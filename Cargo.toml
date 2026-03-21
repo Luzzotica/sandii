@@ -1,0 +1,21 @@
+[package]
+name = "sandii"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [
+    "crates/falling_everything_core",
+    "crates/falling_everything_godot",
+]
+resolver = "2"
+
+[dependencies]
+falling_everything_core = { path = "crates/falling_everything_core" }
+minifb = "0.27"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.falling_everything_core]
+opt-level = 2

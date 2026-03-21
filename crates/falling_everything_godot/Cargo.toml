@@ -1,0 +1,7 @@
+[package]
+name = "falling_everything_godot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+falling_everything_core = { path = "../falling_everything_core" }
