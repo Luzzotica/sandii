@@ -5,12 +5,64 @@ use falling_everything_core::world::{material, MaterialId, RectI, Vec2i};
 use falling_everything_core::{Simulation, SimulationConfig, SimulationStats};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
 
-const WIDTH: usize = 640;
-const HEIGHT: usize = 360;
+const WIDTH: usize = 1280;
+const HEIGHT: usize = 720;
 const TARGET_FPS: usize = 60;
 const CULL_MARGIN: i32 = 80;
-fn palette_argb() -> [u32; material::MAX_MATERIALS] {
-    materials::builtin_palette_argb()
+
+/// Top-left material palette (must match `draw_ui_hint` / `draw_material_palette`).
+struct PaletteLayout {
+    panel_x: usize,
+    panel_y: usize,
+    panel_w: usize,
+    panel_h: usize,
+    swatch_x0: usize,
+    swatch_y: usize,
+    swatch_w: usize,
+    swatch_h: usize,
+    stride: usize,
+    count: usize,
+}
+
+impl PaletteLayout {
+    fn new() -> Self {
+        let count = materials::BUILTINS.len();
+        let panel_w = count * 16 + 70;
+        Self {
+            panel_x: 4,
+            panel_y: 4,
+            panel_w,
+            panel_h: 26,
+            swatch_x0: 8,
+            swatch_y: 8,
+            swatch_w: 12,
+            swatch_h: 14,
+            stride: 16,
+            count,
+        }
+    }
+
+    fn panel_contains(&self, mx: i32, my: i32) -> bool {
+        mx >= self.panel_x as i32
+            && mx < (self.panel_x + self.panel_w) as i32
+            && my >= self.panel_y as i32
+            && my < (self.panel_y + self.panel_h) as i32
+    }
+
+    fn material_at(&self, mx: i32, my: i32) -> Option<MaterialId> {
+        for i in 0..self.count {
+            let sx = self.swatch_x0 + i * self.stride;
+            let sy = self.swatch_y;
+            if mx >= sx as i32
+                && mx < (sx + self.swatch_w) as i32
+                && my >= sy as i32
+                && my < (sy + self.swatch_h) as i32
+            {
+                return Some(materials::BUILTINS[i].id);
+            }
+        }
+        None
+    }
 }
 
 fn main() {
@@ -18,14 +70,26 @@ fn main() {
         deterministic: false,
         ..SimulationConfig::default()
     });
-    sim.paint_circle(Vec2i::new(320, 180), 40, material::STATIC);
+    sim.paint_circle(
+        Vec2i::new((WIDTH / 2) as i32, (HEIGHT / 2) as i32),
+        80,
+        material::STATIC,
+    );
     sim.set_solid_bounds(RectI::new(
         Vec2i::new(0, 0),
         Vec2i::new((WIDTH - 1) as i32, (HEIGHT - 1) as i32),
     ));
 
+    let mat_list: String = materials::BUILTINS.iter().enumerate()
+        .map(|(i, d)| format!("{} {}", i, d.name))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = format!(
+        "Sandii Sandbox - {} | R Rigid | C Clear | P Parallel | T Pass viz | D 1-pass debug",
+        mat_list
+    );
     let mut window = Window::new(
-        "Sandii Sandbox - 0 Empty 1 Sand 2 Water 3 Gas 4 Static 5 Rigid 6 LightW 7 HeavyW | R Spawn Body | C Clear",
+        &title,
         WIDTH,
         HEIGHT,
         WindowOptions {
@@ -40,6 +104,8 @@ fn main() {
     let mut frame = vec![0u32; WIDTH * HEIGHT];
     let mut selected: MaterialId = material::SAND;
     let mut brush_radius: i32 = 4;
+    let mut last_left_paint: Option<Vec2i> = None;
+    let mut last_right_paint: Option<Vec2i> = None;
     let mut last_step = Instant::now();
     let mut fps_last = Instant::now();
     let mut fps_frames: u32 = 0;
@@ -51,11 +117,19 @@ fn main() {
     blit_full_world(&sim, &mut frame);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        if window.is_key_pressed(Key::D, KeyRepeat::No) {
+            sim.set_debug_full_world_single_pass(!sim.debug_full_world_single_pass());
+        }
         handle_material_shortcuts(&window, &mut selected);
         handle_brush_shortcuts(&window, &mut brush_radius);
         if window.is_key_pressed(Key::P, KeyRepeat::No) {
             let next_parallel = !sim.is_parallel();
             sim.set_parallel(next_parallel);
+        }
+        if window.is_key_pressed(Key::T, KeyRepeat::No) {
+            let next = !sim.debug_pass_enabled();
+            sim.set_debug_pass_enabled(next);
+            blit_full_world(&sim, &mut frame);
         }
 
         if window.is_key_pressed(Key::C, KeyRepeat::No) {
@@ -68,16 +142,44 @@ fn main() {
 
         if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
             let p = Vec2i::new(mx as i32, my as i32);
-            if window.get_mouse_down(MouseButton::Left) {
-                sim.paint_circle(p, brush_radius, selected);
-            }
-            if window.get_mouse_down(MouseButton::Right) {
-                sim.paint_circle(p, brush_radius, material::EMPTY);
-            }
-            if window.is_key_pressed(Key::R, KeyRepeat::No) {
-                let min = Vec2i::new(p.x - 6, p.y - 4);
-                let max = Vec2i::new(p.x + 6, p.y + 4);
-                let _ = sim.spawn_rigid_body_rect(min, max, material::RIGID);
+            let layout = PaletteLayout::new();
+            let mx_i = mx as i32;
+            let my_i = my as i32;
+
+            if layout.panel_contains(mx_i, my_i) {
+                last_left_paint = None;
+                last_right_paint = None;
+                if window.get_mouse_down(MouseButton::Left) {
+                    if let Some(id) = layout.material_at(mx_i, my_i) {
+                        selected = id;
+                    }
+                }
+            } else {
+                if window.get_mouse_down(MouseButton::Left) {
+                    if let Some(prev) = last_left_paint {
+                        sim.paint_line_brush(prev, p, brush_radius, selected);
+                    } else {
+                        sim.paint_circle(p, brush_radius, selected);
+                    }
+                    last_left_paint = Some(p);
+                } else {
+                    last_left_paint = None;
+                }
+                if window.get_mouse_down(MouseButton::Right) {
+                    if let Some(prev) = last_right_paint {
+                        sim.paint_line_brush(prev, p, brush_radius, material::EMPTY);
+                    } else {
+                        sim.paint_circle(p, brush_radius, material::EMPTY);
+                    }
+                    last_right_paint = Some(p);
+                } else {
+                    last_right_paint = None;
+                }
+                if window.is_key_pressed(Key::R, KeyRepeat::No) {
+                    let min = Vec2i::new(p.x - 6, p.y - 4);
+                    let max = Vec2i::new(p.x + 6, p.y + 4);
+                    let _ = sim.spawn_rigid_body_rect(min, max, material::RIGID);
+                }
             }
         }
 
@@ -103,7 +205,12 @@ fn main() {
             fps_last = Instant::now();
         }
         draw_ui_hint(&mut frame, selected, brush_radius);
-        draw_fps_top_right(&mut frame, fps_display, sim.is_parallel());
+        draw_fps_top_right(
+            &mut frame,
+            fps_display,
+            sim.is_parallel(),
+            sim.debug_full_world_single_pass(),
+        );
         draw_perf_hud(&mut frame, sim_stats, render_ms);
 
         window
@@ -115,11 +222,20 @@ fn main() {
 
 fn blit_full_world(sim: &Simulation, frame: &mut [u32]) {
     let rect = RectI::new(Vec2i::new(0, 0), Vec2i::new((WIDTH - 1) as i32, (HEIGHT - 1) as i32));
-    let palette_indices = sim.copy_palette_indices_for_region(rect);
-    palette_to_argb32(&palette_indices, frame);
+    let pixels = if sim.debug_pass_enabled() {
+        sim.copy_debug_argb32_for_region(rect)
+    } else {
+        sim.copy_argb32_for_region(rect)
+    };
+    frame[..pixels.len()].copy_from_slice(&pixels);
 }
 
 fn blit_dirty_regions(sim: &Simulation, frame: &mut [u32]) {
+    let debug = sim.debug_pass_enabled();
+    if debug {
+        blit_full_world(sim, frame);
+        return;
+    }
     let dirty = sim.get_dirty_chunks();
     if dirty.is_empty() {
         return;
@@ -139,37 +255,33 @@ fn blit_dirty_regions(sim: &Simulation, frame: &mut [u32]) {
             continue;
         }
         let rect = RectI::new(min, max);
-        let indices = sim.copy_palette_indices_for_region(rect);
+        let pixels = sim.copy_argb32_for_region(rect);
         let w = (max.x - min.x + 1) as usize;
         let h = (max.y - min.y + 1) as usize;
         for y in 0..h {
             let src = y * w;
             let dst = (min.y as usize + y) * WIDTH + min.x as usize;
-            for x in 0..w {
-                let idx = indices[src + x] as usize;
-                frame[dst + x] = PALETTE_ARGB.get(idx).copied().unwrap_or(0xFFFF00FF);
-            }
+            frame[dst..dst + w].copy_from_slice(&pixels[src..src + w]);
         }
     }
 }
 
 fn handle_material_shortcuts(window: &Window, selected: &mut MaterialId) {
-    if window.is_key_pressed(Key::Key0, KeyRepeat::No) {
-        *selected = material::EMPTY;
-    } else if window.is_key_pressed(Key::Key1, KeyRepeat::No) {
-        *selected = material::SAND;
-    } else if window.is_key_pressed(Key::Key2, KeyRepeat::No) {
-        *selected = material::LIQUID;
-    } else if window.is_key_pressed(Key::Key3, KeyRepeat::No) {
-        *selected = material::GAS;
-    } else if window.is_key_pressed(Key::Key4, KeyRepeat::No) {
-        *selected = material::STATIC;
-    } else if window.is_key_pressed(Key::Key5, KeyRepeat::No) {
-        *selected = material::RIGID;
-    } else if window.is_key_pressed(Key::Key6, KeyRepeat::No) {
-        *selected = material::LIGHT_LIQUID;
-    } else if window.is_key_pressed(Key::Key7, KeyRepeat::No) {
-        *selected = material::HEAVY_LIQUID;
+    // Avoid R (rigid), P (parallel), D (1-pass debug), C (clear), [, ] (brush). Comma = slot that was D.
+    const KEYS: &[Key] = &[
+        Key::Key0, Key::Key1, Key::Key2, Key::Key3, Key::Key4,
+        Key::Key5, Key::Key6, Key::Key7, Key::Key8, Key::Key9,
+        Key::Q, Key::W, Key::E, Key::A, Key::S, Key::Comma, Key::F, Key::G,
+        Key::H, Key::J, Key::K, Key::L, Key::Z, Key::X, Key::V, Key::B, Key::N, Key::M,
+    ];
+    for (i, &key) in KEYS.iter().enumerate() {
+        if i >= materials::BUILTINS.len() {
+            break;
+        }
+        if window.is_key_pressed(key, KeyRepeat::No) {
+            *selected = materials::BUILTINS[i].id;
+            return;
+        }
     }
 }
 
@@ -182,44 +294,32 @@ fn handle_brush_shortcuts(window: &Window, brush_radius: &mut i32) {
     }
 }
 
-fn palette_to_argb32(src: &[u16], dst: &mut [u32]) {
-    for (i, px) in dst.iter_mut().enumerate() {
-        let idx = src[i] as usize;
-        *px = PALETTE_ARGB.get(idx).copied().unwrap_or(0xFFFF00FF);
-    }
-}
-
 fn draw_ui_hint(frame: &mut [u32], material: MaterialId, brush_radius: i32) {
-    draw_panel(frame, 4, 4, 180, 26, 0xAA101010);
+    let layout = PaletteLayout::new();
+    draw_panel(frame, layout.panel_x, layout.panel_y, layout.panel_w, layout.panel_h, 0xAA101010);
     draw_material_palette(frame, material);
     draw_brush_meter(frame, brush_radius);
 }
 
 fn draw_material_palette(frame: &mut [u32], selected: MaterialId) {
-    let materials = [
-        (0u8, material::EMPTY),
-        (1u8, material::SAND),
-        (2u8, material::LIQUID),
-        (3u8, material::GAS),
-        (4u8, material::STATIC),
-        (5u8, material::RIGID),
-        (6u8, material::LIGHT_LIQUID),
-        (7u8, material::HEAVY_LIQUID),
-    ];
-    let mut x = 8usize;
-    for (idx, mat) in materials {
-        let color = material_color(mat);
-        draw_panel(frame, x, 8, 14, 14, color);
-        if mat == selected {
-            draw_rect_outline(frame, x - 1, 7, 16, 16, 0xFFFFFFFF);
+    let layout = PaletteLayout::new();
+    let mut x = layout.swatch_x0;
+    for (idx, def) in materials::BUILTINS.iter().enumerate() {
+        let color = def.color_argb;
+        draw_panel(frame, x, layout.swatch_y, layout.swatch_w, layout.swatch_h, color);
+        if def.id == selected {
+            draw_rect_outline(frame, x - 1, 7, 14, 16, 0xFFFFFFFF);
         }
-        draw_digit(frame, idx, x + 4, 10, 0xFF000000);
-        x += 18;
+        if idx < 10 {
+            draw_digit(frame, idx as u8, x + 3, 10, 0xFF000000);
+        }
+        x += layout.stride;
     }
 }
 
 fn draw_brush_meter(frame: &mut [u32], brush_radius: i32) {
-    let meter_x = 120usize;
+    let layout = PaletteLayout::new();
+    let meter_x = layout.swatch_x0 + layout.count * layout.stride + 4;
     let meter_y = 10usize;
     let w = 56usize;
     let fill = ((brush_radius.clamp(1, 32) as usize) * w) / 32;
@@ -232,10 +332,6 @@ fn draw_brush_meter(frame: &mut [u32], brush_radius: i32) {
         draw_digit(frame, tens, meter_x + w + 6, meter_y + 1, 0xFFFFFFFF);
     }
     draw_digit(frame, ones, meter_x + w + 10, meter_y + 1, 0xFFFFFFFF);
-}
-
-fn material_color(material: MaterialId) -> u32 {
-    PALETTE_ARGB[material as usize]
 }
 
 fn draw_panel(frame: &mut [u32], x: usize, y: usize, w: usize, h: usize, color: u32) {
@@ -308,12 +404,18 @@ fn draw_number(frame: &mut [u32], value: u32, x: usize, y: usize, color: u32) {
     }
 }
 
-fn draw_fps_top_right(frame: &mut [u32], fps: u32, parallel: bool) {
+fn draw_fps_top_right(frame: &mut [u32], fps: u32, parallel: bool, full_world_debug: bool) {
     let digits = fps.to_string().len().max(1);
     let text_w = digits * 4 + 18;
     let x = WIDTH.saturating_sub(text_w + 6);
     draw_panel(frame, x, 4, text_w, 12, 0xAA101010);
-    let mode_color = if parallel { 0xFF4CAF50 } else { 0xFFE53935 };
+    let mode_color = if full_world_debug {
+        0xFFFF9800
+    } else if parallel {
+        0xFF4CAF50
+    } else {
+        0xFFE53935
+    };
     draw_panel(frame, x + 2, 6, 8, 8, mode_color);
     draw_number(frame, fps, x + 14, 7, 0xFFFFFFFF);
 }

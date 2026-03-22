@@ -1,8 +1,11 @@
+pub mod bresenham;
 pub mod materials;
 pub mod render;
 pub mod rigid;
 pub mod sim;
 pub mod world;
+
+pub use world::MaterialMotion;
 
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
@@ -11,7 +14,7 @@ use std::time::Instant;
 use render::{DirtyChunkView, PixelRegion};
 use rigid::{RigidBodySpec, RigidBridge};
 use sim::{ParticleSim, Scheduler, SchedulerMode};
-use world::{MaterialId, MaterialProps, MaterialRule, ReactionOutcome, RectI, Vec2i, World};
+use world::{Cell, MaterialId, MaterialProps, MaterialRule, ReactionOutcome, RectI, Vec2i, World};
 
 #[derive(Debug, Clone)]
 pub struct SimulationConfig {
@@ -19,6 +22,8 @@ pub struct SimulationConfig {
     pub region_size: i32,
     pub seed: u64,
     pub deterministic: bool,
+    /// Single-threaded full-grid one pass per tick (no checkerboard, no rayon). For debugging vs multithreaded seams.
+    pub debug_full_world_single_pass: bool,
 }
 
 impl Default for SimulationConfig {
@@ -28,6 +33,7 @@ impl Default for SimulationConfig {
             region_size: 512,
             seed: 1,
             deterministic: true,
+            debug_full_world_single_pass: false,
         }
     }
 }
@@ -68,11 +74,14 @@ impl Simulation {
             SchedulerMode::ThreadPool
         };
 
+        let mut scheduler = Scheduler::new(scheduler_mode, config.seed);
+        scheduler.set_debug_full_world_single_pass(config.debug_full_world_single_pass);
+
         Self {
             world: World::new(config.chunk_size, config.region_size),
             particles: ParticleSim::new(),
             rigid: RigidBridge::new(),
-            scheduler: Scheduler::new(scheduler_mode, config.seed),
+            scheduler,
             rng: SmallRng::seed_from_u64(config.seed),
             events: Vec::new(),
             fixed_dt: 1.0 / 60.0,
@@ -96,6 +105,18 @@ impl Simulation {
 
     pub fn paint_circle(&mut self, center: Vec2i, radius: i32, material: MaterialId) {
         self.world.paint_circle(center, radius, material);
+    }
+
+    pub fn cell(&self, p: Vec2i) -> Cell {
+        self.world.get_cell(p)
+    }
+
+    /// Paints a thick brush along the integer Bresenham line from `a` to `b` (inclusive).
+    /// Use when the pointer jumps between frames so no gaps appear in the stroke.
+    pub fn paint_line_brush(&mut self, a: Vec2i, b: Vec2i, brush_radius: i32, material: MaterialId) {
+        for p in crate::bresenham::bresenham_line(a, b) {
+            self.world.paint_circle(p, brush_radius, material);
+        }
     }
 
     pub fn spawn_rigid_body_rect(&mut self, min: Vec2i, max: Vec2i, material: MaterialId) -> u32 {
@@ -149,6 +170,22 @@ impl Simulation {
         render::copy_rgba_for_region(&self.world, rect)
     }
 
+    pub fn copy_argb32_for_region(&self, rect: RectI) -> Vec<u32> {
+        render::copy_argb32_for_region(&self.world, rect)
+    }
+
+    pub fn copy_debug_argb32_for_region(&self, rect: RectI) -> Vec<u32> {
+        render::copy_debug_argb32_for_region(&self.world, rect)
+    }
+
+    pub fn set_debug_pass_enabled(&mut self, enabled: bool) {
+        self.world.set_debug_pass_enabled(enabled);
+    }
+
+    pub fn debug_pass_enabled(&self) -> bool {
+        self.world.debug_pass_enabled()
+    }
+
     pub fn copy_palette_indices_for_region(&self, rect: RectI) -> Vec<u16> {
         render::copy_palette_indices_for_region(&self.world, rect)
     }
@@ -168,6 +205,16 @@ impl Simulation {
 
     pub fn is_parallel(&self) -> bool {
         self.scheduler.mode() == SchedulerMode::ThreadPool
+    }
+
+    /// When enabled, the grid is stepped in **one** single-threaded full-world pass (no 4-pass checkerboard, no `rayon`).
+    /// `ThreadPool` mode is ignored for stepping until this is turned off.
+    pub fn set_debug_full_world_single_pass(&mut self, enabled: bool) {
+        self.scheduler.set_debug_full_world_single_pass(enabled);
+    }
+
+    pub fn debug_full_world_single_pass(&self) -> bool {
+        self.scheduler.debug_full_world_single_pass()
     }
 
     pub fn set_fixed_timestep(&mut self, dt: f32, max_substeps: u32) {
@@ -202,7 +249,7 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::sim::deterministic_hash;
-    use crate::world::{material, Phase};
+    use crate::world::{material, MaterialId, MaterialMotion};
 
     fn count_material(sim: &Simulation, rect: RectI, id: u16) -> usize {
         sim.copy_palette_indices_for_region(rect)
@@ -375,7 +422,8 @@ mod tests {
         }
 
         assert_eq!(before_sand, count_material(&sim, bounds, material::SAND));
-        assert_eq!(before_liquid, count_material(&sim, bounds, material::LIQUID));
+        // `LIQUID` can be cleared when it wets adjacent sand (`adjacent_influence` + `ClearSourceCell`).
+        assert!(count_material(&sim, bounds, material::LIQUID) <= before_liquid);
         assert_eq!(before_gas, count_material(&sim, bounds, material::GAS));
     }
 
@@ -388,11 +436,42 @@ mod tests {
             material::SAND,
             crate::world::MaterialProps {
                 density: 5,
-                phase: Phase::Gas,
-                viscosity: 0,
-                inert: false,
-                max_speed: 4,
-                acceleration: 1,
+                motion: MaterialMotion::Gas {
+                    viscosity: 0,
+                    max_speed: 4,
+                    acceleration: 1,
+                },
+                ignitability: 0,
+                consumption_rate: 0,
+                fuel_mass: 0,
+                explosion_radius: 0,
+                on_heat_become: 0,
+                on_death_become: 0,
+                on_death_lifetime_lo: 0,
+                on_death_lifetime_hi: 0,
+                corrosion_max_hp: 0,
+                smolder_extinguish_material: material::EMPTY,
+                smolder_extinguish_lifetime_lo: 24,
+                smolder_extinguish_lifetime_hi: 64,
+                smolder_burnout_ignites_neighbors: false,
+                smolder_burnout_explosion_radius: 0,
+                smolder_burnout_become: material::EMPTY,
+                smolder_burnout_lifetime_lo: 0,
+                smolder_burnout_lifetime_hi: 0,
+                adjacent_transforms: [
+                    crate::world::AdjacentTransformRule::inactive(),
+                    crate::world::AdjacentTransformRule::inactive(),
+                    crate::world::AdjacentTransformRule::inactive(),
+                    crate::world::AdjacentTransformRule::inactive(),
+                ],
+                corrosion_adjacent: [crate::world::CorrosionAdjacentRule::inactive(); 8],
+                adjacent_influence: [crate::world::AdjacentInfluenceRule::inactive(); 8],
+                neighbor_spawns: [
+                    crate::world::NeighborSpawnRule::inactive(),
+                    crate::world::NeighborSpawnRule::inactive(),
+                    crate::world::NeighborSpawnRule::inactive(),
+                    crate::world::NeighborSpawnRule::inactive(),
+                ],
             },
         );
         sim.paint_circle(Vec2i::new(12, 12), 2, material::SAND);
@@ -405,5 +484,446 @@ mod tests {
             material::SAND,
         );
         assert!(upper > 0);
+    }
+
+    fn paint_cell(sim: &mut Simulation, p: Vec2i, mat: MaterialId) {
+        sim.paint_circle(p, 0, mat);
+    }
+
+    #[test]
+    fn adjacent_liquid_wets_dry_sand() {
+        use crate::world::cell_flags;
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for &(x, y) in &[
+            (9, 9),
+            (10, 9),
+            (11, 9),
+            (9, 10),
+            (11, 10),
+            (9, 11),
+            (11, 11),
+            (9, 12),
+            (10, 12),
+            (11, 12),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 10), material::LIQUID);
+        paint_cell(&mut sim, Vec2i::new(10, 11), material::SAND);
+
+        for _ in 0..240 {
+            sim.step(1.0 / 60.0);
+            let c = sim.cell(Vec2i::new(10, 11));
+            if c.material == material::SAND && (c.flags & cell_flags::WET) != 0 {
+                return;
+            }
+        }
+        panic!("expected WET on sand from adjacent water influence");
+    }
+
+    #[test]
+    fn plant_converts_adjacent_water() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        // Chamber: plant (10,10), water (11,10), static perimeter (incl. corners) so water cannot escape diagonally.
+        for &(x, y) in &[
+            (9, 9),
+            (10, 9),
+            (11, 9),
+            (12, 9),
+            (9, 10),
+            (12, 10),
+            (9, 11),
+            (10, 11),
+            (11, 11),
+            (12, 11),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 10), material::PLANT);
+        paint_cell(&mut sim, Vec2i::new(11, 10), material::LIQUID);
+
+        let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
+        assert_eq!(count_material(&sim, probe, material::PLANT), 1);
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 1);
+
+        for _ in 0..64 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, probe, material::LIQUID) == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
+        assert_eq!(count_material(&sim, probe, material::PLANT), 2);
+    }
+
+    #[test]
+    fn wood_converts_adjacent_water_to_plant() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for &(x, y) in &[
+            (9, 9),
+            (10, 9),
+            (11, 9),
+            (12, 9),
+            (9, 10),
+            (12, 10),
+            (9, 11),
+            (10, 11),
+            (11, 11),
+            (12, 11),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 10), material::WOOD);
+        paint_cell(&mut sim, Vec2i::new(11, 10), material::LIQUID);
+
+        let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
+        assert_eq!(count_material(&sim, probe, material::WOOD), 1);
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 1);
+        assert_eq!(count_material(&sim, probe, material::PLANT), 0);
+
+        for _ in 0..64 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, probe, material::LIQUID) == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
+        assert_eq!(count_material(&sim, probe, material::PLANT), 1);
+        assert_eq!(count_material(&sim, probe, material::WOOD), 1);
+    }
+
+    #[test]
+    fn adjacent_transform_uses_material_props_rules() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        let mut plant_props = crate::materials::BUILTINS
+            .iter()
+            .find(|d| d.id == material::PLANT)
+            .unwrap()
+            .props;
+        plant_props.adjacent_transforms = [
+            crate::world::AdjacentTransformRule {
+                from: material::SAND,
+                to: material::LIQUID,
+                chance_percent: 100,
+                cardinal_neighbors_only: true,
+                actor_lifetime_delta: 0,
+            },
+            crate::world::AdjacentTransformRule::inactive(),
+            crate::world::AdjacentTransformRule::inactive(),
+            crate::world::AdjacentTransformRule::inactive(),
+        ];
+        sim.set_material_props(material::PLANT, plant_props);
+
+        for &(x, y) in &[
+            (9, 9),
+            (10, 9),
+            (11, 9),
+            (12, 9),
+            (9, 10),
+            (12, 10),
+            (9, 11),
+            (10, 11),
+            (11, 11),
+            (12, 11),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 10), material::SAND);
+        paint_cell(&mut sim, Vec2i::new(11, 10), material::PLANT);
+
+        let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
+        assert_eq!(count_material(&sim, probe, material::SAND), 1);
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
+
+        for _ in 0..30 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, probe, material::SAND) == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(count_material(&sim, probe, material::SAND), 0);
+        assert!(count_material(&sim, probe, material::LIQUID) >= 1);
+        assert_eq!(count_material(&sim, probe, material::PLANT), 1);
+    }
+
+    #[test]
+    fn smoldering_wood_burns_away_eventually() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        let mut fast_burn = crate::materials::BUILTINS
+            .iter()
+            .find(|def| def.id == material::WOOD)
+            .unwrap()
+            .props;
+        fast_burn.fuel_mass = 24;
+        fast_burn.consumption_rate = 200;
+        fast_burn.neighbor_spawns = [
+            crate::world::NeighborSpawnRule::inactive(),
+            crate::world::NeighborSpawnRule::inactive(),
+            crate::world::NeighborSpawnRule::inactive(),
+            crate::world::NeighborSpawnRule::inactive(),
+        ];
+        sim.set_material_props(material::WOOD, fast_burn);
+        // Pocket: plant | fire, walls so fire cannot drift away before igniting.
+        for &(x, y) in &[
+            (9, 20),
+            (12, 20),
+            (9, 19),
+            (10, 19),
+            (11, 19),
+            (12, 19),
+            (9, 21),
+            (10, 21),
+            (11, 21),
+            (12, 21),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 20), material::WOOD);
+        paint_cell(&mut sim, Vec2i::new(11, 20), material::FIRE);
+        let start_wood = count_material(&sim, bounds, material::WOOD);
+        assert!(start_wood > 0);
+        for _ in 0..400 {
+            sim.step(1.0 / 60.0);
+        }
+        let end_wood = count_material(&sim, bounds, material::WOOD);
+        assert!(end_wood < start_wood);
+    }
+
+    #[test]
+    fn acid_surrounded_wax_eventually_dissolves() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        sim.paint_circle(Vec2i::new(16, 16), 7, material::ACID);
+        sim.paint_circle(Vec2i::new(16, 16), 0, material::WAX);
+        assert_eq!(count_material(&sim, bounds, material::WAX), 1);
+        for _ in 0..8000 {
+            sim.step(1.0 / 60.0);
+        }
+        assert_eq!(count_material(&sim, bounds, material::WAX), 0);
+    }
+
+    #[test]
+    fn acid_surrounded_sand_eventually_dissolves() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        sim.paint_circle(Vec2i::new(16, 16), 7, material::ACID);
+        sim.paint_circle(Vec2i::new(16, 16), 0, material::SAND);
+        assert_eq!(count_material(&sim, bounds, material::SAND), 1);
+        for _ in 0..8000 {
+            sim.step(1.0 / 60.0);
+        }
+        assert_eq!(count_material(&sim, bounds, material::SAND), 0);
+    }
+
+    #[test]
+    fn acid_adjacent_static_wall_eventually_breaches() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        sim.paint_circle(Vec2i::new(16, 16), 7, material::ACID);
+        sim.paint_circle(Vec2i::new(16, 16), 0, material::STATIC);
+        assert_eq!(count_material(&sim, bounds, material::STATIC), 1);
+        for _ in 0..80_000 {
+            sim.step(1.0 / 60.0);
+        }
+        assert_eq!(count_material(&sim, bounds, material::STATIC), 0);
+    }
+
+    #[test]
+    fn plant_does_not_fall_when_suspended() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        // Single plant with empty cells below (no static floor under it).
+        paint_cell(&mut sim, Vec2i::new(16, 8), material::PLANT);
+
+        for _ in 0..120 {
+            sim.step(1.0 / 60.0);
+        }
+
+        assert_eq!(count_material(&sim, bounds, material::PLANT), 1);
+        assert_eq!(
+            sim.copy_palette_indices_for_region(RectI::new(Vec2i::new(16, 8), Vec2i::new(16, 8)))[0],
+            material::PLANT
+        );
+    }
+
+    #[test]
+    fn fire_adjacent_transform_vaporizes_water_and_costs_lifetime() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for &(x, y) in &[
+            (9, 9),
+            (10, 9),
+            (11, 9),
+            (12, 9),
+            (9, 10),
+            (12, 10),
+            (9, 11),
+            (10, 11),
+            (11, 11),
+            (12, 11),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 10), material::FIRE);
+        paint_cell(&mut sim, Vec2i::new(11, 10), material::LIQUID);
+
+        let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 1);
+        assert_eq!(count_material(&sim, probe, material::FIRE), 1);
+        assert_eq!(count_material(&sim, probe, material::STEAM), 0);
+
+        for _ in 0..96 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, probe, material::LIQUID) == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            count_material(&sim, probe, material::LIQUID),
+            0,
+            "adjacent water should be removed (steam and/or water extinguishing fire)"
+        );
+        let steam = count_material(&sim, probe, material::STEAM);
+        let fire_left = count_material(&sim, probe, material::FIRE);
+        assert!(
+            steam >= 1 || fire_left == 0,
+            "expected steam from vaporize and/or fire gone from water quench (steam={steam}, fire={fire_left})"
+        );
+    }
+
+    #[test]
+    fn steam_condenses_to_water_when_lifetime_ends() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for dx in -1i32..=1 {
+            for dy in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                paint_cell(
+                    &mut sim,
+                    Vec2i::new(16 + dx, 16 + dy),
+                    material::STATIC,
+                );
+            }
+        }
+        paint_cell(&mut sim, Vec2i::new(16, 16), material::STEAM);
+
+        for _ in 0..200 {
+            sim.step(1.0 / 60.0);
+        }
+
+        assert_eq!(
+            sim.copy_palette_indices_for_region(RectI::new(Vec2i::new(16, 16), Vec2i::new(16, 16)))[0],
+            material::LIQUID
+        );
+        assert_eq!(count_material(&sim, bounds, material::STEAM), 0);
+    }
+
+    #[test]
+    fn lava_trapped_cools_to_sand() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for dx in -1i32..=1 {
+            for dy in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                paint_cell(
+                    &mut sim,
+                    Vec2i::new(16 + dx, 16 + dy),
+                    material::STATIC,
+                );
+            }
+        }
+        paint_cell(&mut sim, Vec2i::new(16, 16), material::LAVA);
+
+        for _ in 0..60_000 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, bounds, material::LAVA) == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            sim.copy_palette_indices_for_region(RectI::new(Vec2i::new(16, 16), Vec2i::new(16, 16)))[0],
+            material::SAND
+        );
+        assert_eq!(count_material(&sim, bounds, material::LAVA), 0);
+    }
+
+    #[test]
+    fn torch_neighbor_spawns_fire() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        paint_cell(&mut sim, Vec2i::new(15, 15), material::TORCH);
+        let probe = RectI::new(Vec2i::new(14, 14), Vec2i::new(16, 16));
+        assert_eq!(count_material(&sim, probe, material::FIRE), 0);
+
+        for _ in 0..4000 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, bounds, material::FIRE) > 0 {
+                break;
+            }
+        }
+
+        assert!(count_material(&sim, bounds, material::FIRE) >= 1);
+    }
+
+    #[test]
+    fn lava_adjacent_transform_vaporizes_water() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for &(x, y) in &[
+            (9, 9),
+            (10, 9),
+            (11, 9),
+            (12, 9),
+            (9, 10),
+            (12, 10),
+            (9, 11),
+            (10, 11),
+            (11, 11),
+            (12, 11),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 10), material::LAVA);
+        paint_cell(&mut sim, Vec2i::new(11, 10), material::LIQUID);
+
+        let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
+        let mut saw_steam = false;
+        for _ in 0..256 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, probe, material::STEAM) >= 1 {
+                saw_steam = true;
+                break;
+            }
+        }
+        assert!(saw_steam, "lava should eventually vaporize adjacent water (chance < 100%)");
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
+        assert_eq!(count_material(&sim, probe, material::LAVA), 1);
     }
 }

@@ -94,9 +94,8 @@ impl RigidBridge {
         for &p in positions {
             let mut cell = world.get_cell(p);
             cell.material = material_id;
-            cell.rigid_id = Some(id);
-            cell.flags |= 0b0000_0001;
             world.set_cell(p, cell);
+            world.set_rigid_id(p, id);
             anchors.push(PixelAnchor {
                 local: Vec2i::new(p.x - center.x, p.y - center.y),
                 cell,
@@ -153,6 +152,7 @@ impl RigidBridge {
                 let wp = Vec2i::new(pos.x.round() as i32 + anchor.local.x, pos.y.round() as i32 + anchor.local.y);
                 extracted.push((wp, anchor.cell));
                 world.set_cell(wp, Cell::default());
+                world.clear_rigid_id(wp);
             }
             self.extracted_world_positions.insert(rigid.id, extracted);
         }
@@ -191,7 +191,7 @@ impl RigidBridge {
             for anchor in &rigid.anchors {
                 let wp = Vec2i::new(pos.x.round() as i32 + anchor.local.x, pos.y.round() as i32 + anchor.local.y);
                 let occupant = world.get_cell(wp);
-                if occupant.material != material::EMPTY && occupant.rigid_id != Some(rigid.id) {
+                if occupant.material != material::EMPTY && world.get_rigid_id(wp) != Some(rigid.id) {
                     particles.spawn(Particle {
                         pos: (wp.x as f32, wp.y as f32),
                         vel: (0.0, -20.0),
@@ -200,6 +200,7 @@ impl RigidBridge {
                     });
                 }
                 world.set_cell(wp, anchor.cell);
+                world.set_rigid_id(wp, rigid.id);
                 events.push(SimulationEvent::PixelEjectedToParticle { at: wp });
             }
         }
@@ -241,9 +242,9 @@ impl RigidBridge {
         let pos = body.translation();
         for anchor in &rigid.anchors {
             let wp = Vec2i::new(pos.x.round() as i32 + anchor.local.x, pos.y.round() as i32 + anchor.local.y);
-            let cell = world.get_cell(wp);
-            if cell.rigid_id == Some(rigid.id) {
+            if world.get_rigid_id(wp) == Some(rigid.id) {
                 world.set_cell(wp, Cell::default());
+                world.clear_rigid_id(wp);
             }
         }
     }
@@ -271,7 +272,7 @@ impl RigidBridge {
                     pos.x.round() as i32 + anchor.local.x,
                     pos.y.round() as i32 + anchor.local.y,
                 );
-                if world.get_cell(wp).rigid_id == Some(body_id) {
+                if world.get_rigid_id(wp) == Some(body_id) {
                     surviving.push(anchor.clone());
                 } else {
                     has_missing = true;
@@ -302,9 +303,9 @@ impl RigidBridge {
                     pos.x.round() as i32 + anchor.local.x,
                     pos.y.round() as i32 + anchor.local.y,
                 );
-                let cell = world.get_cell(wp);
-                if cell.rigid_id == Some(body_id) {
+                if world.get_rigid_id(wp) == Some(body_id) {
                     world.set_cell(wp, Cell::default());
+                    world.clear_rigid_id(wp);
                 }
             }
             self.remove_body_physics(body_id);

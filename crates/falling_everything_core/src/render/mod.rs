@@ -1,4 +1,4 @@
-use crate::world::{MaterialId, RectI, Vec2i, World};
+use crate::world::{cell_flags, material, Cell, MaterialId, RectI, Vec2i, World};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DirtyChunkView {
@@ -14,12 +14,11 @@ pub struct PixelRegion {
 
 pub fn get_dirty_chunks(world: &World) -> Vec<DirtyChunkView> {
     world
-        .all_chunks()
-        .filter_map(|(coord, dirty)| {
-            dirty.map(|rect| DirtyChunkView {
-                chunk: Vec2i::new(coord.x, coord.y),
-                rect,
-            })
+        .all_chunk_dirty_rects()
+        .into_iter()
+        .map(|(coord, rect)| DirtyChunkView {
+            chunk: Vec2i::new(coord.x, coord.y),
+            rect,
         })
         .collect()
 }
@@ -30,11 +29,26 @@ pub fn copy_rgba_for_region(world: &World, rect: RectI) -> PixelRegion {
     let mut rgba = Vec::with_capacity(width * height * 4);
     for y in rect.min.y..=rect.max.y {
         for x in rect.min.x..=rect.max.x {
-            let color = material_to_rgba(world.get_cell(Vec2i::new(x, y)).material);
+            let cell = world.get_cell(Vec2i::new(x, y));
+            let color = cell_to_rgba(cell, x, y);
             rgba.extend_from_slice(&color);
         }
     }
     PixelRegion { width, height, rgba }
+}
+
+/// Returns ARGB32 pixels for a region, suitable for minifb / sandbox rendering.
+pub fn copy_argb32_for_region(world: &World, rect: RectI) -> Vec<u32> {
+    let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
+    let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
+    let mut buf = Vec::with_capacity(width * height);
+    for y in rect.min.y..=rect.max.y {
+        for x in rect.min.x..=rect.max.x {
+            let cell = world.get_cell(Vec2i::new(x, y));
+            buf.push(cell_to_argb32(cell, x, y));
+        }
+    }
+    buf
 }
 
 pub fn copy_palette_indices_for_region(world: &World, rect: RectI) -> Vec<u16> {
@@ -47,8 +61,211 @@ pub fn copy_palette_indices_for_region(world: &World, rect: RectI) -> Vec<u16> {
     indices
 }
 
-fn material_to_rgba(material: MaterialId) -> [u8; 4] {
-    static PALETTE: std::sync::LazyLock<[[u8; 4]; crate::world::material::MAX_MATERIALS]> =
+fn cell_to_rgba(cell: Cell, x: i32, y: i32) -> [u8; 4] {
+    let [mut r, mut g, mut b, a] = if (cell.material == material::PLANT || cell.material == material::WOOD)
+        && (cell.flags & cell_flags::ON_FIRE != 0)
+    {
+        burning_vegetation_rgba(cell.lifetime, x, y)
+    } else {
+        match cell.material {
+            m if m == material::FIRE => fire_rgba(cell.lifetime, x, y),
+            m if m == material::LAVA => lava_rgba(cell.lifetime, x, y),
+            m if m == material::EMBER => ember_pile_rgba(cell.lifetime, x, y),
+            m if m == material::SMOKE => smoke_rgba(cell.lifetime, x, y),
+            m if m == material::STEAM => steam_rgba(cell.lifetime, x, y),
+            m => {
+                let base = static_palette_rgba(m);
+                let mut v = apply_variant(base, cell.variant);
+                if cell.flags & cell_flags::WET != 0 && m == material::SAND {
+                    v[0] = ((v[0] as u16 * 88) / 100) as u8;
+                    v[1] = ((v[1] as u16 * 92) / 100) as u8;
+                    v[2] = v[2].saturating_add(20).min(255);
+                }
+                v
+            }
+        }
+    };
+    if cell.scorch > 0 {
+        let factor = (255u16 - cell.scorch as u16) as u32;
+        r = ((r as u32 * factor) / 255) as u8;
+        g = ((g as u32 * factor) / 255) as u8;
+        b = ((b as u32 * factor) / 255) as u8;
+    }
+    [r, g, b, a]
+}
+
+fn cell_to_argb32(cell: Cell, x: i32, y: i32) -> u32 {
+    let [r, g, b, a] = cell_to_rgba(cell, x, y);
+    (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+}
+
+fn apply_variant(base: [u8; 4], variant: u8) -> [u8; 4] {
+    if variant == 0 {
+        return base;
+    }
+    let shift = (variant as i16 % 21) - 10;
+    [
+        (base[0] as i16 + shift).clamp(0, 255) as u8,
+        (base[1] as i16 + shift).clamp(0, 255) as u8,
+        (base[2] as i16 + shift).clamp(0, 255) as u8,
+        base[3],
+    ]
+}
+
+/// Smoldering plant / wood: high `lifetime` (more fuel left) → red/orange; low → char black.
+fn burning_vegetation_rgba(life: u8, x: i32, y: i32) -> [u8; 4] {
+    let t = (life as f32 / 255.0).clamp(0.0, 1.0);
+    let noise = simple_hash(x, y, life as i32) as i16;
+    let jitter = ((noise % 26) - 13) as i32;
+
+    let r = (35.0 + t * 215.0) as i32 + jitter;
+    let g = (22.0 + t * 95.0) as i32 + jitter / 2;
+    let b = (12.0 + t * 42.0) as i32 + jitter / 3;
+
+    [
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+        255,
+    ]
+}
+
+/// Glowing ember pile: high `lifetime` → bright orange; low → dull red / near-black.
+fn ember_pile_rgba(life: u8, x: i32, y: i32) -> [u8; 4] {
+    let t = (life as f32 / 255.0).clamp(0.0, 1.0);
+    let noise = simple_hash(x, y, life as i32) as i16;
+    let jitter = ((noise % 22) - 11) as i32;
+
+    let r = (28.0 + t * 210.0) as i32 + jitter;
+    let g = (10.0 + t * 85.0) as i32 + jitter / 2;
+    let b = (4.0 + t * 28.0) as i32 + jitter / 3;
+
+    [
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+        255,
+    ]
+}
+
+fn lava_rgba(life: u8, x: i32, y: i32) -> [u8; 4] {
+    let noise = simple_hash(x, y, life as i32) as i16;
+    let jitter = (noise % 28) - 14;
+    let (r, g, b) = if life > 200 {
+        (255i16, 120, 20)
+    } else if life > 120 {
+        (255, 85, 12)
+    } else if life > 60 {
+        (240, 55, 8)
+    } else if life > 25 {
+        (210, 40, 5)
+    } else {
+        (170, 30, 4)
+    };
+    [
+        (r + jitter).clamp(0, 255) as u8,
+        (g + jitter / 2).clamp(0, 255) as u8,
+        (b + jitter / 3).clamp(0, 255) as u8,
+        255,
+    ]
+}
+
+fn fire_rgba(life: u8, x: i32, y: i32) -> [u8; 4] {
+    let noise = simple_hash(x, y, life as i32) as i16;
+    let jitter = (noise % 30) - 15;
+
+    let (r, g, b) = if life > 200 {
+        (255i16, 220, 50)
+    } else if life > 120 {
+        (255, 160, 20)
+    } else if life > 60 {
+        (240, 100, 10)
+    } else if life > 25 {
+        (200, 60, 5)
+    } else {
+        (150, 35, 5)
+    };
+
+    [
+        (r + jitter).clamp(0, 255) as u8,
+        (g + jitter / 2).clamp(0, 255) as u8,
+        (b + jitter / 4).clamp(0, 255) as u8,
+        255,
+    ]
+}
+
+fn smoke_rgba(life: u8, x: i32, y: i32) -> [u8; 4] {
+    let noise = simple_hash(x, y, life as i32) as i16;
+    let jitter = (noise % 20) - 10;
+    let base = 90i16 + jitter;
+    let alpha = ((life as i16) * 180 / 60).clamp(20, 180);
+    [
+        base.clamp(40, 140) as u8,
+        base.clamp(40, 140) as u8,
+        base.clamp(40, 140) as u8,
+        alpha as u8,
+    ]
+}
+
+fn steam_rgba(life: u8, x: i32, y: i32) -> [u8; 4] {
+    let noise = simple_hash(x, y, life as i32) as i16;
+    let jitter = (noise % 24) - 12;
+    let alpha = ((life as i16) * 200 / 72).clamp(40, 200);
+    [
+        (200 + jitter).clamp(160, 255) as u8,
+        (230 + jitter / 2).clamp(200, 255) as u8,
+        255u8,
+        alpha as u8,
+    ]
+}
+
+fn simple_hash(x: i32, y: i32, z: i32) -> u32 {
+    let mut h = (x as u32).wrapping_mul(374761393)
+        .wrapping_add((y as u32).wrapping_mul(668265263))
+        .wrapping_add((z as u32).wrapping_mul(2147483647));
+    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
+    h ^ (h >> 16)
+}
+
+/// Debug overlay: tint pixel by the pass that last processed it (0..3 checkerboard, 4 full-grid debug).
+/// Pass 0xFF (unprocessed) renders as dark gray.
+fn cell_to_debug_rgba(cell: Cell, x: i32, y: i32, pass: u8) -> [u8; 4] {
+    let base = cell_to_rgba(cell, x, y);
+    let tint: [u8; 3] = match pass {
+        0 => [255, 80, 80],
+        1 => [80, 255, 80],
+        2 => [80, 120, 255],
+        3 => [255, 220, 60],
+        4 => [255, 80, 255],
+        _ => [80, 80, 80],
+    };
+    let blend = |b: u8, t: u8| -> u8 { ((b as u16 + t as u16) / 2) as u8 };
+    [blend(base[0], tint[0]), blend(base[1], tint[1]), blend(base[2], tint[2]), base[3]]
+}
+
+fn cell_to_debug_argb32(cell: Cell, x: i32, y: i32, pass: u8) -> u32 {
+    let [r, g, b, a] = cell_to_debug_rgba(cell, x, y, pass);
+    (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+}
+
+/// ARGB32 debug overlay for a region, tinted by last-processed pass.
+pub fn copy_debug_argb32_for_region(world: &World, rect: RectI) -> Vec<u32> {
+    let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
+    let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
+    let mut buf = Vec::with_capacity(width * height);
+    for y in rect.min.y..=rect.max.y {
+        for x in rect.min.x..=rect.max.x {
+            let p = Vec2i::new(x, y);
+            let cell = world.get_cell(p);
+            let pass = world.get_debug_pass(p);
+            buf.push(cell_to_debug_argb32(cell, x, y, pass));
+        }
+    }
+    buf
+}
+
+fn static_palette_rgba(material: MaterialId) -> [u8; 4] {
+    static PALETTE: std::sync::LazyLock<[[u8; 4]; material::MAX_MATERIALS]> =
         std::sync::LazyLock::new(crate::materials::builtin_palette_rgba);
     PALETTE[material as usize]
 }

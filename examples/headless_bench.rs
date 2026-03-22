@@ -25,6 +25,7 @@ fn main() {
 
 fn run_tier(name: &str, steps: usize, setup: impl FnOnce(&mut Simulation)) {
     let mut sim = Simulation::new(SimulationConfig::default());
+    sim.set_solid_bounds(RectI::new(Vec2i::new(0, 0), Vec2i::new(255, 255)));
     setup(&mut sim);
     let mut per_step_us = Vec::with_capacity(steps);
     for i in 0..steps {
