@@ -11,8 +11,10 @@
 .AppleDouble
 .LSOverride
 
-# Editors
+# Editors / IDE
 .idea/
+.vscode/
+.cursor/
 *.swp
 *.swo
 *~
