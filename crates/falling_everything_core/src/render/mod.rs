@@ -51,6 +51,122 @@ pub fn copy_argb32_for_region(world: &World, rect: RectI) -> Vec<u32> {
     buf
 }
 
+#[inline]
+fn checker_pass_rgb(pass: usize) -> [u8; 3] {
+    match pass & 3 {
+        0 => [255, 40, 40],
+        1 => [40, 255, 60],
+        2 => [50, 120, 255],
+        _ => [255, 220, 50],
+    }
+}
+
+#[inline]
+fn blend_argb32_toward_rgb(px: u32, rgb: [u8; 3], tint_numer: u16, tint_denom: u16) -> u32 {
+    let d = tint_denom.max(1);
+    let n = tint_numer.min(d);
+    let inv = d - n;
+    let pr = ((px >> 16) & 0xFF) as u16;
+    let pg = ((px >> 8) & 0xFF) as u16;
+    let pb = (px & 0xFF) as u16;
+    let a = ((px >> 24) & 0xFF) as u16;
+    let nr = ((pr * inv + rgb[0] as u16 * n) / d) as u8;
+    let ng = ((pg * inv + rgb[1] as u16 * n) / d) as u8;
+    let nb = ((pb * inv + rgb[2] as u16 * n) / d) as u8;
+    let na = (a.min(255)) as u32;
+    (na << 24) | ((nr as u32) << 16) | ((ng as u32) << 8) | nb as u32
+}
+
+fn draw_chunk_outline_on_buf(
+    buf: &mut [u32],
+    width: usize,
+    region: RectI,
+    chunk: RectI,
+    thickness: i32,
+    rgb: [u8; 3],
+    blend: Option<(u16, u16)>,
+) {
+    let t = thickness.max(1);
+    // Only scan the chunk ∩ blit region — not the whole framebuffer per chunk (was O(screen × chunks)).
+    let y_lo = region.min.y.max(chunk.min.y);
+    let y_hi = region.max.y.min(chunk.max.y);
+    let x_lo = region.min.x.max(chunk.min.x);
+    let x_hi = region.max.x.min(chunk.max.x);
+    if y_lo > y_hi || x_lo > x_hi {
+        return;
+    }
+    for y in y_lo..=y_hi {
+        for x in x_lo..=x_hi {
+            let edge = x < chunk.min.x + t || x > chunk.max.x - t || y < chunk.min.y + t || y > chunk.max.y - t;
+            if !edge {
+                continue;
+            }
+            let ix = (x - region.min.x) as usize;
+            let iy = (y - region.min.y) as usize;
+            let i = iy * width + ix;
+            if i >= buf.len() {
+                continue;
+            }
+            buf[i] = match blend {
+                Some((n, d)) => blend_argb32_toward_rgb(buf[i], rgb, n, d),
+                None => {
+                    0xFF000000u32 | (rgb[0] as u32) << 16 | (rgb[1] as u32) << 8 | rgb[2] as u32
+                }
+            };
+        }
+    }
+}
+
+fn draw_all_pass_batch_outlines(world: &World, buf: &mut [u32], width: usize, region: RectI) {
+    for pass in 0usize..4 {
+        let rgb = checker_pass_rgb(pass);
+        for coord in world.active_chunk_coords_for_pass(pass) {
+            let b = world.bounds_for_chunk(coord);
+            // 1px solid outline: each chunk in its checkerboard pass color.
+            draw_chunk_outline_on_buf(buf, width, region, b, 1, rgb, None);
+        }
+    }
+}
+
+/// Same as [`copy_argb32_for_region`], then 1px outlines per chunk in checkerboard pass color (red/green/blue/yellow batches).
+/// In [`crate::sim::SchedulerMode::ThreadPool`], all chunks of one color are stepped **in parallel** (one chunk per rayon task).
+pub fn copy_argb32_for_region_pass_batch_viz(world: &World, rect: RectI) -> Vec<u32> {
+    let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
+    let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
+    let mut buf = Vec::with_capacity(width * height);
+    for y in rect.min.y..=rect.max.y {
+        for x in rect.min.x..=rect.max.x {
+            let cell = world.get_cell(Vec2i::new(x, y));
+            buf.push(cell_to_argb32(cell, x, y));
+        }
+    }
+    draw_all_pass_batch_outlines(world, &mut buf, width, rect);
+    buf
+}
+
+/// Same as [`copy_argb32_for_region`], optional pass-batch outlines, then a thick outline on the chunk being stepped.
+pub fn copy_argb32_for_region_chunk_step_viz(world: &World, rect: RectI) -> Vec<u32> {
+    let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
+    let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
+    let mut buf = Vec::with_capacity(width * height);
+    for y in rect.min.y..=rect.max.y {
+        for x in rect.min.x..=rect.max.x {
+            let cell = world.get_cell(Vec2i::new(x, y));
+            buf.push(cell_to_argb32(cell, x, y));
+        }
+    }
+    if world.debug_pass_batch_outlines() {
+        draw_all_pass_batch_outlines(world, &mut buf, width, rect);
+    }
+    if let Some((coord, pass)) = world.debug_chunk_highlight() {
+        let b = world.bounds_for_chunk(coord);
+        let rgb = checker_pass_rgb(pass as usize);
+        // Slightly thicker than batch lines so the active chunk is still obvious when O is on.
+        draw_chunk_outline_on_buf(&mut buf, width, rect, b, 2, rgb, None);
+    }
+    buf
+}
+
 pub fn copy_palette_indices_for_region(world: &World, rect: RectI) -> Vec<u16> {
     let mut indices = Vec::new();
     for y in rect.min.y..=rect.max.y {
@@ -260,6 +376,19 @@ pub fn copy_debug_argb32_for_region(world: &World, rect: RectI) -> Vec<u32> {
             let pass = world.get_debug_pass(p);
             buf.push(cell_to_debug_argb32(cell, x, y, pass));
         }
+    }
+    buf
+}
+
+/// Per-pixel pass tint, pass-colored chunk grid, and (if set) the active chunk-step outline.
+pub fn copy_argb32_for_region_all_debug_views(world: &World, rect: RectI) -> Vec<u32> {
+    let mut buf = copy_debug_argb32_for_region(world, rect);
+    let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
+    draw_all_pass_batch_outlines(world, &mut buf, width, rect);
+    if let Some((coord, pass)) = world.debug_chunk_highlight() {
+        let b = world.bounds_for_chunk(coord);
+        let rgb = checker_pass_rgb(pass as usize);
+        draw_chunk_outline_on_buf(&mut buf, width, rect, b, 2, rgb, None);
     }
     buf
 }

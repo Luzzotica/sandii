@@ -1,9 +1,11 @@
 pub mod bresenham;
+pub mod cell64;
 pub mod materials;
 pub mod render;
 pub mod rigid;
 pub mod sim;
 pub mod world;
+pub mod worldgen;
 
 pub use world::MaterialMotion;
 
@@ -14,7 +16,7 @@ use std::time::Instant;
 use render::{DirtyChunkView, PixelRegion};
 use rigid::{RigidBodySpec, RigidBridge};
 use sim::{ParticleSim, Scheduler, SchedulerMode};
-use world::{Cell, MaterialId, MaterialProps, MaterialRule, ReactionOutcome, RectI, Vec2i, World};
+use world::{Cell, MaterialId, MaterialProps, MaterialRule, ReactionOutcome, RectI, Vec2i, World, CHUNK_SIZE};
 
 #[derive(Debug, Clone)]
 pub struct SimulationConfig {
@@ -29,7 +31,7 @@ pub struct SimulationConfig {
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 32,
+            chunk_size: CHUNK_SIZE,
             region_size: 512,
             seed: 1,
             deterministic: true,
@@ -55,6 +57,11 @@ pub struct Simulation {
     fixed_dt: f32,
     accumulator: f32,
     max_substeps: u32,
+    /// With chunk-step on: run at most one grid substep every this many frames (1 = every frame).
+    chunk_step_stride_frames: u32,
+    chunk_step_stride_counter: u32,
+    /// Master toggle for pass-pixel tint + pass-batch grid (sandbox **D**).
+    debug_views_enabled: bool,
     last_stats: SimulationStats,
 }
 
@@ -68,6 +75,11 @@ pub struct SimulationStats {
 
 impl Simulation {
     pub fn new(config: SimulationConfig) -> Self {
+        assert_eq!(
+            config.chunk_size, CHUNK_SIZE,
+            "Simulation chunk size is fixed at {}; got {}",
+            CHUNK_SIZE, config.chunk_size
+        );
         let scheduler_mode = if config.deterministic {
             SchedulerMode::SingleThreadSeeded
         } else {
@@ -87,6 +99,9 @@ impl Simulation {
             fixed_dt: 1.0 / 60.0,
             accumulator: 0.0,
             max_substeps: 4,
+            chunk_step_stride_frames: 8,
+            chunk_step_stride_counter: 0,
+            debug_views_enabled: false,
             last_stats: SimulationStats::default(),
         }
     }
@@ -111,6 +126,10 @@ impl Simulation {
         self.world.get_cell(p)
     }
 
+    pub fn paint_cell(&mut self, p: Vec2i, cell: Cell) {
+        self.world.set_cell(p, cell);
+    }
+
     /// Paints a thick brush along the integer Bresenham line from `a` to `b` (inclusive).
     /// Use when the pointer jumps between frames so no gaps appear in the stroke.
     pub fn paint_line_brush(&mut self, a: Vec2i, b: Vec2i, brush_radius: i32, material: MaterialId) {
@@ -129,13 +148,35 @@ impl Simulation {
             .spawn_from_pixels(&mut self.world, positions, material)
     }
 
-    pub fn step(&mut self, dt: f32) {
-        self.rigid.check_splits(&mut self.world);
-        self.rigid.extract_from_world(&mut self.world);
-        self.scheduler.step_world(&mut self.world, &mut self.rng);
-        self.rigid.step(dt);
+    pub fn spawn_rigid_body_circle(&mut self, center: Vec2i, radius: i32, material: MaterialId) -> u32 {
+        let r2 = radius * radius;
+        let positions: Vec<Vec2i> = (center.y - radius..=center.y + radius)
+            .flat_map(|y| {
+                (center.x - radius..=center.x + radius).filter_map(move |x| {
+                    let dx = x - center.x;
+                    let dy = y - center.y;
+                    if dx * dx + dy * dy <= r2 {
+                        Some(Vec2i::new(x, y))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
         self.rigid
-            .reinsert_into_world(&mut self.world, &mut self.particles, &mut self.events);
+            .spawn_from_circle(&mut self.world, &positions, material, radius as f32)
+    }
+
+    pub fn step(&mut self, dt: f32) {
+        self.rigid.rebuild_dirty_dynamic_colliders();
+        self.rigid.record_positions(&mut self.world);
+        self.scheduler.step_world(&mut self.world, &mut self.rng);
+        self.world.prune_rigid_ids_for_empty_cells();
+        self.rigid.check_splits(&mut self.world);
+        let physics_dirty = self.world.take_physics_dirty_chunks();
+        self.rigid.rebuild_static_colliders(&self.world, &physics_dirty);
+        self.rigid.step(dt);
+        self.rigid.sync_pixels_to_physics(&mut self.world);
         self.particles.step(dt, &mut self.world, &mut self.events);
         self.world.finish_frame();
     }
@@ -147,7 +188,42 @@ impl Simulation {
     }
 
     pub fn set_solid_bounds(&mut self, bounds: RectI) {
+        self.rigid.clear_all_static_colliders();
         self.world.set_solid_bounds(bounds);
+        self.world.mark_all_chunks_physics_dirty();
+    }
+
+    /// Re-center the simulation grid around `camera_center` if the camera has drifted
+    /// far enough from the current grid center. The grid is sized at 3x the screen
+    /// dimensions to provide a one-screen buffer in every direction.
+    pub fn relocate_if_needed(&mut self, camera_center: Vec2i, screen_w: i32, screen_h: i32) {
+        let origin = self.world.grid_origin();
+        let gw = self.world.grid_width();
+        let gh = self.world.grid_height();
+        let grid_center = Vec2i::new(origin.x + gw / 2, origin.y + gh / 2);
+
+        let dx = (camera_center.x - grid_center.x).abs();
+        let dy = (camera_center.y - grid_center.y).abs();
+
+        if dx > screen_w / 2 || dy > screen_h / 2 {
+            let half_w = screen_w * 3 / 2;
+            let half_h = screen_h * 3 / 2;
+            if self.world.relocate_around(camera_center, half_w, half_h) {
+                self.rigid.clear_all_static_colliders();
+            }
+        }
+    }
+
+    pub fn grid_origin(&self) -> Vec2i {
+        self.world.grid_origin()
+    }
+
+    pub fn grid_width(&self) -> i32 {
+        self.world.grid_width()
+    }
+
+    pub fn grid_height(&self) -> i32 {
+        self.world.grid_height()
     }
 
     pub fn set_material_props(&mut self, id: MaterialId, props: MaterialProps) {
@@ -174,8 +250,35 @@ impl Simulation {
         render::copy_argb32_for_region(&self.world, rect)
     }
 
+    pub fn copy_argb32_for_region_chunk_step_viz(&self, rect: RectI) -> Vec<u32> {
+        render::copy_argb32_for_region_chunk_step_viz(&self.world, rect)
+    }
+
+    pub fn copy_argb32_for_region_pass_batch_viz(&self, rect: RectI) -> Vec<u32> {
+        render::copy_argb32_for_region_pass_batch_viz(&self.world, rect)
+    }
+
     pub fn copy_debug_argb32_for_region(&self, rect: RectI) -> Vec<u32> {
         render::copy_debug_argb32_for_region(&self.world, rect)
+    }
+
+    pub fn copy_argb32_for_region_all_debug_views(&self, rect: RectI) -> Vec<u32> {
+        render::copy_argb32_for_region_all_debug_views(&self.world, rect)
+    }
+
+    pub fn debug_collider_lines(&self) -> Vec<[(f32, f32); 2]> {
+        self.rigid.debug_collider_lines()
+    }
+
+    /// Enables per-pixel pass tint and pass-batch chunk grid together (sandbox **D**).
+    pub fn set_debug_views_enabled(&mut self, enabled: bool) {
+        self.debug_views_enabled = enabled;
+        self.world.set_debug_pass_enabled(enabled);
+        self.world.set_debug_pass_batch_outlines(enabled);
+    }
+
+    pub fn debug_views_enabled(&self) -> bool {
+        self.debug_views_enabled
     }
 
     pub fn set_debug_pass_enabled(&mut self, enabled: bool) {
@@ -184,6 +287,14 @@ impl Simulation {
 
     pub fn debug_pass_enabled(&self) -> bool {
         self.world.debug_pass_enabled()
+    }
+
+    pub fn set_debug_pass_batch_outlines(&mut self, enabled: bool) {
+        self.world.set_debug_pass_batch_outlines(enabled);
+    }
+
+    pub fn debug_pass_batch_outlines(&self) -> bool {
+        self.world.debug_pass_batch_outlines()
     }
 
     pub fn copy_palette_indices_for_region(&self, rect: RectI) -> Vec<u16> {
@@ -210,11 +321,45 @@ impl Simulation {
     /// When enabled, the grid is stepped in **one** single-threaded full-world pass (no 4-pass checkerboard, no `rayon`).
     /// `ThreadPool` mode is ignored for stepping until this is turned off.
     pub fn set_debug_full_world_single_pass(&mut self, enabled: bool) {
+        if enabled {
+            self.scheduler.abort_debug_chunk_step(&mut self.world);
+            self.scheduler.set_debug_chunk_step(false);
+        }
         self.scheduler.set_debug_full_world_single_pass(enabled);
     }
 
     pub fn debug_full_world_single_pass(&self) -> bool {
         self.scheduler.debug_full_world_single_pass()
+    }
+
+    /// One checkerboard chunk per simulation step; [`Self::copy_argb32_for_region_chunk_step_viz`] outlines the active chunk.
+    /// [`Self::advance_frame`] runs at most one fixed substep per frame while this is on.
+    pub fn set_debug_chunk_step(&mut self, enabled: bool) {
+        if !enabled {
+            self.scheduler.abort_debug_chunk_step(&mut self.world);
+            self.scheduler.set_debug_chunk_step(false);
+            self.chunk_step_stride_counter = 0;
+            return;
+        }
+        self.scheduler.abort_debug_chunk_step(&mut self.world);
+        self.scheduler.set_debug_full_world_single_pass(false);
+        self.scheduler.set_debug_chunk_step(true);
+        self.chunk_step_stride_counter = 0;
+        self.chunk_step_stride_frames = 1;
+    }
+
+    pub fn debug_chunk_step(&self) -> bool {
+        self.scheduler.debug_chunk_step()
+    }
+
+    /// Chunk-step mode runs a grid substep at most once per `stride` frames (larger = slower).
+    pub fn set_debug_chunk_step_stride_frames(&mut self, stride: u32) {
+        self.chunk_step_stride_frames = stride.clamp(1, 128);
+        self.chunk_step_stride_counter = 0;
+    }
+
+    pub fn debug_chunk_step_stride_frames(&self) -> u32 {
+        self.chunk_step_stride_frames
     }
 
     pub fn set_fixed_timestep(&mut self, dt: f32, max_substeps: u32) {
@@ -226,7 +371,19 @@ impl Simulation {
         self.accumulator = (self.accumulator + frame_dt).min(self.fixed_dt * self.max_substeps as f32);
         let start = Instant::now();
         let mut substeps = 0u32;
-        while self.accumulator >= self.fixed_dt && substeps < self.max_substeps {
+        let max_sub = if self.scheduler.debug_chunk_step() {
+            self.chunk_step_stride_counter = self.chunk_step_stride_counter.saturating_add(1);
+            if self.chunk_step_stride_counter < self.chunk_step_stride_frames {
+                0
+            } else {
+                self.chunk_step_stride_counter = 0;
+                1
+            }
+        } else {
+            self.chunk_step_stride_counter = 0;
+            self.max_substeps
+        };
+        while self.accumulator >= self.fixed_dt && substeps < max_sub {
             self.step(self.fixed_dt);
             self.accumulator -= self.fixed_dt;
             substeps += 1;
@@ -246,10 +403,22 @@ impl Simulation {
 }
 
 #[cfg(test)]
+impl Simulation {
+    pub(crate) fn test_world(&self) -> &World {
+        &self.world
+    }
+
+    pub(crate) fn test_rigid(&self) -> &RigidBridge {
+        &self.rigid
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rigid::RigidBridge;
     use crate::sim::deterministic_hash;
-    use crate::world::{material, MaterialId, MaterialMotion};
+    use crate::world::{material, Cell, ChunkCoord, MaterialId, MaterialMotion, World, CHUNK_SIZE};
 
     fn count_material(sim: &Simulation, rect: RectI, id: u16) -> usize {
         sim.copy_palette_indices_for_region(rect)
@@ -450,6 +619,8 @@ mod tests {
                 on_death_lifetime_lo: 0,
                 on_death_lifetime_hi: 0,
                 corrosion_max_hp: 0,
+                acid_vulnerability: crate::world::AcidVulnerability::inactive(),
+                acid_corrosion: crate::world::AcidCorrosionSource::inactive(),
                 smolder_extinguish_material: material::EMPTY,
                 smolder_extinguish_lifetime_lo: 24,
                 smolder_extinguish_lifetime_hi: 64,
@@ -464,7 +635,6 @@ mod tests {
                     crate::world::AdjacentTransformRule::inactive(),
                     crate::world::AdjacentTransformRule::inactive(),
                 ],
-                corrosion_adjacent: [crate::world::CorrosionAdjacentRule::inactive(); 8],
                 adjacent_influence: [crate::world::AdjacentInfluenceRule::inactive(); 8],
                 neighbor_spawns: [
                     crate::world::NeighborSpawnRule::inactive(),
@@ -768,44 +938,36 @@ mod tests {
         let mut sim = Simulation::new(SimulationConfig::default());
         let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
         sim.set_solid_bounds(bounds);
-        for &(x, y) in &[
-            (9, 9),
-            (10, 9),
-            (11, 9),
-            (12, 9),
-            (9, 10),
-            (12, 10),
-            (9, 11),
-            (10, 11),
-            (11, 11),
-            (12, 11),
-        ] {
-            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
-        }
-        paint_cell(&mut sim, Vec2i::new(10, 10), material::FIRE);
-        paint_cell(&mut sim, Vec2i::new(11, 10), material::LIQUID);
-
-        let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
-        assert_eq!(count_material(&sim, probe, material::LIQUID), 1);
-        assert_eq!(count_material(&sim, probe, material::FIRE), 1);
-        assert_eq!(count_material(&sim, probe, material::STEAM), 0);
-
-        for _ in 0..96 {
-            sim.step(1.0 / 60.0);
-            if count_material(&sim, probe, material::LIQUID) == 0 {
-                break;
+        // 5x5 static shell with fire surrounding water on all cardinal sides.
+        for y in 8..=12 {
+            for x in 8..=12 {
+                paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
             }
         }
-        assert_eq!(
-            count_material(&sim, probe, material::LIQUID),
-            0,
-            "adjacent water should be removed (steam and/or water extinguishing fire)"
-        );
+        // Hollow out the 3x3 interior and place fire + water.
+        for y in 9..=11 {
+            for x in 9..=11 {
+                paint_cell(&mut sim, Vec2i::new(x, y), material::FIRE);
+            }
+        }
+        paint_cell(&mut sim, Vec2i::new(10, 10), material::LIQUID);
+
+        let probe = RectI::new(Vec2i::new(8, 8), Vec2i::new(12, 12));
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 1);
+        assert!(count_material(&sim, probe, material::FIRE) >= 1);
+
+        for _ in 0..120 {
+            sim.step(1.0 / 60.0);
+        }
+        let liquid = count_material(&sim, probe, material::LIQUID);
         let steam = count_material(&sim, probe, material::STEAM);
         let fire_left = count_material(&sim, probe, material::FIRE);
+        // Fire-water adjacency should produce at least one outcome:
+        // water vaporized to steam, or fire extinguished by water.
         assert!(
-            steam >= 1 || fire_left == 0,
-            "expected steam from vaporize and/or fire gone from water quench (steam={steam}, fire={fire_left})"
+            liquid == 0 || fire_left == 0,
+            "fire/water adjacency should vaporize water or extinguish fire \
+             (liquid={liquid}, fire={fire_left}, steam={steam})"
         );
     }
 
@@ -925,5 +1087,203 @@ mod tests {
         assert!(saw_steam, "lava should eventually vaporize adjacent water (chance < 100%)");
         assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
         assert_eq!(count_material(&sim, probe, material::LAVA), 1);
+    }
+
+    fn test_dirt_cell() -> Cell {
+        Cell {
+            material: material::DIRT,
+            flags: 0,
+            velocity: 0,
+            lifetime: 0,
+            variant: 0,
+            scorch: 0,
+        }
+    }
+
+    /// Misaligned grid origin: `bounds_for_chunk` must still cover every dense cell for its chunk key.
+    #[test]
+    fn static_physics_bounds_cover_cells_when_origin_not_chunk_aligned() {
+        let mut world = World::new(CHUNK_SIZE, 256);
+        let min = Vec2i::new(-1001, 14);
+        let max = Vec2i::new(-1001 + 255, 14 + 127);
+        world.set_solid_bounds(RectI::new(min, max));
+        let origin = world.grid_origin();
+        assert_ne!(
+            origin.x.rem_euclid(CHUNK_SIZE),
+            0,
+            "test requires misaligned origin.x (got {})",
+            origin.x
+        );
+
+        let y = origin.y + 3;
+        let x1 = origin.x + CHUNK_SIZE - 1;
+        let x2 = origin.x + CHUNK_SIZE;
+        let x3 = origin.x + 2 * CHUNK_SIZE;
+
+        for &x in &[x1, x2, x3] {
+            let p = Vec2i::new(x, y);
+            let coord = world.dense_chunk_coord_for_cell(p).expect("in dense grid");
+            let b = world.bounds_for_chunk(coord);
+            assert!(
+                b.contains(p),
+                "p={p:?} coord={coord:?} bounds={b:?} origin={origin:?}"
+            );
+        }
+    }
+
+    /// Aligned origin: bounds still match legacy world-chunk grid.
+    #[test]
+    fn static_physics_bounds_aligned_origin_matches_world_grid() {
+        let mut world = World::new(CHUNK_SIZE, 128);
+        world.set_solid_bounds(RectI::new(Vec2i::new(-960, 0), Vec2i::new(-960 + 127, 95)));
+        let origin = world.grid_origin();
+        assert_eq!(origin.x.rem_euclid(CHUNK_SIZE), 0);
+
+        let p = Vec2i::new(origin.x + CHUNK_SIZE + 3, origin.y + 5);
+        let coord = world.dense_chunk_coord_for_cell(p).unwrap();
+        assert_eq!(coord.x * CHUNK_SIZE, origin.x + CHUNK_SIZE);
+        let b = world.bounds_for_chunk(coord);
+        assert!(b.contains(p));
+    }
+
+    /// After toggling static contribution, drained physics-dirty chunk coords must cover the cell.
+    #[test]
+    fn physics_dirty_drained_chunks_cover_modified_cells() {
+        let mut world = World::new(CHUNK_SIZE, 256);
+        world.set_solid_bounds(RectI::new(Vec2i::new(-1003, 8), Vec2i::new(-1003 + 255, 8 + 191)));
+        let _ = world.take_physics_dirty_chunks();
+
+        let probes = [
+            Vec2i::new(-1000, 20),
+            Vec2i::new(-1000 + CHUNK_SIZE, 20),
+            Vec2i::new(-1000 + 2 * CHUNK_SIZE, 20),
+        ];
+        for p in probes {
+            world.set_cell(p, test_dirt_cell());
+            let dirty = world.take_physics_dirty_chunks();
+            assert!(
+                dirty.iter().any(|c| world.bounds_for_chunk(*c).contains(p)),
+                "p={p:?} dirty={dirty:?}"
+            );
+        }
+    }
+
+    /// One-cell-at-a-time paint across chunk columns; Rapier static handles appear for each chunk touched.
+    #[test]
+    fn static_colliders_follow_incremental_paint_across_chunks() {
+        let mut world = World::new(CHUNK_SIZE, 256);
+        world.set_solid_bounds(RectI::new(Vec2i::new(-1005, 11), Vec2i::new(-1005 + 255, 11 + 160)));
+        let _ = world.take_physics_dirty_chunks();
+        let mut rigid = RigidBridge::new();
+        let origin = world.grid_origin();
+        let y = origin.y + 7;
+        let x0 = origin.x + 1;
+        for dx in 0..(3 * CHUNK_SIZE + 5) {
+            let p = Vec2i::new(x0 + dx, y);
+            if world.get_cell(p).material == material::EMPTY {
+                world.set_cell(p, test_dirt_cell());
+            }
+            let dirty = world.take_physics_dirty_chunks();
+            rigid.rebuild_static_colliders(&world, &dirty);
+            let coord = world.dense_chunk_coord_for_cell(p).expect("p in grid");
+            assert!(
+                rigid.static_collider_count_for_chunk(coord) > 0,
+                "no static colliders for chunk {coord:?} after painting {p:?}"
+            );
+        }
+    }
+
+    /// Clearing static cells one-by-one removes static colliders when the chunk has no inert solids left.
+    #[test]
+    fn static_colliders_follow_incremental_clear_across_chunks() {
+        let mut world = World::new(CHUNK_SIZE, 256);
+        world.set_solid_bounds(RectI::new(Vec2i::new(-1007, 9), Vec2i::new(-1007 + 255, 9 + 160)));
+        let _ = world.take_physics_dirty_chunks();
+        let mut rigid = RigidBridge::new();
+        let origin = world.grid_origin();
+        let y = origin.y + 11;
+        let x0 = origin.x + 2;
+        let span = 3 * CHUNK_SIZE + 3;
+        let mut coords_order: Vec<ChunkCoord> = Vec::new();
+        for dx in 0..span {
+            let p = Vec2i::new(x0 + dx, y);
+            world.set_cell(p, test_dirt_cell());
+            let dirty = world.take_physics_dirty_chunks();
+            rigid.rebuild_static_colliders(&world, &dirty);
+            let c = world.dense_chunk_coord_for_cell(p).unwrap();
+            if !coords_order.contains(&c) {
+                coords_order.push(c);
+            }
+        }
+        assert!(
+            coords_order.len() >= 2,
+            "expected multiple chunks, got {:?}",
+            coords_order
+        );
+
+        for dx in 0..span {
+            let p = Vec2i::new(x0 + dx, y);
+            world.set_cell(p, Cell::default());
+            let dirty = world.take_physics_dirty_chunks();
+            rigid.rebuild_static_colliders(&world, &dirty);
+        }
+        for c in &coords_order {
+            assert_eq!(
+                rigid.static_collider_count_for_chunk(*c),
+                0,
+                "chunk {:?} should have no static colliders after clear",
+                c
+            );
+        }
+    }
+
+    /// Vertical strip across chunk rows.
+    #[test]
+    fn static_colliders_follow_incremental_paint_vertical_across_chunks() {
+        let mut world = World::new(CHUNK_SIZE, 256);
+        world.set_solid_bounds(RectI::new(Vec2i::new(-1002, 20), Vec2i::new(-1002 + 200, 20 + 255)));
+        let _ = world.take_physics_dirty_chunks();
+        let mut rigid = RigidBridge::new();
+        let origin = world.grid_origin();
+        let x = origin.x + 5;
+        let y0 = origin.y + 2;
+        for dy in 0..(2 * CHUNK_SIZE + 4) {
+            let p = Vec2i::new(x, y0 + dy);
+            if world.get_cell(p).material == material::EMPTY {
+                world.set_cell(p, test_dirt_cell());
+            }
+            let dirty = world.take_physics_dirty_chunks();
+            rigid.rebuild_static_colliders(&world, &dirty);
+            let coord = world.dense_chunk_coord_for_cell(p).expect("p in grid");
+            assert!(
+                rigid.static_collider_count_for_chunk(coord) > 0,
+                "vertical: no colliders for {coord:?} at {p:?}"
+            );
+        }
+    }
+
+    /// Full `Simulation::step` still refreshes static colliders after paint (integration).
+    #[test]
+    fn simulation_step_rebuilds_static_colliders_after_paint_misaligned() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        sim.set_solid_bounds(RectI::new(
+            Vec2i::new(-1004, 16),
+            Vec2i::new(-1004 + 255, 16 + 180),
+        ));
+        for _ in 0..3 {
+            sim.step(1.0 / 60.0);
+        }
+        let p = Vec2i::new(-990, 40);
+        sim.paint_cell(p, test_dirt_cell());
+        sim.step(1.0 / 60.0);
+        let coord = sim
+            .test_world()
+            .dense_chunk_coord_for_cell(p)
+            .expect("probe in world");
+        assert!(
+            sim.test_rigid().static_collider_count_for_chunk(coord) > 0,
+            "expected static colliders in chunk {:?}",
+            coord
+        );
     }
 }

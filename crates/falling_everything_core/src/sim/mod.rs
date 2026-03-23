@@ -312,6 +312,14 @@ pub enum SchedulerMode {
     ThreadPool,
 }
 
+struct ChunkStepState {
+    pass_order: [usize; 4],
+    pass_idx: usize,
+    coords: Vec<ChunkCoord>,
+    coord_idx: usize,
+    pending_explosions: Vec<(Vec2i, i32)>,
+}
+
 pub struct Scheduler {
     mode: SchedulerMode,
     seed: u64,
@@ -319,6 +327,9 @@ pub struct Scheduler {
     /// When true, skips the 4-pass checkerboard chunk schedule: single-threaded full-grid scan once
     /// per tick (no `rayon`). Ignores `ThreadPool` for stepping. Reseeds RNG like `SingleThreadSeeded`.
     debug_full_world_single_pass: bool,
+    /// One checkerboard chunk per [`Scheduler::step_world`] call; uses [`World::set_debug_chunk_highlight`].
+    debug_chunk_step: bool,
+    chunk_step: Option<ChunkStepState>,
 }
 
 impl Scheduler {
@@ -328,6 +339,8 @@ impl Scheduler {
             seed,
             tick: 0,
             debug_full_world_single_pass: false,
+            debug_chunk_step: false,
+            chunk_step: None,
         }
     }
 
@@ -347,9 +360,51 @@ impl Scheduler {
         self.debug_full_world_single_pass = enabled;
     }
 
+    pub fn debug_chunk_step(&self) -> bool {
+        self.debug_chunk_step
+    }
+
+    pub fn set_debug_chunk_step(&mut self, enabled: bool) {
+        self.debug_chunk_step = enabled;
+    }
+
+    /// Finish a partial chunk-step tick without stepping further (e.g. when turning debug off).
+    pub fn abort_debug_chunk_step(&mut self, world: &mut World) {
+        if let Some(state) = self.chunk_step.take() {
+            world.set_debug_chunk_highlight(None);
+            world.finish_sim();
+            for (center, radius) in state.pending_explosions {
+                process_explosion(world, center, radius);
+            }
+        }
+    }
+
     pub fn step_world(&mut self, world: &mut World, rng: &mut SmallRng) {
+        if self.debug_full_world_single_pass {
+            self.tick = self.tick.saturating_add(1);
+            let reseed_tick_rng =
+                matches!(self.mode, SchedulerMode::SingleThreadSeeded) || self.debug_full_world_single_pass;
+            if reseed_tick_rng {
+                *rng = SmallRng::seed_from_u64(self.seed ^ self.tick);
+            }
+            world.advance_awake_flags();
+            world.prepare_sim();
+            let sg = SimGrids::from_world(world);
+            let all_explosions = process_world_full_pass(&sg, world, rng);
+            world.finish_sim();
+            for (center, radius) in all_explosions {
+                process_explosion(world, center, radius);
+            }
+            return;
+        }
+
+        if self.debug_chunk_step {
+            self.step_world_one_chunk(world, rng);
+            return;
+        }
+
         self.tick = self.tick.saturating_add(1);
-        let reseed_tick_rng = matches!(self.mode, SchedulerMode::SingleThreadSeeded) || self.debug_full_world_single_pass;
+        let reseed_tick_rng = matches!(self.mode, SchedulerMode::SingleThreadSeeded);
         if reseed_tick_rng {
             *rng = SmallRng::seed_from_u64(self.seed ^ self.tick);
         }
@@ -359,47 +414,38 @@ impl Scheduler {
 
         let mut all_explosions: Vec<(Vec2i, i32)> = Vec::new();
 
-        if self.debug_full_world_single_pass {
-            let sg = SimGrids::from_world(world);
-            all_explosions = process_world_full_pass(&sg, world, rng);
+        let pass_order: [usize; 4] = if (self.tick & 1) == 0 {
+            [0, 1, 2, 3]
         } else {
-            let mut pass_order: [usize; 4] = [0, 1, 2, 3];
-            if matches!(self.mode, SchedulerMode::ThreadPool) {
-                pass_order.shuffle(rng);
-            }
-
-            for &pass in &pass_order {
-                let coords: Vec<ChunkCoord> = world
-                    .active_chunk_coords_for_pass(pass)
-                    .into_iter()
-                    .filter(|c| world.is_chunk_awake(*c))
-                    .collect();
-                match self.mode {
-                    SchedulerMode::SingleThreadSeeded => {
-                        for coord in coords {
-                            let explosions = {
-                                let sg = SimGrids::from_world(world);
-                                process_chunk(&sg, world, coord, pass as u8, rng)
-                            };
-                            all_explosions.extend(explosions);
-                        }
-                    }
-                    SchedulerMode::ThreadPool => {
+            [2, 3, 0, 1]
+        };
+        for pass in pass_order {
+            let coords: Vec<ChunkCoord> = world.active_chunk_coords_for_pass(pass).into_iter().collect();
+            match self.mode {
+                SchedulerMode::SingleThreadSeeded => {
+                    for coord in coords {
                         let sg = SimGrids::from_world(world);
-                        let tick = self.tick;
-                        let seed = self.seed;
-                        let pass_u8 = pass as u8;
-                        let results: Vec<Vec<(Vec2i, i32)>> = coords
-                            .par_iter()
-                            .map(|coord| {
-                                let mut local_rng =
-                                    SmallRng::seed_from_u64(seed ^ tick ^ ((coord.x as u64) << 32) ^ coord.y as u64);
-                                process_chunk(&sg, world, *coord, pass_u8, &mut local_rng)
-                            })
-                            .collect();
-                        for explosions in results {
-                            all_explosions.extend(explosions);
-                        }
+                        let explosions = process_chunk(&sg, world, coord, pass as u8, rng);
+                        all_explosions.extend(explosions);
+                    }
+                }
+                SchedulerMode::ThreadPool => {
+                    // Parallelism is **per chunk** within this pass: each `ChunkCoord` is one rayon task.
+                    // A single 64×64 chunk is still stepped on one thread (cells are not split across threads).
+                    let sg = SimGrids::from_world(world);
+                    let tick = self.tick;
+                    let seed = self.seed;
+                    let pass_u8 = pass as u8;
+                    let results: Vec<Vec<(Vec2i, i32)>> = coords
+                        .par_iter()
+                        .map(|coord| {
+                            let mut local_rng =
+                                SmallRng::seed_from_u64(seed ^ tick ^ ((coord.x as u64) << 32) ^ coord.y as u64);
+                            process_chunk(&sg, world, *coord, pass_u8, &mut local_rng)
+                        })
+                        .collect();
+                    for explosions in results {
+                        all_explosions.extend(explosions);
                     }
                 }
             }
@@ -409,6 +455,87 @@ impl Scheduler {
 
         for (center, radius) in all_explosions {
             process_explosion(world, center, radius);
+        }
+    }
+
+    fn step_world_one_chunk(&mut self, world: &mut World, rng: &mut SmallRng) {
+        if self.chunk_step.is_none() {
+            self.tick = self.tick.saturating_add(1);
+            let reseed_tick_rng = matches!(self.mode, SchedulerMode::SingleThreadSeeded) || self.debug_chunk_step;
+            if reseed_tick_rng {
+                *rng = SmallRng::seed_from_u64(self.seed ^ self.tick);
+            }
+            world.advance_awake_flags();
+            world.prepare_sim();
+            let pass_order: [usize; 4] = if (self.tick & 1) == 0 {
+                [0, 1, 2, 3]
+            } else {
+                [2, 3, 0, 1]
+            };
+            let mut pass_idx = 0usize;
+            let mut coords = world.active_chunk_coords_for_pass(pass_order[0]);
+            while coords.is_empty() && pass_idx < 3 {
+                pass_idx += 1;
+                coords = world.active_chunk_coords_for_pass(pass_order[pass_idx]);
+            }
+            if coords.is_empty() {
+                world.finish_sim();
+                world.set_debug_chunk_highlight(None);
+                return;
+            }
+            self.chunk_step = Some(ChunkStepState {
+                pass_order,
+                pass_idx,
+                coords,
+                coord_idx: 0,
+                pending_explosions: Vec::new(),
+            });
+        }
+
+        let state = self.chunk_step.as_mut().expect("chunk_step");
+        let pass = state.pass_order[state.pass_idx] as u8;
+        let coord = state.coords[state.coord_idx];
+        world.set_debug_chunk_highlight(Some((coord, pass)));
+
+        let sg = SimGrids::from_world(world);
+        let explosions = match self.mode {
+            SchedulerMode::SingleThreadSeeded => process_chunk(&sg, world, coord, pass, rng),
+            SchedulerMode::ThreadPool => {
+                // Chunk-step mode runs one chunk per `step_world`; there is nothing for rayon to fan out.
+                let mut local_rng =
+                    SmallRng::seed_from_u64(self.seed ^ self.tick ^ ((coord.x as u64) << 32) ^ coord.y as u64);
+                process_chunk(&sg, world, coord, pass, &mut local_rng)
+            }
+        };
+        state.pending_explosions.extend(explosions);
+        state.coord_idx += 1;
+
+        if state.coord_idx >= state.coords.len() {
+            state.coord_idx = 0;
+            state.pass_idx += 1;
+            while state.pass_idx < 4 {
+                state.coords = world.active_chunk_coords_for_pass(state.pass_order[state.pass_idx]);
+                if !state.coords.is_empty() {
+                    break;
+                }
+                state.pass_idx += 1;
+            }
+        }
+
+        if state.pass_idx >= 4 {
+            let explosions = std::mem::take(&mut state.pending_explosions);
+            self.chunk_step = None;
+            world.set_debug_chunk_highlight(None);
+            world.finish_sim();
+            for (center, radius) in explosions {
+                process_explosion(world, center, radius);
+            }
+        } else {
+            // `World::get_cell` reads the read buffer; sim writes the write buffer until `finish_sim`
+            // swaps. Without committing after each chunk, rendering (and any read-buffer logic) stays
+            // stuck on the pre-tick read grid for the whole multi-chunk tick — looks like the sim froze.
+            world.finish_sim();
+            world.prepare_sim();
         }
     }
 }
@@ -571,29 +698,38 @@ impl SimGrids {
             })
     }
 
+    #[inline]
     fn was_moved(&self, p: Vec2i) -> bool {
         self.index(p)
-            .map(|i| unsafe { *self.read.add(i) != *self.write.add(i) })
+            .map(|i| {
+                unsafe { *self.read.add(i) != *self.write.add(i) }
+            })
             .unwrap_or(false)
     }
 
     fn set_velocity(&self, p: Vec2i, vel: i8) {
         if let Some(i) = self.index(p) {
-            unsafe { (*self.write.add(i)).velocity = vel; }
+            unsafe {
+                (*self.write.add(i)).velocity = vel;
+            }
             self.wake_at(p);
         }
     }
 
     fn set_cell(&self, p: Vec2i, cell: Cell) {
         if let Some(i) = self.index(p) {
-            unsafe { *self.write.add(i) = cell; }
+            unsafe {
+                *self.write.add(i) = cell;
+            }
             self.wake_at(p);
         }
     }
 
     fn set_lifetime(&self, p: Vec2i, lifetime: u8) {
         if let Some(i) = self.index(p) {
-            unsafe { (*self.write.add(i)).lifetime = lifetime; }
+            unsafe {
+                (*self.write.add(i)).lifetime = lifetime;
+            }
             self.wake_at(p);
         }
     }
@@ -601,12 +737,14 @@ impl SimGrids {
     fn set_flag(&self, p: Vec2i, flag: u16) {
         if let Some(i) = self.index(p) {
             unsafe { (*self.write.add(i)).flags |= flag; }
+            self.wake_at(p);
         }
     }
 
     fn clear_flag(&self, p: Vec2i, flag: u16) {
         if let Some(i) = self.index(p) {
             unsafe { (*self.write.add(i)).flags &= !flag; }
+            self.wake_at(p);
         }
     }
 
@@ -628,6 +766,9 @@ impl SimGrids {
     }
 
     fn try_displace(&self, world: &World, from: Vec2i, to: Vec2i, intent: MoveIntent, rng: &mut SmallRng) -> bool {
+        // Conflict policy: checkerboard phases prevent concurrent adjacent chunk stepping, so writes to
+        // the same target cell in a phase are not expected. If two candidates contend across serial order,
+        // the first processed source in scan order wins and tags frame bits; later attempts observe the new state.
         let Some(from_idx) = self.index(from) else {
             return false;
         };
@@ -711,7 +852,7 @@ fn can_displace(
     _from_rule: MaterialRule,
     to_cell: Cell,
     to_props: MaterialProps,
-    to_rule: MaterialRule,
+    _to_rule: MaterialRule,
     intent: MoveIntent,
     rng: &mut SmallRng,
 ) -> bool {
@@ -739,7 +880,8 @@ fn can_displace(
         }
         MoveIntent::Lateral => match (from_props.phase(), to_props.phase()) {
             (Phase::Gas, Phase::Gas) => true,
-            (Phase::Liquid, Phase::Liquid) => to_rule.miscible,
+            // Liquids do not swap sideways with other liquids (avoids pool shimmer / edge ping-pong).
+            (Phase::Liquid, Phase::Liquid) => false,
             (Phase::Liquid, Phase::Gas) => true,
             _ => false,
         },
@@ -753,6 +895,17 @@ fn step_pixel(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explos
     let cell = sg.get(p);
     if cell.material == material::EMPTY {
         return;
+    }
+    // Rigid-body pixels are STATIC + RIGID_BODY_SIM for the sim step; still vaporize adjacent water like lava.
+    if cell.material == material::STATIC
+        && (cell.flags & cell_flags::RIGID_BODY_SIM) != 0
+        && (cell.flags & cell_flags::ON_FIRE) != 0
+        && cell.lifetime > 0
+    {
+        let lava_props = world.material_props(material::LAVA);
+        if lava_props.has_adjacent_transforms() {
+            step_adjacent_transform_neighbors(sg, world, p, &lava_props, rng);
+        }
     }
     if cell.material == material::EMBER {
         step_ember(sg, world, p, rng, explosions);
@@ -995,7 +1148,14 @@ fn step_smoldering_fuel(
 ) {
     sg.wake_at(p);
     let cell = sg.get(p);
-    let props = world.material_props(cell.material);
+    let rigid_heat_proxy = cell.material == material::STATIC
+        && (cell.flags & cell_flags::RIGID_BODY_SIM) != 0
+        && (cell.flags & cell_flags::ON_FIRE) != 0;
+    let props = if rigid_heat_proxy {
+        world.material_props(material::LAVA)
+    } else {
+        world.material_props(cell.material)
+    };
 
     const NEIGHBORS8: [(i32, i32); 8] = [
         (-1, -1),
@@ -1021,7 +1181,11 @@ fn step_smoldering_fuel(
         }
         let nl = src.lifetime.saturating_sub(ADJ_ACTOR_WATER_QUENCH_LIFETIME);
         if nl == 0 {
-            let out_props = world.material_props(src.material);
+            let out_props = world.material_props(if (src.flags & cell_flags::RIGID_BODY_SIM) != 0 {
+                material::LAVA
+            } else {
+                src.material
+            });
             eliminate_smoldering_fuel_at(sg, world, p, &out_props, &src, rng, explosions, false);
             return;
         }
@@ -1043,7 +1207,11 @@ fn step_smoldering_fuel(
     let rate = props.consumption_rate.max(1) as u32;
     if rng.gen_ratio(rate, 256) {
         if life <= 1 {
-            let burn_props = world.material_props(cell.material);
+            let burn_props = world.material_props(if (cell.flags & cell_flags::RIGID_BODY_SIM) != 0 {
+                material::LAVA
+            } else {
+                cell.material
+            });
             eliminate_smoldering_fuel_at(sg, world, p, &burn_props, &cell, rng, explosions, true);
             return;
         }
@@ -1053,10 +1221,15 @@ fn step_smoldering_fuel(
     try_neighbor_spawns(sg, world, p, &props, rng);
 
     let c = sg.get(p);
-    if c.material == material::LAVA
+    let rigid_lava_proxy = c.material == material::STATIC
+        && (c.flags & cell_flags::RIGID_BODY_SIM) != 0
         && c.lifetime > 0
-        && (c.flags & cell_flags::ON_FIRE != 0)
-    {
+        && (c.flags & cell_flags::ON_FIRE != 0);
+    let molten_lava = c.material == material::LAVA
+        && c.lifetime > 0
+        && (c.flags & cell_flags::ON_FIRE != 0);
+
+    if rigid_lava_proxy || molten_lava {
         let life = c.lifetime;
         let heat_factor = life as f32 / 255.0;
         let _ = spread_burn_to_neighbors(
@@ -1207,10 +1380,23 @@ fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     }
 }
 
+/// Diagonal / lateral tie-break: **do not** use vertical `velocity` (it is almost always > 0 after
+/// gravity accel and wrongly biases flow to the right).
+#[inline]
+fn liquid_prefer_left_first(p: Vec2i) -> bool {
+    (p.x ^ p.y) & 1 == 0
+}
+
+/// Supported liquid loses this much vertical speed per tick when it cannot slide (viscous drag).
+#[inline]
+fn liquid_supported_friction(props: &MaterialProps) -> i8 {
+    (1 + (props.viscosity() as i16 / 32).min(3)) as i8
+}
+
 fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     let cell = sg.get(p);
     let props = world.material_props(cell.material);
-    if props.has_corrosion_adjacent() {
+    if props.has_acid_corrosion() {
         acid_corrode_neighbors(sg, world, p, &props, rng);
     }
     if props.has_adjacent_influence() {
@@ -1219,6 +1405,38 @@ fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
             return;
         }
     }
+
+    let cell = sg.get(p);
+    let props = world.material_props(cell.material);
+
+    let below = Vec2i::new(p.x, p.y + 1);
+    let below_cell = sg.get(below);
+    let below_props = world.material_props(below_cell.material);
+    let can_fall = below_cell.material == material::EMPTY
+        || (!below_props.inert()
+            && vertical_down_allows_density_swap(props.phase(), below_props.phase())
+            && props.density > below_props.density);
+
+    if !can_fall {
+        if cell.velocity == 0 {
+            // One slip attempt without requiring fall speed (opens v=0 puddles toward holes only).
+            if step_liquid_supported_slide(sg, world, p, rng) {
+                return;
+            }
+            sg.set_velocity(p, 0);
+            return;
+        }
+
+        if step_liquid_supported_slide(sg, world, p, rng) {
+            return;
+        }
+
+        let v = sg.get(p).velocity;
+        let friction = liquid_supported_friction(&props);
+        sg.set_velocity(p, (v - friction).max(0));
+        return;
+    }
+
     let new_vel = ((cell.velocity as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
     sg.set_velocity(p, new_vel);
 
@@ -1231,67 +1449,141 @@ fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
             current = down;
             continue;
         }
-        let left_first = rng.gen_bool(0.5);
+
         let dl = Vec2i::new(current.x - 1, current.y + 1);
         let dr = Vec2i::new(current.x + 1, current.y + 1);
-        let (first, second) = if left_first { (dl, dr) } else { (dr, dl) };
-        if sg.try_displace(world, current, first, MoveIntent::VerticalDown, rng) {
-            current = first;
-        } else if sg.try_displace(world, current, second, MoveIntent::VerticalDown, rng) {
-            current = second;
+        let prefer_left_first = liquid_prefer_left_first(current);
+
+        let moved_diag = if prefer_left_first {
+            if sg.try_displace(world, current, dl, MoveIntent::VerticalDown, rng) {
+                current = dl;
+                true
+            } else if sg.try_displace(world, current, dr, MoveIntent::VerticalDown, rng) {
+                current = dr;
+                true
+            } else {
+                false
+            }
+        } else if sg.try_displace(world, current, dr, MoveIntent::VerticalDown, rng) {
+            current = dr;
+            true
+        } else if sg.try_displace(world, current, dl, MoveIntent::VerticalDown, rng) {
+            current = dl;
+            true
         } else {
-            sg.set_velocity(current, 0);
-            break;
+            false
+        };
+
+        if moved_diag {
+            continue;
         }
+
+        if step_liquid_supported_slide(sg, world, current, rng) {
+            return;
+        }
+
+        let v = sg.get(current).velocity;
+        let friction = liquid_supported_friction(&props);
+        sg.set_velocity(current, (v - friction).max(0));
+        return;
     }
 
     let below_current = Vec2i::new(current.x, current.y + 1);
-    let supported = sg.get(below_current).material != material::EMPTY;
-    if supported {
-        let lateral_chance = (255 - props.viscosity() as i32).clamp(0, 255) as u32;
-        if !rng.gen_ratio(lateral_chance + 1, 256) {
-            return;
-        }
-        let rule = world.material_rule(sg.get(current).material);
-        let spread = rule.lateral_spread.max(1) as i32;
-
-        let left_target = scan_lateral_target(sg, current, -1, spread);
-        let right_target = scan_lateral_target(sg, current, 1, spread);
-
-        let dir = match (left_target, right_target) {
-            (Some(l), Some(r)) => {
-                if l < r { -1 }
-                else if r < l { 1 }
-                else if rng.gen_bool(0.5) { -1 } else { 1 }
-            }
-            (Some(_), None) => -1,
-            (None, Some(_)) => 1,
-            (None, None) => {
-                let above = Vec2i::new(current.x, current.y - 1);
-                let above_props = world.material_props(sg.get(above).material);
-                if above_props.phase() == Phase::Liquid || above_props.phase() == Phase::Solid {
-                    if rng.gen_bool(0.5) { -1 } else { 1 }
-                } else {
-                    return;
-                }
-            }
-        };
-
-        let max_move = spread.min(2);
-        for i in 1..=max_move {
-            let side = Vec2i::new(current.x + dir * i, current.y);
-            if sg.try_displace(world, current, side, MoveIntent::Lateral, rng) {
-                current = side;
-            } else {
-                break;
-            }
+    let below_cell = sg.get(below_current);
+    let below_props = world.material_props(below_cell.material);
+    if below_cell.material != material::EMPTY
+        && (below_props.inert()
+            || !vertical_down_allows_density_swap(props.phase(), below_props.phase())
+            || props.density <= below_props.density)
+    {
+        if !step_liquid_supported_slide(sg, world, current, rng) {
+            let v = sg.get(current).velocity;
+            let friction = liquid_supported_friction(&props);
+            sg.set_velocity(current, (v - friction).max(0));
         }
     }
 }
 
-fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, props: &MaterialProps, rng: &mut SmallRng) {
+/// While supported, slide toward the side whose column has void (empty or hole-below) closest
+/// below this row. Tie-break: shallower `liquid_column_void_depth` then [`liquid_prefer_left_first`].
+fn step_liquid_supported_slide(sg: &SimGrids, world: &World, from: Vec2i, rng: &mut SmallRng) -> bool {
+    let mat = sg.get(from).material;
+    let rule = world.material_rule(mat);
+    let spread = rule.lateral_spread.max(1) as i32;
+
+    let left_target = scan_lateral_target(sg, from, -1, spread);
+    let right_target = scan_lateral_target(sg, from, 1, spread);
+
+    let dir: i32 = match (left_target, right_target) {
+        (Some(l), Some(r)) => {
+            if l < r {
+                -1
+            } else if r < l {
+                1
+            } else {
+                let dl = liquid_column_void_depth(sg, from.x - 1, from.y, spread);
+                let dr = liquid_column_void_depth(sg, from.x + 1, from.y, spread);
+                match (dl, dr) {
+                    (Some(a), Some(b)) if a < b => -1,
+                    (Some(a), Some(b)) if b < a => 1,
+                    _ => {
+                        if liquid_prefer_left_first(from) {
+                            -1
+                        } else {
+                            1
+                        }
+                    }
+                }
+            }
+        }
+        (Some(_), None) => -1,
+        (None, Some(_)) => 1,
+        // No reachable void within lateral_spread — do not lateral nudge (keeps flat pools at rest).
+        (None, None) => return false,
+    };
+
+    let max_move = spread.min(2);
+    let mut cur = from;
+    let mut moved_any = false;
+    for i in 1..=max_move {
+        let side = Vec2i::new(cur.x + dir * i, cur.y);
+        if sg.try_displace(world, cur, side, MoveIntent::Lateral, rng) {
+            cur = side;
+            moved_any = true;
+        } else {
+            break;
+        }
+    }
+    moved_any
+}
+
+/// Shortest vertical offset `dy >= 1` such that `(col_x, surface_y + dy)` is empty or has empty
+/// directly below (same rule as [`scan_lateral_target`]). Scans up to `max_dy` rows.
+fn liquid_column_void_depth(sg: &SimGrids, col_x: i32, surface_y: i32, max_dy: i32) -> Option<i32> {
+    for dy in 1..=max_dy {
+        let p = Vec2i::new(col_x, surface_y + dy);
+        if sg.index(p).is_none() {
+            break;
+        }
+        let cell = sg.get(p);
+        if cell.material == material::EMPTY {
+            return Some(dy);
+        }
+        let below = Vec2i::new(col_x, surface_y + dy + 1);
+        if sg.index(below).is_none() {
+            continue;
+        }
+        if sg.get(below).material == material::EMPTY {
+            return Some(dy);
+        }
+    }
+    None
+}
+
+fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, acid_props: &MaterialProps, rng: &mut SmallRng) {
     const CARDINAL: [(i32, i32); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
-    if !props.has_corrosion_adjacent() {
+    let src = acid_props.acid_corrosion;
+    if !src.is_active() {
         return;
     }
     let mut acid = sg.get(p);
@@ -1312,26 +1604,18 @@ fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, props: &Materi
         if ncell.material == material::EMPTY {
             continue;
         }
-        let mut rule_hit = None;
-        for rule in props.corrosion_adjacent {
-            if !rule.is_active() || rule.victim != ncell.material {
-                continue;
-            }
-            rule_hit = Some(rule);
-            break;
-        }
-        let Some(rule) = rule_hit else {
+        let nprops = world.material_props(ncell.material);
+        if !nprops.acid_vulnerability.affected {
             continue;
-        };
-        let chance = rule.chance_percent.min(100);
+        }
+        let chance = nprops.acid_vulnerability.chance_percent.min(100);
         if chance == 0 || rng.gen_range(0u8..100) >= chance {
             continue;
         }
-        if rule.neighbor_damage == 0 && rule.self_lifetime_cost == 0 {
+        if src.neighbor_damage == 0 && src.self_lifetime_cost == 0 {
             continue;
         }
 
-        let nprops = world.material_props(ncell.material);
         if nprops.corrosion_max_hp == 0 {
             sg.set_cell(np, Cell::default());
         } else {
@@ -1340,7 +1624,7 @@ fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, props: &Materi
             } else {
                 ncell.lifetime
             };
-            let new_hp = cur_hp.saturating_sub(rule.neighbor_damage);
+            let new_hp = cur_hp.saturating_sub(src.neighbor_damage);
             if new_hp == 0 {
                 sg.set_cell(np, Cell::default());
             } else {
@@ -1350,7 +1634,7 @@ fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, props: &Materi
             }
         }
 
-        let next_acid = acid.lifetime.saturating_sub(rule.self_lifetime_cost);
+        let next_acid = acid.lifetime.saturating_sub(src.self_lifetime_cost);
         if next_acid == 0 {
             sg.set_cell(p, Cell::default());
             return;

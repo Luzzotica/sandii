@@ -1,8 +1,8 @@
 use crate::world::{
-    cell_flags, material, AdjacentInfluenceRule, AdjacentTransformRule, CorrosionAdjacentRule,
+    cell_flags, material, AcidCorrosionSource, AcidVulnerability, AdjacentInfluenceRule, AdjacentTransformRule,
     InfluenceSourceEffect, InfluenceVictimLifetime, MaterialId, MaterialMotion, MaterialProps, MaterialRule,
     NeighborSpawnRule, ADJ_ACTOR_WATER_QUENCH_LIFETIME, MAX_ADJACENT_INFLUENCE_RULES,
-    MAX_ADJACENT_TRANSFORM_RULES, MAX_CORROSION_ADJACENT_RULES, MAX_NEIGHBOR_SPAWN_RULES,
+    MAX_ADJACENT_TRANSFORM_RULES, MAX_NEIGHBOR_SPAWN_RULES,
 };
 
 /// Plant and wood: cardinal water may become plant (80% per neighbor per tick).
@@ -45,43 +45,6 @@ const ADJ_LIQUID_EXTINGUISH: [AdjacentTransformRule; MAX_ADJACENT_TRANSFORM_RULE
     AdjacentTransformRule::inactive(),
     AdjacentTransformRule::inactive(),
     AdjacentTransformRule::inactive(),
-];
-
-/// Builtin acid: cardinal corrosion vs solids (chance ≈ old `corrosivity` 200 × weight / 256 as percent).
-const ACID_CORROSION_ADJACENT: [CorrosionAdjacentRule; MAX_CORROSION_ADJACENT_RULES] = [
-    CorrosionAdjacentRule {
-        victim: material::SAND,
-        chance_percent: 71,
-        neighbor_damage: 200,
-        self_lifetime_cost: 200,
-    },
-    CorrosionAdjacentRule {
-        victim: material::STATIC,
-        chance_percent: 12,
-        neighbor_damage: 200,
-        self_lifetime_cost: 200,
-    },
-    CorrosionAdjacentRule {
-        victim: material::WAX,
-        chance_percent: 67,
-        neighbor_damage: 200,
-        self_lifetime_cost: 200,
-    },
-    CorrosionAdjacentRule {
-        victim: material::PLANT,
-        chance_percent: 61,
-        neighbor_damage: 200,
-        self_lifetime_cost: 200,
-    },
-    CorrosionAdjacentRule {
-        victim: material::WOOD,
-        chance_percent: 53,
-        neighbor_damage: 200,
-        self_lifetime_cost: 200,
-    },
-    CorrosionAdjacentRule::inactive(),
-    CorrosionAdjacentRule::inactive(),
-    CorrosionAdjacentRule::inactive(),
 ];
 
 /// Fire / lava / ember: dry wet sand in place + optional steam in a random empty neighbor; ignite smolder fuels.
@@ -393,19 +356,6 @@ const NS_WELL_WATER: [NeighborSpawnRule; MAX_NEIGHBOR_SPAWN_RULES] = [
     NeighborSpawnRule::inactive(),
 ];
 
-const NS_SPOUT_HEAVY: [NeighborSpawnRule; MAX_NEIGHBOR_SPAWN_RULES] = [
-    NeighborSpawnRule {
-        spawn_material: material::HEAVY_LIQUID,
-        chance: 18,
-        lifetime_lo: 0,
-        lifetime_hi: 0,
-        spawn_flags: 0,
-    },
-    NeighborSpawnRule::inactive(),
-    NeighborSpawnRule::inactive(),
-    NeighborSpawnRule::inactive(),
-];
-
 /// One-stop definition for a built-in material. To add a new material:
 /// 1. Add an ID constant in `world::material`
 /// 2. Add an entry to `BUILTINS` below -- that's it for the core crate. Use struct update syntax:
@@ -415,10 +365,10 @@ const NS_SPOUT_HEAVY: [NeighborSpawnRule; MAX_NEIGHBOR_SPAWN_RULES] = [
 ///    plus optional `smolder_burnout_ignites_neighbors` / explosion radius on burnout.
 ///    `FIRE` uses `on_death_become` + `on_death_lifetime_*` for smoke when its tick lifetime expires;
 ///    `LAVA` uses [`MaterialMotion::Liquid`] with high viscosity; painted `ON_FIRE` with `lifetime` = `fuel_mass`;
-///    each tick runs smolder then `step_liquid` so it flows slowly but stays cohesive (`viscosity` 255, `miscible: true`).
+///    each tick runs smolder then `step_liquid` so it flows slowly but stays cohesive (`viscosity` 255).
 /// 4. Optional neighbor reactions: `world::MaterialProps::adjacent_transforms` (up to four `from` → `to` rules at `chance_percent`, optional `actor_lifetime_delta` on the stepped cell; `to: EMPTY` clears the neighbor). Water uses this to erase adjacent `FIRE` / `EMBER` (`ADJ_LIQUID_EXTINGUISH`).
 /// 5. Optional `neighbor_spawns`: up to four rules (material, `/256` chance, lifetime range) for smolder, ember, and inert props (torch, well, spout).
-/// 6. Corrosive liquids: `corrosion_adjacent` on the acid (victim material, `chance_percent`, damage, self cost); victims use `corrosion_max_hp` for multi-hit melt.
+/// 6. Acid: `acid_corrosion` on the corrosive liquid; victims use `acid_vulnerability` and optional `corrosion_max_hp`. [`MaterialProps::default_const`] enables acid at 50% for new materials; builtins opt out only `EMPTY` and `ACID`, and tune sand/static/wax/plant/wood.
 /// 7. `adjacent_influence` on fire/lava/ember/water: neighbor flags, lifetime, optional transition spawns (see `world::AdjacentInfluenceRule`).
 /// 8. Optionally add a keyboard shortcut in the sandbox example.
 #[derive(Debug, Clone, Copy)]
@@ -456,6 +406,10 @@ pub const BUILTINS: &[MaterialDef] = &[
                 max_speed: 6,
                 acceleration: 2,
                 inertial_resistance: 80,
+            },
+            acid_vulnerability: AcidVulnerability {
+                affected: true,
+                chance_percent: 71,
             },
             ..MaterialProps::default_const()
         },
@@ -501,7 +455,13 @@ pub const BUILTINS: &[MaterialDef] = &[
         props: MaterialProps {
             density: i16::MAX,
             motion: MaterialMotion::InertSolid,
-            corrosion_max_hp: 255,
+            // Rigid bodies use STATIC as a sim-step placeholder; keep acid able to eat through
+            // at a reasonable rate without making world walls trivial.
+            corrosion_max_hp: 96,
+            acid_vulnerability: AcidVulnerability {
+                affected: true,
+                chance_percent: 28,
+            },
             ..MaterialProps::default_const()
         },
         rule: MaterialRule { lateral_spread: 0, miscible: false },
@@ -521,39 +481,7 @@ pub const BUILTINS: &[MaterialDef] = &[
             ..MaterialProps::default_const()
         },
         rule: MaterialRule { lateral_spread: 1, miscible: false },
-        color_argb: 0xFFBE6E46,
-    },
-    MaterialDef {
-        id: material::LIGHT_LIQUID,
-        name: "Light Liq",
-        props: MaterialProps {
-            density: 80,
-            motion: MaterialMotion::Liquid {
-                viscosity: 20,
-                max_speed: 4,
-                acceleration: 1,
-                extinguishes_fire: true,
-            },
-            ..MaterialProps::default_const()
-        },
-        rule: MaterialRule { lateral_spread: 5, miscible: true },
-        color_argb: 0xFF5A96F0,
-    },
-    MaterialDef {
-        id: material::HEAVY_LIQUID,
-        name: "Heavy Liq",
-        props: MaterialProps {
-            density: 140,
-            motion: MaterialMotion::Liquid {
-                viscosity: 35,
-                max_speed: 3,
-                acceleration: 1,
-                extinguishes_fire: true,
-            },
-            ..MaterialProps::default_const()
-        },
-        rule: MaterialRule { lateral_spread: 3, miscible: true },
-        color_argb: 0xFF2346AA,
+        color_argb: 0xFF8B7355,
     },
     MaterialDef {
         id: material::OIL,
@@ -612,6 +540,10 @@ pub const BUILTINS: &[MaterialDef] = &[
             consumption_rate: 9,
             neighbor_spawns: NS_FIRE_SMOLDER_22,
             fuel_mass: 220,
+            acid_vulnerability: AcidVulnerability {
+                affected: true,
+                chance_percent: 67,
+            },
             ..MaterialProps::default_const()
         },
         rule: MaterialRule { lateral_spread: 1, miscible: false },
@@ -665,6 +597,10 @@ pub const BUILTINS: &[MaterialDef] = &[
             smolder_burnout_lifetime_lo: 22,
             smolder_burnout_lifetime_hi: 52,
             adjacent_transforms: ADJ_PLANT_GROWTH,
+            acid_vulnerability: AcidVulnerability {
+                affected: true,
+                chance_percent: 61,
+            },
             ..MaterialProps::default_const()
         },
         rule: MaterialRule { lateral_spread: 0, miscible: false },
@@ -681,7 +617,11 @@ pub const BUILTINS: &[MaterialDef] = &[
                 acceleration: 1,
                 extinguishes_fire: false,
             },
-            corrosion_adjacent: ACID_CORROSION_ADJACENT,
+            acid_corrosion: AcidCorrosionSource {
+                neighbor_damage: 200,
+                self_lifetime_cost: 200,
+            },
+            acid_vulnerability: AcidVulnerability::inactive(),
             ..MaterialProps::default_const()
         },
         rule: MaterialRule { lateral_spread: 3, miscible: true },
@@ -716,6 +656,10 @@ pub const BUILTINS: &[MaterialDef] = &[
             smolder_extinguish_lifetime_lo: 120,
             smolder_extinguish_lifetime_hi: 200,
             adjacent_transforms: ADJ_PLANT_GROWTH,
+            acid_vulnerability: AcidVulnerability {
+                affected: true,
+                chance_percent: 53,
+            },
             ..MaterialProps::default_const()
         },
         rule: MaterialRule { lateral_spread: 0, miscible: false },
@@ -748,7 +692,7 @@ pub const BUILTINS: &[MaterialDef] = &[
                 extinguishes_fire: false,
             },
             // ~8/256 per tick to lose 1 fuel; fuel_mass 255 → long-lived molten pool.
-            consumption_rate: 8,
+            consumption_rate: 50,
             neighbor_spawns: NS_FIRE_SMOLDER_1,
             fuel_mass: 255,
             smolder_extinguish_material: material::SAND,
@@ -792,16 +736,30 @@ pub const BUILTINS: &[MaterialDef] = &[
         color_argb: 0xFF4A6B8A,
     },
     MaterialDef {
-        id: material::SPOUT,
-        name: "Spout",
+        id: material::DIRT,
+        name: "Dirt",
         props: MaterialProps {
-            density: 130,
+            density: i16::MAX,
             motion: MaterialMotion::InertSolid,
-            neighbor_spawns: NS_SPOUT_HEAVY,
+            acid_vulnerability: AcidVulnerability {
+                affected: true,
+                chance_percent: 55,
+            },
             ..MaterialProps::default_const()
         },
         rule: MaterialRule { lateral_spread: 0, miscible: false },
-        color_argb: 0xFF5C6BC0,
+        color_argb: 0xFF6B4226,
+    },
+    MaterialDef {
+        id: material::GRASS,
+        name: "Grass",
+        props: MaterialProps {
+            density: i16::MAX,
+            motion: MaterialMotion::InertSolid,
+            ..MaterialProps::default_const()
+        },
+        rule: MaterialRule { lateral_spread: 0, miscible: false },
+        color_argb: 0xFF3A7D32,
     },
 ];
 

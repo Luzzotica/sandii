@@ -4,6 +4,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cell64::{PackedCell, MAX_PACKED_MATERIAL_ID};
+
+mod store;
+use store::{DenseCellStore, SpatialHashChunkStore};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Vec2i {
     pub x: i32,
@@ -48,9 +53,31 @@ impl RectI {
             && self.min.y <= other.max.y
             && self.max.y >= other.min.y
     }
+
+    pub fn intersection(&self, other: &RectI) -> Option<RectI> {
+        let min_x = self.min.x.max(other.min.x);
+        let min_y = self.min.y.max(other.min.y);
+        let max_x = self.max.x.min(other.max.x);
+        let max_y = self.max.y.min(other.max.y);
+        if min_x <= max_x && min_y <= max_y {
+            Some(RectI::new(Vec2i::new(min_x, min_y), Vec2i::new(max_x, max_y)))
+        } else {
+            None
+        }
+    }
 }
 
 pub type MaterialId = u16;
+pub const CHUNK_W: i32 = 32;
+pub const CHUNK_H: i32 = 32;
+pub const CHUNK_SIZE: i32 = 32;
+pub const CHUNK_AREA: usize = (CHUNK_W as usize) * (CHUNK_H as usize);
+/// How many ticks a chunk stays awake after the last wake signal.
+/// Gives settling cascades (sand piles, liquid spreading) time to propagate
+/// before sleeping the chunk.
+pub const WAKE_COOLDOWN: u8 = 16;
+
+const _: () = assert!(CHUNK_W == CHUNK_H && CHUNK_W == CHUNK_SIZE);
 
 pub mod material {
     use super::MaterialId;
@@ -77,7 +104,25 @@ pub mod material {
     pub const TORCH: MaterialId = 19;
     pub const WELL: MaterialId = 20;
     pub const SPOUT: MaterialId = 21;
-    pub const MAX_MATERIALS: usize = 512;
+    pub const DIRT: MaterialId = 22;
+    pub const GRASS: MaterialId = 23;
+    pub const MAX_MATERIALS: usize = 1024;
+}
+
+pub mod chunk_local_step {
+    pub const LEFT: i32 = -1;
+    pub const RIGHT: i32 = 1;
+    pub const UP: i32 = -super::CHUNK_W;
+    pub const DOWN: i32 = super::CHUNK_W;
+    pub const UP_LEFT: i32 = UP + LEFT;
+    pub const UP_RIGHT: i32 = UP + RIGHT;
+    pub const DOWN_LEFT: i32 = DOWN + LEFT;
+    pub const DOWN_RIGHT: i32 = DOWN + RIGHT;
+}
+
+#[inline]
+pub const fn chunk_local_index(x: i32, y: i32) -> usize {
+    (y as usize) * (CHUNK_W as usize) + (x as usize)
 }
 
 /// Lifetime removed from fire (and similar) when an adjacent transform vaporizes a water neighbor.
@@ -86,6 +131,8 @@ pub const ADJ_ACTOR_WATER_QUENCH_LIFETIME: u8 = 48;
 #[derive(Debug, Clone, Copy)]
 pub struct MaterialRule {
     pub lateral_spread: u8,
+    /// Reserved for future tuning. **Not** used for lateral liquid–liquid motion: the sim does not
+    /// swap adjacent liquids sideways (see `sim::can_displace`, `MoveIntent::Lateral`).
     pub miscible: bool,
 }
 
@@ -298,32 +345,46 @@ impl Default for NeighborSpawnRule {
 
 pub type NeighborSpawnRules = [NeighborSpawnRule; MAX_NEIGHBOR_SPAWN_RULES];
 
-/// Max rules per corrosive liquid for [`MaterialProps::corrosion_adjacent`].
-pub const MAX_CORROSION_ADJACENT_RULES: usize = 8;
-
-/// When this **corrosive** material is stepped as a liquid, each cardinal neighbor may be damaged.
+/// Whether this material can be damaged by adjacent corrosive liquids and at what odds per tick.
 ///
-/// Slots with `chance_percent == 0` or `victim == EMPTY` are inactive. Rules are checked in order per
-/// neighbor; the first matching `victim` that succeeds the roll applies.
-///
-/// Neighbor HP is stored in [`Cell::lifetime`]; see [`MaterialProps::corrosion_max_hp`] on the victim.
+/// Inactive when `affected == false` or `chance_percent == 0`. Roll in `sim`: `rng.gen_range(0..100) < chance_percent.min(100)`.
+/// Neighbor HP for multi-hit melt is [`MaterialProps::corrosion_max_hp`] + [`Cell::lifetime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CorrosionAdjacentRule {
-    /// Neighbor material this rule applies to.
-    pub victim: MaterialId,
-    /// 0 = disabled. Otherwise `roll in 0..100` must be `< chance_percent` (same as [`AdjacentTransformRule`]).
+pub struct AcidVulnerability {
+    pub affected: bool,
     pub chance_percent: u8,
-    /// Subtracted from neighbor [`Cell::lifetime`] when `corrosion_max_hp > 0`; one-shot erase when `0`.
+}
+
+impl AcidVulnerability {
+    pub const fn inactive() -> Self {
+        Self {
+            affected: false,
+            chance_percent: 0,
+        }
+    }
+
+    #[inline]
+    pub const fn is_active(self) -> bool {
+        self.affected && self.chance_percent > 0
+    }
+}
+
+impl Default for AcidVulnerability {
+    fn default() -> Self {
+        Self::inactive()
+    }
+}
+
+/// Damage dealt by a **corrosive liquid** (e.g. acid) to acid-vulnerable neighbors and cost to its own `lifetime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcidCorrosionSource {
     pub neighbor_damage: u8,
-    /// Subtracted from this corrosive cell's [`Cell::lifetime`] after a successful hit.
     pub self_lifetime_cost: u8,
 }
 
-impl CorrosionAdjacentRule {
+impl AcidCorrosionSource {
     pub const fn inactive() -> Self {
         Self {
-            victim: material::EMPTY,
-            chance_percent: 0,
             neighbor_damage: 0,
             self_lifetime_cost: 0,
         }
@@ -331,17 +392,15 @@ impl CorrosionAdjacentRule {
 
     #[inline]
     pub const fn is_active(self) -> bool {
-        self.victim != material::EMPTY && self.chance_percent > 0
+        self.neighbor_damage != 0 || self.self_lifetime_cost != 0
     }
 }
 
-impl Default for CorrosionAdjacentRule {
+impl Default for AcidCorrosionSource {
     fn default() -> Self {
         Self::inactive()
     }
 }
-
-pub type CorrosionAdjacentRules = [CorrosionAdjacentRule; MAX_CORROSION_ADJACENT_RULES];
 
 /// Max rules per material for [`MaterialProps::adjacent_influence`].
 pub const MAX_ADJACENT_INFLUENCE_RULES: usize = 8;
@@ -454,6 +513,9 @@ pub mod cell_flags {
     pub const ON_FIRE: u16 = 1 << 1;
     pub const WET: u16 = 1 << 2;
     pub const ELECTRIFIED: u16 = 1 << 3;
+    /// Set during the sim step on rigid-body pixels (material forced to STATIC). Used to keep
+    /// heat/adjacent rules (e.g. lava vaporizing water, igniting wood) while blocking displacement.
+    pub const RIGID_BODY_SIM: u16 = 1 << 4;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -474,9 +536,15 @@ pub struct MaterialProps {
     /// (e.g. `FIRE` → smoke). If `hi <= lo`, the sim uses a built-in default range instead.
     pub on_death_lifetime_lo: u8,
     pub on_death_lifetime_hi: u8,
-    /// For materials that take multiple corrosion hits: max HP stored in [`Cell::lifetime`] when painted.
-    /// `0` = first successful corrosive hit erases the cell (no bar). Corrosion rules live on the acid material.
+    /// For materials that take multiple acid hits: max HP stored in [`Cell::lifetime`] when painted.
+    /// `0` = first successful corrosive hit erases the cell (no bar). Hit chance and “affected” are [`Self::acid_vulnerability`]; damage/cost come from the adjacent corrosive liquid’s [`AcidCorrosionSource`].
     pub corrosion_max_hp: u8,
+
+    /// When active ([`AcidVulnerability::is_active`]), this material can be damaged by adjacent corrosive liquids at `chance_percent` per tick.
+    pub acid_vulnerability: AcidVulnerability,
+
+    /// When non-inactive on a corrosive liquid, [`sim`](crate::sim) applies these values to vulnerable neighbors each successful hit.
+    pub acid_corrosion: AcidCorrosionSource,
 
     // --- Smolder elimination (`ON_FIRE` + `fuel_mass`): burnout or fully quenched by water ---
 
@@ -499,9 +567,6 @@ pub struct MaterialProps {
 
     /// Probabilistic neighbor replacement each tick (runs even when [`Self::inert`] is true).
     pub adjacent_transforms: AdjacentTransformRules,
-
-    /// Cardinal corrosion: which neighbor materials this **corrosive liquid** damages and at what odds/cost.
-    pub corrosion_adjacent: CorrosionAdjacentRules,
 
     /// Neighbor flag/lifetime rules (fire spread, water wetting, drying wet sand, etc.).
     pub adjacent_influence: AdjacentInfluenceRules,
@@ -531,6 +596,12 @@ impl MaterialProps {
             on_death_lifetime_lo: 0,
             on_death_lifetime_hi: 0,
             corrosion_max_hp: 0,
+            // Most materials are acid-vulnerable unless overridden (e.g. EMPTY, ACID in builtins).
+            acid_vulnerability: AcidVulnerability {
+                affected: true,
+                chance_percent: 50,
+            },
+            acid_corrosion: AcidCorrosionSource::inactive(),
             smolder_extinguish_material: material::EMPTY,
             smolder_extinguish_lifetime_lo: 24,
             smolder_extinguish_lifetime_hi: 64,
@@ -544,16 +615,6 @@ impl MaterialProps {
                 AdjacentTransformRule::inactive(),
                 AdjacentTransformRule::inactive(),
                 AdjacentTransformRule::inactive(),
-            ],
-            corrosion_adjacent: [
-                CorrosionAdjacentRule::inactive(),
-                CorrosionAdjacentRule::inactive(),
-                CorrosionAdjacentRule::inactive(),
-                CorrosionAdjacentRule::inactive(),
-                CorrosionAdjacentRule::inactive(),
-                CorrosionAdjacentRule::inactive(),
-                CorrosionAdjacentRule::inactive(),
-                CorrosionAdjacentRule::inactive(),
             ],
             adjacent_influence: [
                 AdjacentInfluenceRule::inactive(),
@@ -620,8 +681,8 @@ impl MaterialProps {
     }
 
     #[inline]
-    pub fn has_corrosion_adjacent(self) -> bool {
-        self.corrosion_adjacent.iter().any(|r| r.is_active())
+    pub fn has_acid_corrosion(self) -> bool {
+        self.acid_corrosion.is_active()
     }
 
     #[inline]
@@ -677,6 +738,18 @@ impl Default for Cell {
     }
 }
 
+impl Cell {
+    #[inline]
+    pub fn to_packed(self) -> PackedCell {
+        PackedCell::from_legacy_cell(self)
+    }
+
+    #[inline]
+    pub fn from_packed(cell: PackedCell) -> Self {
+        cell.to_legacy_cell()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkCoord {
     pub x: i32,
@@ -691,24 +764,31 @@ pub enum WorldEvent {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RegionFile {
+    #[serde(default = "region_file_version")]
+    version: u8,
     chunk_size: i32,
     cells: Vec<(ChunkCoord, Vec<Cell>)>,
+}
+
+const fn region_file_version() -> u8 {
+    2
 }
 
 pub struct World {
     chunk_size: i32,
     region_size: i32,
 
-    grids: [Vec<Cell>; 2],
-    read_idx: usize,
-    grid_width: i32,
-    grid_height: i32,
-    grid_origin: Vec2i,
+    store: DenseCellStore,
+    hash_chunks: SpatialHashChunkStore,
 
     chunks_x: i32,
     chunks_y: i32,
     chunk_dirty: Vec<bool>,
-    chunk_awake: Vec<bool>,
+    /// Marks chunks whose inert-solid content changed (for static physics collider rebuild).
+    chunk_physics_dirty: Vec<bool>,
+    /// Per-chunk cooldown counter: >0 means awake. Decremented each tick; any
+    /// wake signal resets to `WAKE_COOLDOWN`. Prevents rapid sleep/wake cycling.
+    chunk_awake: Vec<u8>,
     chunk_awake_next: Vec<bool>,
 
     active_regions: HashSet<Vec2i>,
@@ -724,29 +804,66 @@ pub struct World {
 
     debug_pass_enabled: bool,
     debug_pass: Vec<u8>,
+
+    /// When stepping one chunk at a time, the chunk currently being processed (checkerboard pass in `.1`).
+    debug_chunk_highlight: Option<(ChunkCoord, u8)>,
+
+    /// Draw faint outlines for all chunks in each checkerboard pass (same color = same pass = parallel batch in thread-pool mode).
+    debug_pass_batch_outlines: bool,
+}
+
+fn cell_contributes_static_collider_refs(
+    store: &DenseCellStore,
+    material_props: &[MaterialProps; material::MAX_MATERIALS],
+    rigid_ids: &HashMap<Vec2i, u32>,
+    p: Vec2i,
+    cell: Cell,
+) -> bool {
+    if store.grid_index(p).is_none() {
+        return false;
+    }
+    material_props
+        .get(cell.material as usize)
+        .copied()
+        .unwrap_or_default()
+        .inert()
+        && cell.material != material::EMPTY
+        && !rigid_ids.contains_key(&p)
 }
 
 impl World {
+    #[inline]
+    fn assert_supported_material_id(id: MaterialId) {
+        debug_assert!(
+            id <= MAX_PACKED_MATERIAL_ID,
+            "material id {} exceeds packed u10 limit {}",
+            id,
+            MAX_PACKED_MATERIAL_ID
+        );
+    }
+
     pub fn new(chunk_size: i32, region_size: i32) -> Self {
+        assert_eq!(
+            chunk_size, CHUNK_SIZE,
+            "World chunk size is fixed at {}; got {}",
+            CHUNK_SIZE, chunk_size
+        );
         let w = region_size;
         let h = region_size;
         let origin = Vec2i::new(0, 0);
-        let total = (w * h) as usize;
-        let cx = (w + chunk_size - 1) / chunk_size;
-        let cy = (h + chunk_size - 1) / chunk_size;
+        let cx = (w + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let cy = (h + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
         Self {
-            chunk_size,
+            chunk_size: CHUNK_SIZE,
             region_size,
-            grids: [vec![Cell::default(); total], vec![Cell::default(); total]],
-            read_idx: 0,
-            grid_width: w,
-            grid_height: h,
-            grid_origin: origin,
+            store: DenseCellStore::new(w, h, origin),
+            hash_chunks: SpatialHashChunkStore::with_capacity((cx * cy).max(1) as usize * 4),
             chunks_x: cx,
             chunks_y: cy,
             chunk_dirty: vec![true; (cx * cy) as usize],
-            chunk_awake: vec![true; (cx * cy) as usize],
+            chunk_physics_dirty: vec![true; (cx * cy) as usize],
+            chunk_awake: vec![WAKE_COOLDOWN; (cx * cy) as usize],
             chunk_awake_next: vec![false; (cx * cy) as usize],
             active_regions: HashSet::new(),
             active_radius_regions: 1,
@@ -759,6 +876,8 @@ impl World {
             rigid_ids: HashMap::new(),
             debug_pass_enabled: false,
             debug_pass: Vec::new(),
+            debug_chunk_highlight: None,
+            debug_pass_batch_outlines: false,
         }
     }
 
@@ -767,15 +886,15 @@ impl World {
     }
 
     pub fn grid_width(&self) -> i32 {
-        self.grid_width
+        self.store.width()
     }
 
     pub fn grid_height(&self) -> i32 {
-        self.grid_height
+        self.store.height()
     }
 
     pub fn grid_origin(&self) -> Vec2i {
-        self.grid_origin
+        self.store.origin()
     }
 
     pub fn set_storage_dir(&mut self, dir: PathBuf) {
@@ -786,21 +905,161 @@ impl World {
         self.solid_bounds = Some(bounds);
         let new_w = bounds.max.x - bounds.min.x + 1;
         let new_h = bounds.max.y - bounds.min.y + 1;
-        if new_w != self.grid_width || new_h != self.grid_height || bounds.min != self.grid_origin {
-            let total = (new_w * new_h) as usize;
-            self.grids = [vec![Cell::default(); total], vec![Cell::default(); total]];
-            self.grid_width = new_w;
-            self.grid_height = new_h;
-            self.grid_origin = bounds.min;
-            let cx = (new_w + self.chunk_size - 1) / self.chunk_size;
-            let cy = (new_h + self.chunk_size - 1) / self.chunk_size;
+        if new_w != self.store.width() || new_h != self.store.height() || bounds.min != self.store.origin() {
+            self.store.resize(new_w, new_h, bounds.min);
+            let cx = (new_w + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            let cy = (new_h + CHUNK_SIZE - 1) / CHUNK_SIZE;
             self.chunks_x = cx;
             self.chunks_y = cy;
+            self.hash_chunks = SpatialHashChunkStore::with_capacity((cx * cy).max(1) as usize * 4);
             let n = (cx * cy) as usize;
             self.chunk_dirty = vec![true; n];
-            self.chunk_awake = vec![true; n];
+            self.chunk_physics_dirty = vec![true; n];
+            self.chunk_awake = vec![WAKE_COOLDOWN; n];
             self.chunk_awake_next = vec![false; n];
         }
+    }
+
+    /// Re-center the dense simulation grid around `center` with the given half-extents.
+    /// Cells leaving the new area are saved to hash_chunks; cells entering are loaded
+    /// from hash_chunks if present.
+    /// Recenters the dense grid. Returns `true` if the store origin/size changed.
+    pub fn relocate_around(&mut self, center: Vec2i, half_w: i32, half_h: i32) -> bool {
+        let new_origin = Vec2i::new(center.x - half_w, center.y - half_h);
+        let new_w = half_w * 2;
+        let new_h = half_h * 2;
+
+        if new_origin == self.store.origin() && new_w == self.store.width() && new_h == self.store.height() {
+            return false;
+        }
+
+        let old_origin = self.store.origin();
+        let old_w = self.store.width();
+        let old_h = self.store.height();
+        let old_rect = RectI::new(old_origin, Vec2i::new(old_origin.x + old_w - 1, old_origin.y + old_h - 1));
+        let new_rect = RectI::new(new_origin, Vec2i::new(new_origin.x + new_w - 1, new_origin.y + new_h - 1));
+
+        // Save outgoing cells (in old area but NOT in new area) to hash_chunks.
+        // A chunk that partially overlaps both areas must still save its non-overlap cells.
+        let old_base_cx = div_floor(old_origin.x, CHUNK_SIZE);
+        let old_base_cy = div_floor(old_origin.y, CHUNK_SIZE);
+        let old_chunks_x = (old_w + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let old_chunks_y = (old_h + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        for lcy in 0..old_chunks_y {
+            for lcx in 0..old_chunks_x {
+                let coord = ChunkCoord { x: old_base_cx + lcx, y: old_base_cy + lcy };
+                let chunk_min = Vec2i::new(coord.x * CHUNK_SIZE, coord.y * CHUNK_SIZE);
+                let chunk_max = Vec2i::new(chunk_min.x + CHUNK_SIZE - 1, chunk_min.y + CHUNK_SIZE - 1);
+                let chunk_rect = RectI::new(chunk_min, chunk_max);
+
+                let clipped = chunk_rect.intersection(&old_rect).unwrap_or(chunk_rect);
+                let mut has_content = false;
+                for y in clipped.min.y..=clipped.max.y {
+                    for x in clipped.min.x..=clipped.max.x {
+                        if new_rect.contains(Vec2i::new(x, y)) {
+                            continue; // overlap — preserved by relocate
+                        }
+                        if let Some(cell) = self.store.get_read(Vec2i::new(x, y)) {
+                            if cell.material != material::EMPTY {
+                                has_content = true;
+                                break;
+                            }
+                        }
+                    }
+                    if has_content { break; }
+                }
+                if !has_content {
+                    continue;
+                }
+                self.hash_chunks.ensure_chunk(coord);
+                for y in clipped.min.y..=clipped.max.y {
+                    for x in clipped.min.x..=clipped.max.x {
+                        if new_rect.contains(Vec2i::new(x, y)) {
+                            continue;
+                        }
+                        if let Some(cell) = self.store.get_read(Vec2i::new(x, y)) {
+                            if cell.material != material::EMPTY {
+                                let lx = x - coord.x * CHUNK_SIZE;
+                                let ly = y - coord.y * CHUNK_SIZE;
+                                let local_idx = chunk_local_index(lx, ly);
+                                if let Some(slab) = self.hash_chunks.get_chunk_mut(coord) {
+                                    slab[local_idx] = cell;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Relocate dense store (copies overlap region automatically).
+        let (_old_read, _old_origin, _old_w, _old_h) = self.store.relocate(new_origin, new_w, new_h);
+
+        // Load incoming cells from hash_chunks (in new area but NOT in old area).
+        // Partial-overlap chunks must still load their non-overlap portion.
+        let new_base_cx = div_floor(new_origin.x, CHUNK_SIZE);
+        let new_base_cy = div_floor(new_origin.y, CHUNK_SIZE);
+        let new_chunks_x = (new_w + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let new_chunks_y = (new_h + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        let mut loaded_coords = Vec::new();
+        for lcy in 0..new_chunks_y {
+            for lcx in 0..new_chunks_x {
+                let coord = ChunkCoord { x: new_base_cx + lcx, y: new_base_cy + lcy };
+                let chunk_min = Vec2i::new(coord.x * CHUNK_SIZE, coord.y * CHUNK_SIZE);
+                let chunk_max = Vec2i::new(chunk_min.x + CHUNK_SIZE - 1, chunk_min.y + CHUNK_SIZE - 1);
+                let chunk_rect = RectI::new(chunk_min, chunk_max);
+
+                if let Some(slab) = self.hash_chunks.get_chunk(coord) {
+                    let slab_copy: Vec<Cell> = slab.to_vec();
+                    let clipped = chunk_rect.intersection(&new_rect).unwrap_or(chunk_rect);
+                    for y in clipped.min.y..=clipped.max.y {
+                        for x in clipped.min.x..=clipped.max.x {
+                            if old_rect.contains(Vec2i::new(x, y)) {
+                                continue; // overlap — already copied by relocate
+                            }
+                            let lx = x - coord.x * CHUNK_SIZE;
+                            let ly = y - coord.y * CHUNK_SIZE;
+                            let local_idx = chunk_local_index(lx, ly);
+                            let cell = slab_copy[local_idx];
+                            if cell.material != material::EMPTY {
+                                self.store.set_read(Vec2i::new(x, y), cell);
+                            }
+                        }
+                    }
+                    // Only remove hash chunk if it's fully inside the new dense area
+                    // (all its cells are now covered by the dense store).
+                    if chunk_rect.min.x >= new_rect.min.x
+                        && chunk_rect.max.x <= new_rect.max.x
+                        && chunk_rect.min.y >= new_rect.min.y
+                        && chunk_rect.max.y <= new_rect.max.y
+                    {
+                        loaded_coords.push(coord);
+                    }
+                }
+            }
+        }
+        for coord in loaded_coords {
+            self.hash_chunks.remove_chunk(coord);
+        }
+
+        // Rebuild chunk metadata.
+        self.chunks_x = new_chunks_x;
+        self.chunks_y = new_chunks_y;
+        let n = (new_chunks_x * new_chunks_y) as usize;
+        self.chunk_dirty = vec![true; n];
+        self.chunk_physics_dirty = vec![true; n];
+        self.chunk_awake = vec![WAKE_COOLDOWN; n];
+        self.chunk_awake_next = vec![false; n];
+
+        self.solid_bounds = None;
+
+        // Rebuild debug pass buffer if active.
+        if self.debug_pass_enabled {
+            self.debug_pass = vec![0xFF; (new_w * new_h) as usize];
+        }
+        true
     }
 
     pub fn material_props(&self, id: MaterialId) -> MaterialProps {
@@ -811,6 +1070,7 @@ impl World {
     }
 
     pub fn set_material_props(&mut self, id: MaterialId, props: MaterialProps) {
+        Self::assert_supported_material_id(id);
         if let Some(slot) = self.material_props.get_mut(id as usize) {
             *slot = props;
         }
@@ -824,6 +1084,7 @@ impl World {
     }
 
     pub fn set_material_rule(&mut self, id: MaterialId, rule: MaterialRule) {
+        Self::assert_supported_material_id(id);
         if let Some(slot) = self.material_rules.get_mut(id as usize) {
             *slot = rule;
         }
@@ -835,6 +1096,8 @@ impl World {
     }
 
     pub fn set_reaction(&mut self, from: MaterialId, to: MaterialId, reaction: ReactionOutcome) {
+        Self::assert_supported_material_id(from);
+        Self::assert_supported_material_id(to);
         let idx = from as usize * material::MAX_MATERIALS + to as usize;
         if let Some(slot) = self.reactions.get_mut(idx) {
             *slot = reaction;
@@ -846,19 +1109,31 @@ impl World {
     }
 
     pub fn set_rigid_id(&mut self, p: Vec2i, id: u32) {
+        let cell = self.get_cell(p);
+        let before = self.cell_contributes_static_collider(p, cell);
         self.rigid_ids.insert(p, id);
+        let after = self.cell_contributes_static_collider(p, cell);
+        if before != after {
+            self.mark_chunk_physics_dirty_for(p);
+        }
     }
 
     pub fn clear_rigid_id(&mut self, p: Vec2i) {
+        let cell = self.get_cell(p);
+        let before = self.cell_contributes_static_collider(p, cell);
         self.rigid_ids.remove(&p);
+        let after = self.cell_contributes_static_collider(p, cell);
+        if before != after {
+            self.mark_chunk_physics_dirty_for(p);
+        }
     }
 
     pub fn active_chunk_count(&self) -> usize {
-        self.chunk_awake.iter().filter(|&&a| a).count()
+        self.chunk_awake.iter().filter(|&&a| a > 0).count()
     }
 
     pub fn sleeping_chunk_count(&self) -> usize {
-        self.chunk_awake.iter().filter(|&&a| !a).count()
+        self.chunk_awake.iter().filter(|&&a| a == 0).count()
     }
 
     fn chunk_local_index(&self, cx: i32, cy: i32) -> Option<usize> {
@@ -871,14 +1146,19 @@ impl World {
 
     pub fn advance_awake_flags(&mut self) {
         for i in 0..self.chunk_awake.len() {
-            self.chunk_awake[i] = self.chunk_awake_next[i];
+            if self.chunk_awake_next[i] {
+                self.chunk_awake[i] = WAKE_COOLDOWN;
+            } else {
+                self.chunk_awake[i] = self.chunk_awake[i].saturating_sub(1);
+            }
             self.chunk_awake_next[i] = false;
         }
     }
 
     pub fn wake_chunk_at(&mut self, p: Vec2i) {
-        let cx = div_floor(p.x - self.grid_origin.x, self.chunk_size);
-        let cy = div_floor(p.y - self.grid_origin.y, self.chunk_size);
+        let origin = self.store.origin();
+        let cx = div_floor(p.x - origin.x, self.chunk_size);
+        let cy = div_floor(p.y - origin.y, self.chunk_size);
         self.wake_chunk_local(cx, cy);
     }
 
@@ -889,8 +1169,9 @@ impl World {
     }
 
     pub fn wake_chunk_and_neighbors(&mut self, p: Vec2i) {
-        let cx = div_floor(p.x - self.grid_origin.x, self.chunk_size);
-        let cy = div_floor(p.y - self.grid_origin.y, self.chunk_size);
+        let origin = self.store.origin();
+        let cx = div_floor(p.x - origin.x, self.chunk_size);
+        let cy = div_floor(p.y - origin.y, self.chunk_size);
         for dy in -1..=1 {
             for dx in -1..=1 {
                 self.wake_chunk_local(cx + dx, cy + dy);
@@ -899,16 +1180,17 @@ impl World {
     }
 
     pub fn is_chunk_awake(&self, coord: ChunkCoord) -> bool {
-        let base_cx = div_floor(self.grid_origin.x, self.chunk_size);
-        let base_cy = div_floor(self.grid_origin.y, self.chunk_size);
+        let origin = self.store.origin();
+        let base_cx = div_floor(origin.x, self.chunk_size);
+        let base_cy = div_floor(origin.y, self.chunk_size);
         let cx = coord.x - base_cx;
         let cy = coord.y - base_cy;
         self.chunk_local_index(cx, cy)
-            .map(|i| self.chunk_awake[i])
+            .map(|i| self.chunk_awake[i] > 0)
             .unwrap_or(false)
     }
 
-    pub fn chunk_awake_ptr(&self) -> *const bool {
+    pub fn chunk_awake_ptr(&self) -> *const u8 {
         self.chunk_awake.as_ptr()
     }
 
@@ -926,8 +1208,9 @@ impl World {
 
     pub fn set_debug_pass_enabled(&mut self, enabled: bool) {
         self.debug_pass_enabled = enabled;
-        if enabled && self.debug_pass.len() != (self.grid_width * self.grid_height) as usize {
-            self.debug_pass = vec![0xFF; (self.grid_width * self.grid_height) as usize];
+        let total = (self.store.width() * self.store.height()) as usize;
+        if enabled && self.debug_pass.len() != total {
+            self.debug_pass = vec![0xFF; total];
         }
     }
 
@@ -945,44 +1228,125 @@ impl World {
             .unwrap_or(0xFF)
     }
 
+    pub fn debug_chunk_highlight(&self) -> Option<(ChunkCoord, u8)> {
+        self.debug_chunk_highlight
+    }
+
+    pub(crate) fn set_debug_chunk_highlight(&mut self, highlight: Option<(ChunkCoord, u8)>) {
+        self.debug_chunk_highlight = highlight;
+    }
+
+    pub fn debug_pass_batch_outlines(&self) -> bool {
+        self.debug_pass_batch_outlines
+    }
+
+    pub fn set_debug_pass_batch_outlines(&mut self, enabled: bool) {
+        self.debug_pass_batch_outlines = enabled;
+    }
+
     pub fn set_focus(&mut self, focus: Vec2i) -> Vec<WorldEvent> {
         self.focus = focus;
         self.sync_streaming_regions()
     }
 
     fn grid_index(&self, p: Vec2i) -> Option<usize> {
-        let x = p.x - self.grid_origin.x;
-        let y = p.y - self.grid_origin.y;
-        if x < 0 || x >= self.grid_width || y < 0 || y >= self.grid_height {
-            return None;
-        }
-        Some((y * self.grid_width + x) as usize)
+        self.store.grid_index(p)
     }
 
     pub fn get_cell(&self, p: Vec2i) -> Cell {
-        match self.grid_index(p) {
-            Some(idx) => self.grids[self.read_idx][idx],
-            None => STATIC_CELL,
+        self.store.get_read(p).unwrap_or(STATIC_CELL)
+    }
+
+    /// Whether this cell is included in the static terrain Rapier colliders (fixed body).
+    pub(crate) fn cell_contributes_static_collider(&self, p: Vec2i, cell: Cell) -> bool {
+        cell_contributes_static_collider_refs(&self.store, &self.material_props, &self.rigid_ids, p, cell)
+    }
+
+    /// Mark every chunk for a static Rapier collider rebuild on the next [`Self::take_physics_dirty_chunks`].
+    pub fn mark_all_chunks_physics_dirty(&mut self) {
+        for d in self.chunk_physics_dirty.iter_mut() {
+            *d = true;
         }
     }
 
     pub fn set_cell(&mut self, p: Vec2i, cell: Cell) {
-        if let Some(idx) = self.grid_index(p) {
-            self.grids[self.read_idx][idx] = cell;
+        Self::assert_supported_material_id(cell.material);
+        let old = self.store.get_read(p);
+        if self.store.set_read(p, cell) {
+            let (coord, idx) = SpatialHashChunkStore::split_world_to_chunk(p);
+            self.hash_chunks.ensure_chunk(coord);
+            if let Some(chunk) = self.hash_chunks.get_chunk_mut(coord) {
+                if idx < chunk.len() {
+                    chunk[idx] = cell;
+                }
+            }
             self.mark_chunk_dirty_for(p);
             self.wake_chunk_and_neighbors(p);
+
+            let before = old.map_or(false, |c| self.cell_contributes_static_collider(p, c));
+            let after = self.cell_contributes_static_collider(p, cell);
+            if before != after {
+                self.mark_chunk_physics_dirty_for(p);
+            }
         }
     }
 
     fn mark_chunk_dirty_for(&mut self, p: Vec2i) {
-        let cx = div_floor(p.x - self.grid_origin.x, self.chunk_size);
-        let cy = div_floor(p.y - self.grid_origin.y, self.chunk_size);
+        let origin = self.store.origin();
+        let cx = div_floor(p.x - origin.x, self.chunk_size);
+        let cy = div_floor(p.y - origin.y, self.chunk_size);
         if cx >= 0 && cx < self.chunks_x && cy >= 0 && cy < self.chunks_y {
             self.chunk_dirty[(cy * self.chunks_x + cx) as usize] = true;
         }
     }
 
+    fn mark_chunk_physics_dirty_for(&mut self, p: Vec2i) {
+        let origin = self.store.origin();
+        let cx = div_floor(p.x - origin.x, self.chunk_size);
+        let cy = div_floor(p.y - origin.y, self.chunk_size);
+        if cx >= 0 && cx < self.chunks_x && cy >= 0 && cy < self.chunks_y {
+            self.chunk_physics_dirty[(cy * self.chunks_x + cx) as usize] = true;
+        }
+    }
+
+    /// Drain and return all chunk coordinates whose static-terrain collider mask may have changed
+    /// since the last call (`set_cell`, sim commit in `finish_sim`, or rigid id toggles).
+    pub fn take_physics_dirty_chunks(&mut self) -> Vec<ChunkCoord> {
+        let origin = self.store.origin();
+        let base_cx = div_floor(origin.x, self.chunk_size);
+        let base_cy = div_floor(origin.y, self.chunk_size);
+        let mut out = Vec::new();
+        for cy in 0..self.chunks_y {
+            for cx in 0..self.chunks_x {
+                let idx = (cy * self.chunks_x + cx) as usize;
+                if self.chunk_physics_dirty[idx] {
+                    self.chunk_physics_dirty[idx] = false;
+                    out.push(ChunkCoord { x: cx + base_cx, y: cy + base_cy });
+                }
+            }
+        }
+        out
+    }
+
+    /// Return chunk coords for all currently-awake chunks.
+    pub fn awake_chunk_coords(&self) -> Vec<ChunkCoord> {
+        let origin = self.store.origin();
+        let base_cx = div_floor(origin.x, self.chunk_size);
+        let base_cy = div_floor(origin.y, self.chunk_size);
+        let mut out = Vec::new();
+        for cy in 0..self.chunks_y {
+            for cx in 0..self.chunks_x {
+                let idx = (cy * self.chunks_x + cx) as usize;
+                if self.chunk_awake[idx] > 0 {
+                    out.push(ChunkCoord { x: cx + base_cx, y: cy + base_cy });
+                }
+            }
+        }
+        out
+    }
+
     pub fn paint_circle(&mut self, center: Vec2i, radius: i32, mat: MaterialId) {
+        Self::assert_supported_material_id(mat);
         let props = self.material_props(mat);
         let initial_lifetime = Self::initial_lifetime_for(mat, &props);
         let (paint_flags, paint_lifetime) = if mat == material::LAVA && props.fuel_mass > 0 {
@@ -1048,54 +1412,130 @@ impl World {
     // --- Double-buffer lifecycle ---
 
     pub fn prepare_sim(&mut self) {
-        let (src, dst) = if self.read_idx == 0 {
-            let (a, b) = self.grids.split_at_mut(1);
-            (a[0].as_slice(), b[0].as_mut_slice())
-        } else {
-            let (a, b) = self.grids.split_at_mut(1);
-            (b[0].as_slice(), a[0].as_mut_slice())
-        };
-        dst.copy_from_slice(src);
+        self.store.prepare_sim();
     }
 
     pub fn finish_sim(&mut self) {
-        self.read_idx = 1 - self.read_idx;
+        self.mark_physics_dirty_from_simulation_diff();
+        self.store.finish_sim();
+    }
+
+    fn mark_physics_dirty_from_simulation_diff(&mut self) {
+        let store = &self.store;
+        let material_props = &self.material_props;
+        let rigid_ids = &self.rigid_ids;
+        let chunk_awake_next = self.chunk_awake_next.as_slice();
+
+        let (read_buf, write_buf) = store.read_write_cell_slices();
+        debug_assert_eq!(read_buf.len(), write_buf.len());
+        let origin = store.origin();
+        let width = store.width();
+        let height = store.height();
+        let chunks_x = self.chunks_x;
+        let chunks_y = self.chunks_y;
+        let chunk_size = self.chunk_size;
+
+        let mut mark_indices: Vec<usize> = Vec::new();
+
+        for cy in 0..chunks_y {
+            for cx in 0..chunks_x {
+                let idx = (cy * chunks_x + cx) as usize;
+                if !chunk_awake_next[idx] {
+                    continue;
+                }
+                let mut dirty = false;
+                'scan: for ly in 0..chunk_size {
+                    for lx in 0..chunk_size {
+                        let x = origin.x + cx * chunk_size + lx;
+                        let y = origin.y + cy * chunk_size + ly;
+                        let lx_g = x - origin.x;
+                        let ly_g = y - origin.y;
+                        if lx_g < 0 || lx_g >= width || ly_g < 0 || ly_g >= height {
+                            continue;
+                        }
+                        let i = (ly_g * width + lx_g) as usize;
+                        let old_c = read_buf[i];
+                        let new_c = write_buf[i];
+                        let p = Vec2i::new(x, y);
+                        let before = cell_contributes_static_collider_refs(
+                            store,
+                            material_props,
+                            rigid_ids,
+                            p,
+                            old_c,
+                        );
+                        let after = cell_contributes_static_collider_refs(
+                            store,
+                            material_props,
+                            rigid_ids,
+                            p,
+                            new_c,
+                        );
+                        if before != after {
+                            dirty = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                if dirty {
+                    mark_indices.push(idx);
+                }
+            }
+        }
+
+        for idx in mark_indices {
+            self.chunk_physics_dirty[idx] = true;
+        }
+    }
+
+    /// After a sim step, remove stale rigid-body ownership for cells the sim cleared to EMPTY.
+    /// Without this, `sync_pixels_to_physics` would keep re-drawing body pixels on top of acid etc.
+    pub fn prune_rigid_ids_for_empty_cells(&mut self) {
+        let keys: Vec<Vec2i> = self.rigid_ids.keys().copied().collect();
+        for p in keys {
+            if self.get_cell(p).material == material::EMPTY {
+                self.clear_rigid_id(p);
+            }
+        }
     }
 
     pub fn read_cells(&self) -> &[Cell] {
-        &self.grids[self.read_idx]
+        self.store.read_cells()
     }
 
     pub fn write_cells_mut(&mut self) -> &mut [Cell] {
-        let write_idx = 1 - self.read_idx;
-        &mut self.grids[write_idx]
+        self.store.write_cells_mut()
     }
 
     pub fn write_cells_ptr(&mut self) -> *mut Cell {
-        let write_idx = 1 - self.read_idx;
-        self.grids[write_idx].as_mut_ptr()
+        self.store.write_cells_ptr()
     }
 
     pub fn write_cells_len(&self) -> usize {
-        self.grids[1 - self.read_idx].len()
+        self.store.write_cells_len()
     }
 
     // --- Chunk queries ---
 
     pub fn all_chunk_dirty_rects(&self) -> Vec<(ChunkCoord, RectI)> {
         let mut out = Vec::new();
+        let origin = self.store.origin();
+        let width = self.store.width();
+        let height = self.store.height();
+        let base_cx = div_floor(origin.x, self.chunk_size);
+        let base_cy = div_floor(origin.y, self.chunk_size);
         for cy in 0..self.chunks_y {
             for cx in 0..self.chunks_x {
                 let idx = (cy * self.chunks_x + cx) as usize;
                 if self.chunk_dirty[idx] {
                     let coord = ChunkCoord {
-                        x: cx + self.grid_origin.x / self.chunk_size,
-                        y: cy + self.grid_origin.y / self.chunk_size,
+                        x: cx + base_cx,
+                        y: cy + base_cy,
                     };
-                    let min_x = self.grid_origin.x + cx * self.chunk_size;
-                    let min_y = self.grid_origin.y + cy * self.chunk_size;
-                    let max_x = (min_x + self.chunk_size - 1).min(self.grid_origin.x + self.grid_width - 1);
-                    let max_y = (min_y + self.chunk_size - 1).min(self.grid_origin.y + self.grid_height - 1);
+                    let min_x = origin.x + cx * self.chunk_size;
+                    let min_y = origin.y + cy * self.chunk_size;
+                    let max_x = (min_x + self.chunk_size - 1).min(origin.x + width - 1);
+                    let max_y = (min_y + self.chunk_size - 1).min(origin.y + height - 1);
                     out.push((coord, RectI::new(Vec2i::new(min_x, min_y), Vec2i::new(max_x, max_y))));
                 }
             }
@@ -1106,11 +1546,16 @@ impl World {
     pub fn active_chunk_coords_for_pass(&self, pass: usize) -> Vec<ChunkCoord> {
         let px = (pass & 1) as i32;
         let py = ((pass >> 1) & 1) as i32;
-        let base_cx = div_floor(self.grid_origin.x, self.chunk_size);
-        let base_cy = div_floor(self.grid_origin.y, self.chunk_size);
+        let origin = self.store.origin();
+        let base_cx = div_floor(origin.x, self.chunk_size);
+        let base_cy = div_floor(origin.y, self.chunk_size);
         let mut coords = Vec::new();
         for cy in 0..self.chunks_y {
             for cx in 0..self.chunks_x {
+                let idx = (cy * self.chunks_x + cx) as usize;
+                if self.chunk_awake[idx] == 0 {
+                    continue;
+                }
                 let abs_cx = base_cx + cx;
                 let abs_cy = base_cy + cy;
                 if (abs_cx & 1) == px && (abs_cy & 1) == py {
@@ -1122,10 +1567,48 @@ impl World {
         coords
     }
 
+    /// World-space rectangle for one dense-grid chunk.
+    ///
+    /// [`ChunkCoord`] values from [`Self::take_physics_dirty_chunks`], [`Self::active_chunk_coords_for_pass`],
+    /// and the simulation scheduler use `coord = local_index + div_floor(origin, chunk_size)` so that
+    /// stepping and static colliders stay aligned with the store even when `origin` is not a multiple of
+    /// [`CHUNK_SIZE`]. This must **not** use `coord * chunk_size` alone.
     pub fn bounds_for_chunk(&self, coord: ChunkCoord) -> RectI {
-        let min = Vec2i::new(coord.x * self.chunk_size, coord.y * self.chunk_size);
-        let max = Vec2i::new(min.x + self.chunk_size - 1, min.y + self.chunk_size - 1);
-        RectI::new(min, max)
+        let origin = self.store.origin();
+        let base_cx = div_floor(origin.x, self.chunk_size);
+        let base_cy = div_floor(origin.y, self.chunk_size);
+        let lcx = coord.x - base_cx;
+        let lcy = coord.y - base_cy;
+        let w = self.store.width();
+        let h = self.store.height();
+        if lcx < 0 || lcy < 0 || lcx >= self.chunks_x || lcy >= self.chunks_y || w <= 0 || h <= 0 {
+            return RectI::new(origin, origin);
+        }
+        let min_x = origin.x + lcx * self.chunk_size;
+        let min_y = origin.y + lcy * self.chunk_size;
+        let max_x = (min_x + self.chunk_size - 1).min(origin.x + w - 1);
+        let max_y = (min_y + self.chunk_size - 1).min(origin.y + h - 1);
+        RectI::new(Vec2i::new(min_x, min_y), Vec2i::new(max_x, max_y))
+    }
+
+    /// Chunk coordinate used with [`Self::bounds_for_chunk`] for a world cell inside the dense store.
+    #[cfg(test)]
+    pub(crate) fn dense_chunk_coord_for_cell(&self, p: Vec2i) -> Option<ChunkCoord> {
+        if self.store.grid_index(p).is_none() {
+            return None;
+        }
+        let origin = self.store.origin();
+        let lcx = div_floor(p.x - origin.x, self.chunk_size);
+        let lcy = div_floor(p.y - origin.y, self.chunk_size);
+        if lcx < 0 || lcy < 0 || lcx >= self.chunks_x || lcy >= self.chunks_y {
+            return None;
+        }
+        let base_cx = div_floor(origin.x, self.chunk_size);
+        let base_cy = div_floor(origin.y, self.chunk_size);
+        Some(ChunkCoord {
+            x: lcx + base_cx,
+            y: lcy + base_cy,
+        })
     }
 
     pub fn finish_frame(&mut self) {
@@ -1136,12 +1619,15 @@ impl World {
     }
 
     pub fn dirty_world_bounds(&self) -> Option<RectI> {
-        if self.grid_width > 0 && self.grid_height > 0 {
+        let width = self.store.width();
+        let height = self.store.height();
+        let origin = self.store.origin();
+        if width > 0 && height > 0 {
             Some(RectI::new(
-                self.grid_origin,
+                origin,
                 Vec2i::new(
-                    self.grid_origin.x + self.grid_width - 1,
-                    self.grid_origin.y + self.grid_height - 1,
+                    origin.x + width - 1,
+                    origin.y + height - 1,
                 ),
             ))
         } else {
@@ -1150,18 +1636,8 @@ impl World {
     }
 
     pub fn clear_outside_rect(&mut self, bounds: RectI) {
-        for y in self.grid_origin.y..(self.grid_origin.y + self.grid_height) {
-            for x in self.grid_origin.x..(self.grid_origin.x + self.grid_width) {
-                let p = Vec2i::new(x, y);
-                if !bounds.contains(p) {
-                    if let Some(idx) = self.grid_index(p) {
-                        if self.grids[self.read_idx][idx].material != material::EMPTY {
-                            self.grids[self.read_idx][idx] = Cell::default();
-                        }
-                    }
-                }
-            }
-        }
+        self.store.clear_outside_rect(bounds);
+        self.hash_chunks.remove_outside_world_rect(bounds);
     }
 
     fn sync_streaming_regions(&mut self) -> Vec<WorldEvent> {
@@ -1227,8 +1703,8 @@ impl World {
                 for ly in 0..cs {
                     for lx in 0..cs {
                         let p = Vec2i::new(cx * cs + lx, cy * cs + ly);
-                        if let Some(idx) = self.grid_index(p) {
-                            cells[(ly * cs + lx) as usize] = self.grids[self.read_idx][idx];
+                        if let Some(cell) = self.store.get_read(p) {
+                            cells[(ly * cs + lx) as usize] = cell;
                         }
                     }
                 }
@@ -1239,6 +1715,7 @@ impl World {
         }
 
         let payload = RegionFile {
+            version: region_file_version(),
             chunk_size: cs,
             cells: chunk_cells,
         };
@@ -1261,13 +1738,22 @@ impl World {
         };
         let cs = payload.chunk_size;
         for (coord, cells) in payload.cells {
+            if cs == CHUNK_SIZE && cells.len() == CHUNK_AREA {
+                let _ = self.hash_chunks.upsert_chunk(coord, &cells);
+            }
             for ly in 0..cs {
                 for lx in 0..cs {
                     let p = Vec2i::new(coord.x * cs + lx, coord.y * cs + ly);
                     let cell = cells[(ly * cs + lx) as usize];
                     if cell.material != material::EMPTY {
-                        if let Some(idx) = self.grid_index(p) {
-                            self.grids[self.read_idx][idx] = cell;
+                        if self.store.set_read(p, cell) {
+                            let (chunk, local_idx) = SpatialHashChunkStore::split_world_to_chunk(p);
+                            self.hash_chunks.ensure_chunk(chunk);
+                            if let Some(slab) = self.hash_chunks.get_chunk_mut(chunk) {
+                                if local_idx < slab.len() {
+                                    slab[local_idx] = cell;
+                                }
+                            }
                         }
                     }
                 }
