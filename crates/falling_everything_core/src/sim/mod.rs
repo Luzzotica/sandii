@@ -4,7 +4,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 
-use crate::bresenham::{bresenham_line, isqrt_i32};
+use crate::explosion::{self, ExplosionParams};
 use crate::world::{
     cell_flags, material, AdjacentInfluenceRule, Cell, ChunkCoord, InfluenceSourceEffect, InfluenceVictimLifetime,
     MaterialId, MaterialProps, MaterialRule, Phase, ReactionOutcome, RectI, Vec2i, World,
@@ -69,19 +69,16 @@ fn try_place_influence_empty_neighbor_spawn(
     offs.shuffle(rng);
     for &(dx, dy) in &offs {
         let np = Vec2i::new(victim_pos.x + dx, victim_pos.y + dy);
-        if sg.get(np).material != material::EMPTY {
+        if sg.get(np).material() != material::EMPTY {
             continue;
         }
         sg.set_cell(
             np,
-            Cell {
-                material: sm,
-                flags: 0,
-                velocity: 0,
-                lifetime: life,
-                variant: rng.gen_range(0..16),
-                scorch: 0,
-            },
+            Cell::new()
+                .with_material(sm)
+                .with_lifetime(life)
+                .with_temperature(sprops.base_temperature)
+                .with_variant(rng.gen_range(0..16)),
         );
         return;
     }
@@ -96,18 +93,18 @@ fn apply_influence_source_effect(
     match effect {
         InfluenceSourceEffect::None => {}
         InfluenceSourceEffect::ClearSourceCell => {
-            sg.set_cell(source_pos, Cell::default());
+            sg.set_cell(source_pos, Cell::new());
         }
         InfluenceSourceEffect::AddSourceLifetime(n) => {
             let c = sg.get(source_pos);
-            if c.material == source_material {
-                sg.set_lifetime(source_pos, c.lifetime.saturating_add(n));
+            if c.material() == source_material {
+                sg.set_lifetime(source_pos, c.lifetime().saturating_add(n));
             }
         }
         InfluenceSourceEffect::SubtractSourceLifetime(n) => {
             let c = sg.get(source_pos);
-            if c.material == source_material {
-                sg.set_lifetime(source_pos, c.lifetime.saturating_sub(n));
+            if c.material() == source_material {
+                sg.set_lifetime(source_pos, c.lifetime().saturating_sub(n));
             }
         }
     }
@@ -128,29 +125,29 @@ fn try_adjacent_influence_on_neighbor(
     rng: &mut SmallRng,
 ) -> bool {
     let hf = heat_factor.clamp(0.0, 1.0);
-    if sg.get(source_pos).material != source_material {
+    if sg.get(source_pos).material() != source_material {
         return false;
     }
     let ncell = sg.get(neighbor_pos);
-    if ncell.material == material::EMPTY || ncell.material == source_material {
+    if ncell.material() == material::EMPTY || ncell.material() == source_material {
         return false;
     }
-    let nprops = world.material_props(ncell.material);
+    let nprops = world.material_props(ncell.material());
 
     for rule in rules {
         if !rule.is_active() {
             continue;
         }
-        if ncell.material != rule.victim {
+        if ncell.material() != rule.victim {
             continue;
         }
         if rule.cardinal_neighbors_only && !(dx == 0 || dy == 0) {
             continue;
         }
-        if rule.require_victim_flags_any != 0 && (ncell.flags & rule.require_victim_flags_any) == 0 {
+        if rule.require_victim_flags_any != 0 && (ncell.flags() & rule.require_victim_flags_any) == 0 {
             continue;
         }
-        if rule.exclude_victim_flags_any != 0 && (ncell.flags & rule.exclude_victim_flags_any) != 0 {
+        if rule.exclude_victim_flags_any != 0 && (ncell.flags() & rule.exclude_victim_flags_any) != 0 {
             continue;
         }
 
@@ -173,7 +170,7 @@ fn try_adjacent_influence_on_neighbor(
             continue;
         }
 
-        let old_flags = ncell.flags;
+        let old_flags = ncell.flags();
         let new_flags = (old_flags | rule.flags_or) & !rule.flags_clear;
 
         if rule.if_cleared_mask != 0 && rule.spawn_on_clear_material != material::EMPTY {
@@ -184,14 +181,10 @@ fn try_adjacent_influence_on_neighbor(
                 let life = influence_transition_spawn_lifetime(rule, sm, &sprops, rng);
                 sg.set_cell(
                     neighbor_pos,
-                    Cell {
-                        material: sm,
-                        flags: 0,
-                        velocity: 0,
-                        lifetime: life,
-                        variant: 0,
-                        scorch: 0,
-                    },
+                    Cell::new()
+                        .with_material(sm)
+                        .with_lifetime(life)
+                        .with_temperature(sprops.base_temperature),
                 );
                 apply_influence_source_effect(sg, source_pos, source_material, rule.source_effect);
                 try_place_influence_empty_neighbor_spawn(sg, world, neighbor_pos, rule, rng);
@@ -207,14 +200,10 @@ fn try_adjacent_influence_on_neighbor(
                 let life = influence_transition_spawn_lifetime(rule, sm, &sprops, rng);
                 sg.set_cell(
                     neighbor_pos,
-                    Cell {
-                        material: sm,
-                        flags: 0,
-                        velocity: 0,
-                        lifetime: life,
-                        variant: 0,
-                        scorch: 0,
-                    },
+                    Cell::new()
+                        .with_material(sm)
+                        .with_lifetime(life)
+                        .with_temperature(sprops.base_temperature),
                 );
                 apply_influence_source_effect(sg, source_pos, source_material, rule.source_effect);
                 try_place_influence_empty_neighbor_spawn(sg, world, neighbor_pos, rule, rng);
@@ -223,7 +212,7 @@ fn try_adjacent_influence_on_neighbor(
         }
 
         let new_lifetime = match rule.victim_lifetime {
-            InfluenceVictimLifetime::Unchanged => ncell.lifetime,
+            InfluenceVictimLifetime::Unchanged => ncell.lifetime(),
             InfluenceVictimLifetime::Set(v) => v,
             InfluenceVictimLifetime::UseVictimFuelMass => {
                 if nprops.fuel_mass == 0 {
@@ -233,17 +222,10 @@ fn try_adjacent_influence_on_neighbor(
             }
         };
 
-        sg.set_cell(
-            neighbor_pos,
-            Cell {
-                material: ncell.material,
-                flags: new_flags,
-                velocity: 0,
-                lifetime: new_lifetime,
-                variant: ncell.variant,
-                scorch: ncell.scorch,
-            },
-        );
+        let mut updated = sg.get(neighbor_pos);
+        updated.set_flags((updated.flags() | rule.flags_or) & !rule.flags_clear);
+        updated.set_lifetime(new_lifetime);
+        sg.set_cell(neighbor_pos, updated);
         apply_influence_source_effect(sg, source_pos, source_material, rule.source_effect);
         try_place_influence_empty_neighbor_spawn(sg, world, neighbor_pos, rule, rng);
         return true;
@@ -271,7 +253,7 @@ fn liquid_adjacent_influence_pass(
         (1, 1),
     ];
     for &(dx, dy) in &NEIGHBORS8 {
-        if sg.get(p).material != source_material {
+        if sg.get(p).material() != source_material {
             return true;
         }
         let np = Vec2i::new(p.x + dx, p.y + dy);
@@ -287,7 +269,7 @@ fn liquid_adjacent_influence_pass(
             1.0,
             255,
             rng,
-        ) && (sg.get(p).material == material::EMPTY || sg.get(p).material != source_material)
+        ) && (sg.get(p).material() == material::EMPTY || sg.get(p).material() != source_material)
         {
             return true;
         }
@@ -296,14 +278,10 @@ fn liquid_adjacent_influence_pass(
 }
 
 fn water_to_steam_cell(rng: &mut SmallRng) -> Cell {
-    Cell {
-        material: material::STEAM,
-        flags: 0,
-        velocity: 0,
-        lifetime: rng.gen_range(36..72),
-        variant: 0,
-        scorch: 0,
-    }
+    Cell::new()
+        .with_material(material::STEAM)
+        .with_lifetime(rng.gen_range(36..72))
+        .with_temperature(100)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,8 +351,9 @@ impl Scheduler {
         if let Some(state) = self.chunk_step.take() {
             world.set_debug_chunk_highlight(None);
             world.finish_sim();
+            let mut blast_rng = SmallRng::seed_from_u64(self.seed.wrapping_add(self.tick));
             for (center, radius) in state.pending_explosions {
-                process_explosion(world, center, radius);
+                process_explosion(world, &mut blast_rng, center, radius);
             }
         }
     }
@@ -393,7 +372,7 @@ impl Scheduler {
             let all_explosions = process_world_full_pass(&sg, world, rng);
             world.finish_sim();
             for (center, radius) in all_explosions {
-                process_explosion(world, center, radius);
+                process_explosion(world, rng, center, radius);
             }
             return;
         }
@@ -454,7 +433,7 @@ impl Scheduler {
         world.finish_sim();
 
         for (center, radius) in all_explosions {
-            process_explosion(world, center, radius);
+            process_explosion(world, rng, center, radius);
         }
     }
 
@@ -528,7 +507,7 @@ impl Scheduler {
             world.set_debug_chunk_highlight(None);
             world.finish_sim();
             for (center, radius) in explosions {
-                process_explosion(world, center, radius);
+                process_explosion(world, rng, center, radius);
             }
         } else {
             // `World::get_cell` reads the read buffer; sim writes the write buffer until `finish_sim`
@@ -590,42 +569,8 @@ fn process_world_full_pass(sg: &SimGrids, world: &World, rng: &mut SmallRng) -> 
     explosions
 }
 
-fn process_explosion(world: &mut World, center: Vec2i, radius: i32) {
-    let r2 = radius * radius;
-    let perimeter_inner = (radius - 2) * (radius - 2);
-    let cx = center.x;
-    let cy = center.y;
-    // Integer-only disk fill: each scanline is a Bresenham horizontal segment (chord half-width from isqrt).
-    for y in (cy - radius)..=(cy + radius) {
-        let dy = y - cy;
-        let dy2 = dy.saturating_mul(dy);
-        if dy2 > r2 {
-            continue;
-        }
-        let w = isqrt_i32(r2 - dy2);
-        let a = Vec2i::new(cx - w, y);
-        let b = Vec2i::new(cx + w, y);
-        for p in bresenham_line(a, b) {
-            let dx = p.x - cx;
-            let d2 = dx * dx + dy2;
-            let existing = world.get_cell(p);
-            if existing.material == material::STATIC {
-                continue;
-            }
-            if d2 >= perimeter_inner {
-                world.set_cell(p, Cell {
-                    material: material::FIRE,
-                    flags: 0,
-                    velocity: 0,
-                    lifetime: 40,
-                    variant: 0,
-                    scorch: 0,
-                });
-            } else {
-                world.set_cell(p, Cell::default());
-            }
-        }
-    }
+fn process_explosion(world: &mut World, rng: &mut SmallRng, center: Vec2i, radius: i32) {
+    explosion::apply(world, rng, ExplosionParams::gameplay_incendiary(center, radius));
 }
 
 /// Provides read/write access to the double-buffered world grids.
@@ -688,14 +633,7 @@ impl SimGrids {
     fn get(&self, p: Vec2i) -> Cell {
         self.index(p)
             .map(|i| unsafe { *self.write.add(i) })
-            .unwrap_or(Cell {
-                material: material::STATIC,
-                flags: 0,
-                velocity: 0,
-                lifetime: 0,
-                variant: 0,
-                scorch: 0,
-            })
+            .unwrap_or(Cell::new().with_material(material::STATIC))
     }
 
     #[inline]
@@ -710,7 +648,7 @@ impl SimGrids {
     fn set_velocity(&self, p: Vec2i, vel: i8) {
         if let Some(i) = self.index(p) {
             unsafe {
-                (*self.write.add(i)).velocity = vel;
+                (*self.write.add(i)).set_velocity_x(vel);
             }
             self.wake_at(p);
         }
@@ -728,22 +666,29 @@ impl SimGrids {
     fn set_lifetime(&self, p: Vec2i, lifetime: u8) {
         if let Some(i) = self.index(p) {
             unsafe {
-                (*self.write.add(i)).lifetime = lifetime;
+                (*self.write.add(i)).set_lifetime(lifetime);
             }
             self.wake_at(p);
         }
     }
 
-    fn set_flag(&self, p: Vec2i, flag: u16) {
+    fn set_flag(&self, p: Vec2i, flag: u8) {
         if let Some(i) = self.index(p) {
-            unsafe { (*self.write.add(i)).flags |= flag; }
+            unsafe { (*self.write.add(i)).or_flags(flag); }
             self.wake_at(p);
         }
     }
 
-    fn clear_flag(&self, p: Vec2i, flag: u16) {
+    fn clear_flag(&self, p: Vec2i, flag: u8) {
         if let Some(i) = self.index(p) {
-            unsafe { (*self.write.add(i)).flags &= !flag; }
+            unsafe { (*self.write.add(i)).clear_flag_bits(flag); }
+            self.wake_at(p);
+        }
+    }
+
+    fn set_temperature(&self, p: Vec2i, temp: u16) {
+        if let Some(i) = self.index(p) {
+            unsafe { (*self.write.add(i)).set_temperature(temp); }
             self.wake_at(p);
         }
     }
@@ -777,23 +722,26 @@ impl SimGrids {
         };
         let from_cell = unsafe { *self.write.add(from_idx) };
         let to_cell = unsafe { *self.write.add(to_idx) };
-        if from_cell.material == material::EMPTY {
+        if from_cell.material() == material::EMPTY {
+            return false;
+        }
+        if from_cell.has_flag(cell_flags::RIGID_PIXEL) || to_cell.has_flag(cell_flags::RIGID_PIXEL) {
             return false;
         }
 
-        let from_props = world.material_props(from_cell.material);
-        let to_props = world.material_props(to_cell.material);
-        let from_rule = world.material_rule(from_cell.material);
-        let to_rule = world.material_rule(to_cell.material);
+        let from_props = world.material_props(from_cell.material());
+        let to_props = world.material_props(to_cell.material());
+        let from_rule = world.material_rule(from_cell.material());
+        let to_rule = world.material_rule(to_cell.material());
         if from_props.inert() || to_props.inert() {
             return false;
         }
 
-        let reaction = world.reaction(from_cell.material, to_cell.material);
+        let reaction = world.reaction(from_cell.material(), to_cell.material());
         if let ReactionOutcome::Transform(from_to, to_to) = reaction {
             unsafe {
-                (*self.write.add(to_idx)).material = from_to;
-                (*self.write.add(from_idx)).material = to_to;
+                (*self.write.add(to_idx)).set_material(from_to);
+                (*self.write.add(from_idx)).set_material(to_to);
             }
             self.wake_at(from);
             self.wake_at(to);
@@ -815,8 +763,8 @@ impl SimGrids {
 
         unsafe {
             *self.write.add(to_idx) = from_cell;
-            *self.write.add(from_idx) = if to_cell.material == material::EMPTY {
-                Cell::default()
+            *self.write.add(from_idx) = if to_cell.material() == material::EMPTY {
+                Cell::new()
             } else {
                 to_cell
             };
@@ -856,7 +804,7 @@ fn can_displace(
     intent: MoveIntent,
     rng: &mut SmallRng,
 ) -> bool {
-    if to_cell.material == material::EMPTY {
+    if to_cell.material() == material::EMPTY {
         return true;
     }
 
@@ -888,39 +836,124 @@ fn can_displace(
     }
 }
 
+#[inline]
+fn is_burning(cell: Cell, props: &MaterialProps) -> bool {
+    props.ignition_temperature > 0
+        && props.fuel_mass > 0
+        && cell.lifetime() > 0
+        && cell.temperature() >= props.ignition_temperature
+}
+
+const AMBIENT_TEMP: i32 = 20;
+
+/// Resolve material props for temperature conduction.
+#[inline]
+fn thermal_props_for(cell: Cell, world: &World) -> Option<MaterialProps> {
+    let mat = cell.material();
+    if mat == material::EMPTY || mat == material::STATIC {
+        return None;
+    }
+    Some(world.material_props(mat))
+}
+
+fn step_temperature(sg: &SimGrids, world: &World, p: Vec2i) {
+    let cell = sg.get(p);
+    let Some(props) = thermal_props_for(cell, world) else {
+        return;
+    };
+    let mut temp = cell.temperature() as i32;
+
+    for &(dx, dy) in &[(0i32, -1i32), (0, 1), (-1, 0), (1, 0)] {
+        let np = Vec2i::new(p.x + dx, p.y + dy);
+        let nc = sg.get(np);
+        let Some(np_props) = thermal_props_for(nc, world) else {
+            continue;
+        };
+        let k = (props.thermal_conductivity as i32).min(np_props.thermal_conductivity as i32);
+        let diff = nc.temperature() as i32 - temp;
+        let sh = (props.specific_heat as i32).max(1);
+        let transfer = (diff * k) / (sh * 16);
+        temp += transfer;
+    }
+
+    if temp > AMBIENT_TEMP {
+        temp -= 1;
+    } else if temp < AMBIENT_TEMP {
+        temp += 1;
+    }
+
+    let new_temp = temp.clamp(0, 4095) as u16;
+    if new_temp != cell.temperature() {
+        sg.set_temperature(p, new_temp);
+    }
+}
+
+fn check_phase_transition(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
+    let cell = sg.get(p);
+    let props = world.material_props(cell.material());
+    let temp = cell.temperature();
+
+    if props.freeze_temperature > 0 && temp <= props.freeze_temperature && props.freeze_into != material::EMPTY {
+        let into = props.freeze_into;
+        let into_props = world.material_props(into);
+        let life = World::initial_lifetime_for(into, &into_props);
+        let new_cell = Cell::new()
+            .with_material(into)
+            .with_temperature(temp)
+            .with_lifetime(life)
+            .with_variant(rng.gen_range(0..4));
+        sg.set_cell(p, new_cell);
+    } else if props.melt_temperature > 0 && temp >= props.melt_temperature && props.melt_into != material::EMPTY {
+        let into = props.melt_into;
+        let into_props = world.material_props(into);
+        let life = World::initial_lifetime_for(into, &into_props);
+        let new_cell = Cell::new()
+            .with_material(into)
+            .with_temperature(temp)
+            .with_lifetime(life)
+            .with_variant(rng.gen_range(0..4));
+        sg.set_cell(p, new_cell);
+    }
+}
+
 fn step_pixel(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explosions: &mut Vec<(Vec2i, i32)>) {
     if sg.was_moved(p) {
         return;
     }
     let cell = sg.get(p);
-    if cell.material == material::EMPTY {
+    if cell.material() == material::EMPTY {
         return;
     }
-    // Rigid-body pixels are STATIC + RIGID_BODY_SIM for the sim step; still vaporize adjacent water like lava.
-    if cell.material == material::STATIC
-        && (cell.flags & cell_flags::RIGID_BODY_SIM) != 0
-        && (cell.flags & cell_flags::ON_FIRE) != 0
-        && cell.lifetime > 0
+
+    step_temperature(sg, world, p);
     {
-        let lava_props = world.material_props(material::LAVA);
-        if lava_props.has_adjacent_transforms() {
-            step_adjacent_transform_neighbors(sg, world, p, &lava_props, rng);
+        let c = sg.get(p);
+        let pr = world.material_props(c.material());
+        if pr.heat_output > 0 && c.lifetime() > 0 {
+            let new_temp = (c.temperature() as u32 + pr.heat_output as u32).min(4095) as u16;
+            sg.set_temperature(p, new_temp);
         }
     }
-    if cell.material == material::EMBER {
+    check_phase_transition(sg, world, p, rng);
+    let cell = sg.get(p);
+    if cell.material() == material::EMPTY {
+        return;
+    }
+
+    if cell.material() == material::EMBER {
         step_ember(sg, world, p, rng, explosions);
         return;
     }
-    let props = world.material_props(cell.material);
-    let lava_adj_early = cell.material == material::LAVA && props.has_adjacent_transforms();
+    let props = world.material_props(cell.material());
+    let lava_adj_early = cell.material() == material::LAVA && props.has_adjacent_transforms();
     if lava_adj_early {
         step_adjacent_transform_neighbors(sg, world, p, &props, rng);
     }
-    if cell.flags & cell_flags::ON_FIRE != 0
-        && cell.material != material::FIRE
+    if is_burning(cell, &props)
+        && cell.material() != material::FIRE
     {
         step_smoldering_fuel(sg, world, p, rng, explosions);
-        if sg.get(p).material == material::LAVA {
+        if sg.get(p).material() == material::LAVA {
             step_liquid(sg, world, p, rng);
         }
         return;
@@ -928,35 +961,36 @@ fn step_pixel(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explos
     if props.has_adjacent_transforms() && !lava_adj_early {
         step_adjacent_transform_neighbors(sg, world, p, &props, rng);
     }
-    // Fire/smolder sparks (wood, wax, lava) must run only from `step_smoldering_fuel` while `ON_FIRE`.
-    // Cold wood/wax was incorrectly rolling `neighbor_spawns` here and spawning adjacent fire every tick.
     if props.has_neighbor_spawns() {
-        let on_fire = cell.flags & cell_flags::ON_FIRE != 0;
+        let burning = is_burning(cell, &props);
         let cold_spawner = matches!(
-            cell.material,
+            cell.material(),
             material::TORCH | material::WELL | material::SPOUT
         );
-        if on_fire || cold_spawner {
+        if burning || cold_spawner {
             try_neighbor_spawns(sg, world, p, &props, rng);
         }
     }
     if props.inert() {
         return;
     }
+    // Rigid body pixels participate in thermal/smolder rules above but must not move like loose sand
+    // or gas (displacement is already blocked in `try_displace`).
+    let cell = sg.get(p);
+    if cell.has_flag(cell_flags::RIGID_PIXEL) {
+        return;
+    }
     match props.phase() {
         Phase::Solid => step_sand(sg, world, p, rng),
         Phase::Liquid => step_liquid(sg, world, p, rng),
         Phase::Gas => {
-            // Smoke must always use step_smoke: with lifetime==0 it used to fall through to step_gas,
-            // which never decays — smoke persisted forever. Chunk sleep needs wake_at in set_lifetime
-            // so stationary decaying smoke keeps its chunk awake.
-            if cell.material == material::SMOKE {
+            if cell.material() == material::SMOKE {
                 step_smoke(sg, world, p, rng);
-            } else if cell.material == material::STEAM {
+            } else if cell.material() == material::STEAM {
                 step_steam(sg, world, p, rng);
             } else if props.on_death_become != material::EMPTY {
                 step_fire(sg, world, p, rng, explosions);
-            } else if cell.lifetime > 0 {
+            } else if cell.lifetime() > 0 {
                 step_smoke(sg, world, p, rng);
             } else {
                 step_gas(sg, world, p, rng);
@@ -1067,14 +1101,10 @@ fn eliminate_smoldering_fuel_at(
     let life = rng.gen_range(lo..hi);
     sg.set_cell(
         p,
-        Cell {
-            material: mat,
-            flags: 0,
-            velocity: 0,
-            lifetime: life,
-            variant: dead_cell.variant,
-            scorch: dead_cell.scorch,
-        },
+        Cell::new()
+            .with_material(mat)
+            .with_lifetime(life)
+            .with_variant(dead_cell.variant()),
     );
 }
 
@@ -1112,7 +1142,7 @@ fn try_neighbor_spawns(
         for i in 0..8 {
             let (dx, dy) = SPAWN_NEIGHBORS8[(start + i) % 8];
             let np = Vec2i::new(p.x + dx, p.y + dy);
-            if sg.get(np).material != material::EMPTY {
+            if sg.get(np).material() != material::EMPTY {
                 continue;
             }
             let spawn_props = world.material_props(rule.spawn_material);
@@ -1123,22 +1153,20 @@ fn try_neighbor_spawns(
             };
             sg.set_cell(
                 np,
-                Cell {
-                    material: rule.spawn_material,
-                    flags: rule.spawn_flags,
-                    velocity: 0,
-                    lifetime,
-                    variant: rng.gen_range(0..16),
-                    scorch: 0,
-                },
+                Cell::new()
+                    .with_material(rule.spawn_material)
+                    .with_flags(rule.spawn_flags)
+                    .with_lifetime(lifetime)
+                    .with_temperature(spawn_props.base_temperature)
+                    .with_variant(rng.gen_range(0..16)),
             );
             break;
         }
     }
 }
 
-/// Smoldering fuel (`ON_FIRE`, non-`FIRE` material). Keeps the chunk awake every tick so low
-/// `consumption_rate` materials (e.g. lava) are not skipped after chunk sleep.
+/// Burning fuel (temperature >= ignition_temperature, non-`FIRE` material). Keeps the chunk
+/// awake every tick so low `consumption_rate` materials (e.g. lava) are not skipped after chunk sleep.
 fn step_smoldering_fuel(
     sg: &SimGrids,
     world: &World,
@@ -1148,71 +1176,13 @@ fn step_smoldering_fuel(
 ) {
     sg.wake_at(p);
     let cell = sg.get(p);
-    let rigid_heat_proxy = cell.material == material::STATIC
-        && (cell.flags & cell_flags::RIGID_BODY_SIM) != 0
-        && (cell.flags & cell_flags::ON_FIRE) != 0;
-    let props = if rigid_heat_proxy {
-        world.material_props(material::LAVA)
-    } else {
-        world.material_props(cell.material)
-    };
+    let props = world.material_props(cell.material());
 
-    const NEIGHBORS8: [(i32, i32); 8] = [
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-        (-1, 0),
-        (1, 0),
-        (-1, 1),
-        (0, 1),
-        (1, 1),
-    ];
-
-    for &(dx, dy) in &NEIGHBORS8 {
-        let np = Vec2i::new(p.x + dx, p.y + dy);
-        let nprops = world.material_props(sg.get(np).material);
-        if !nprops.extinguishes_fire() {
-            continue;
-        }
-        sg.set_cell(np, water_to_steam_cell(rng));
-        let src = sg.get(p);
-        if src.material != cell.material || (src.flags & cell_flags::ON_FIRE == 0) {
-            return;
-        }
-        let nl = src.lifetime.saturating_sub(ADJ_ACTOR_WATER_QUENCH_LIFETIME);
-        if nl == 0 {
-            let out_props = world.material_props(if (src.flags & cell_flags::RIGID_BODY_SIM) != 0 {
-                material::LAVA
-            } else {
-                src.material
-            });
-            eliminate_smoldering_fuel_at(sg, world, p, &out_props, &src, rng, explosions, false);
-            return;
-        }
-        sg.set_cell(
-            p,
-            Cell {
-                material: cell.material,
-                flags: cell.flags | cell_flags::ON_FIRE,
-                velocity: cell.velocity,
-                lifetime: nl,
-                variant: cell.variant,
-                scorch: cell.scorch,
-            },
-        );
-    }
-
-    let cell = sg.get(p);
-    let life = cell.lifetime;
+    let life = cell.lifetime();
     let rate = props.consumption_rate.max(1) as u32;
     if rng.gen_ratio(rate, 256) {
         if life <= 1 {
-            let burn_props = world.material_props(if (cell.flags & cell_flags::RIGID_BODY_SIM) != 0 {
-                material::LAVA
-            } else {
-                cell.material
-            });
-            eliminate_smoldering_fuel_at(sg, world, p, &burn_props, &cell, rng, explosions, true);
+            eliminate_smoldering_fuel_at(sg, world, p, &props, &cell, rng, explosions, true);
             return;
         }
         sg.set_lifetime(p, life - 1);
@@ -1221,16 +1191,12 @@ fn step_smoldering_fuel(
     try_neighbor_spawns(sg, world, p, &props, rng);
 
     let c = sg.get(p);
-    let rigid_lava_proxy = c.material == material::STATIC
-        && (c.flags & cell_flags::RIGID_BODY_SIM) != 0
-        && c.lifetime > 0
-        && (c.flags & cell_flags::ON_FIRE != 0);
-    let molten_lava = c.material == material::LAVA
-        && c.lifetime > 0
-        && (c.flags & cell_flags::ON_FIRE != 0);
+    let molten_lava = c.material() == material::LAVA
+        && c.lifetime() > 0
+        && is_burning(c, &props);
 
-    if rigid_lava_proxy || molten_lava {
-        let life = c.lifetime;
+    if molten_lava {
+        let life = c.lifetime();
         let heat_factor = life as f32 / 255.0;
         let _ = spread_burn_to_neighbors(
             sg,
@@ -1255,7 +1221,7 @@ fn step_adjacent_transform_neighbors(
 ) {
     for &(dx, dy) in &ADJ_TRANSFORM_NEIGHBORS8 {
         let np = Vec2i::new(p.x + dx, p.y + dy);
-        let neighbor_mat = sg.get(np).material;
+        let neighbor_mat = sg.get(np).material();
         for rule in props.adjacent_transforms {
             if !rule.is_active() {
                 continue;
@@ -1271,7 +1237,7 @@ fn step_adjacent_transform_neighbors(
                 break;
             }
             if rule.to == material::EMPTY {
-                sg.set_cell(np, Cell::default());
+                sg.set_cell(np, Cell::new());
             } else {
                 let to_props = world.material_props(rule.to);
                 let new_lifetime = if rule.to == material::STEAM {
@@ -1281,20 +1247,17 @@ fn step_adjacent_transform_neighbors(
                 };
                 sg.set_cell(
                     np,
-                    Cell {
-                        material: rule.to,
-                        flags: 0,
-                        velocity: 0,
-                        lifetime: new_lifetime,
-                        variant: rng.gen_range(0..16),
-                        scorch: 0,
-                    },
+                    Cell::new()
+                        .with_material(rule.to)
+                        .with_lifetime(new_lifetime)
+                        .with_temperature(to_props.base_temperature)
+                        .with_variant(rng.gen_range(0..16)),
                 );
             }
             if rule.actor_lifetime_delta > 0 {
                 let actor = sg.get(p);
                 let nl = actor
-                    .lifetime
+                    .lifetime()
                     .saturating_sub(rule.actor_lifetime_delta);
                 sg.set_lifetime(p, nl);
             }
@@ -1305,14 +1268,14 @@ fn step_adjacent_transform_neighbors(
 
 fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     let cell = sg.get(p);
-    let props = world.material_props(cell.material);
-    let free_falling = cell.flags & cell_flags::IS_FREE_FALLING != 0;
+    let props = world.material_props(cell.material());
+    let free_falling = cell.has_flag(cell_flags::IS_FREE_FALLING);
 
     if !free_falling {
         let below = Vec2i::new(p.x, p.y + 1);
         let below_cell = sg.get(below);
-        let below_props = world.material_props(below_cell.material);
-        if below_cell.material == material::EMPTY
+        let below_props = world.material_props(below_cell.material());
+        if below_cell.material() == material::EMPTY
             || (!below_props.inert()
                 && vertical_down_allows_density_swap(props.phase(), below_props.phase())
                 && props.density > below_props.density)
@@ -1322,7 +1285,7 @@ fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
             if below_props.phase() == Phase::Liquid && rng.gen_ratio(1, 5) {
                 let dir = if rng.gen_bool(0.5) { -1 } else { 1 };
                 let side = Vec2i::new(p.x + dir, p.y);
-                if sg.get(side).material == material::EMPTY {
+                if sg.get(side).material() == material::EMPTY {
                     let _ = sg.try_displace(world, p, side, MoveIntent::Lateral, rng);
                 }
             }
@@ -1330,7 +1293,7 @@ fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
         }
     }
 
-    let new_vel = ((cell.velocity as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
+    let new_vel = ((cell.velocity_x() as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
     sg.set_velocity(p, new_vel);
 
     let steps = (new_vel as i32).max(1);
@@ -1365,10 +1328,10 @@ fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
         for dx in [-1i32, 1] {
             let neighbor = Vec2i::new(current.x + dx, current.y);
             let ncell = sg.get(neighbor);
-            if ncell.material != material::EMPTY
-                && ncell.flags & cell_flags::IS_FREE_FALLING == 0
+            if ncell.material() != material::EMPTY
+                && !ncell.has_flag(cell_flags::IS_FREE_FALLING)
             {
-                let nprops = world.material_props(ncell.material);
+                let nprops = world.material_props(ncell.material());
                 if nprops.phase() == Phase::Solid && !nprops.inert() && nprops.inertial_resistance() < 255 {
                     let dislodge_chance = (255 - nprops.inertial_resistance()) as u32;
                     if rng.gen_ratio(dislodge_chance.max(1), 256) {
@@ -1395,30 +1358,30 @@ fn liquid_supported_friction(props: &MaterialProps) -> i8 {
 
 fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     let cell = sg.get(p);
-    let props = world.material_props(cell.material);
+    let props = world.material_props(cell.material());
     if props.has_acid_corrosion() {
         acid_corrode_neighbors(sg, world, p, &props, rng);
     }
     if props.has_adjacent_influence() {
-        let src_mat = cell.material;
+        let src_mat = cell.material();
         if liquid_adjacent_influence_pass(sg, world, p, src_mat, &props.adjacent_influence, rng) {
             return;
         }
     }
 
     let cell = sg.get(p);
-    let props = world.material_props(cell.material);
+    let props = world.material_props(cell.material());
 
     let below = Vec2i::new(p.x, p.y + 1);
     let below_cell = sg.get(below);
-    let below_props = world.material_props(below_cell.material);
-    let can_fall = below_cell.material == material::EMPTY
+    let below_props = world.material_props(below_cell.material());
+    let can_fall = below_cell.material() == material::EMPTY
         || (!below_props.inert()
             && vertical_down_allows_density_swap(props.phase(), below_props.phase())
             && props.density > below_props.density);
 
     if !can_fall {
-        if cell.velocity == 0 {
+        if cell.velocity_x() == 0 {
             // One slip attempt without requiring fall speed (opens v=0 puddles toward holes only).
             if step_liquid_supported_slide(sg, world, p, rng) {
                 return;
@@ -1431,13 +1394,13 @@ fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
             return;
         }
 
-        let v = sg.get(p).velocity;
+        let v = sg.get(p).velocity_x();
         let friction = liquid_supported_friction(&props);
         sg.set_velocity(p, (v - friction).max(0));
         return;
     }
 
-    let new_vel = ((cell.velocity as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
+    let new_vel = ((cell.velocity_x() as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
     sg.set_velocity(p, new_vel);
 
     let steps = (new_vel as i32).max(1);
@@ -1482,7 +1445,7 @@ fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
             return;
         }
 
-        let v = sg.get(current).velocity;
+        let v = sg.get(current).velocity_x();
         let friction = liquid_supported_friction(&props);
         sg.set_velocity(current, (v - friction).max(0));
         return;
@@ -1490,14 +1453,14 @@ fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
 
     let below_current = Vec2i::new(current.x, current.y + 1);
     let below_cell = sg.get(below_current);
-    let below_props = world.material_props(below_cell.material);
-    if below_cell.material != material::EMPTY
+    let below_props = world.material_props(below_cell.material());
+    if below_cell.material() != material::EMPTY
         && (below_props.inert()
             || !vertical_down_allows_density_swap(props.phase(), below_props.phase())
             || props.density <= below_props.density)
     {
         if !step_liquid_supported_slide(sg, world, current, rng) {
-            let v = sg.get(current).velocity;
+            let v = sg.get(current).velocity_x();
             let friction = liquid_supported_friction(&props);
             sg.set_velocity(current, (v - friction).max(0));
         }
@@ -1507,7 +1470,7 @@ fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
 /// While supported, slide toward the side whose column has void (empty or hole-below) closest
 /// below this row. Tie-break: shallower `liquid_column_void_depth` then [`liquid_prefer_left_first`].
 fn step_liquid_supported_slide(sg: &SimGrids, world: &World, from: Vec2i, rng: &mut SmallRng) -> bool {
-    let mat = sg.get(from).material;
+    let mat = sg.get(from).material();
     let rule = world.material_rule(mat);
     let spread = rule.lateral_spread.max(1) as i32;
 
@@ -1566,14 +1529,14 @@ fn liquid_column_void_depth(sg: &SimGrids, col_x: i32, surface_y: i32, max_dy: i
             break;
         }
         let cell = sg.get(p);
-        if cell.material == material::EMPTY {
+        if cell.material() == material::EMPTY {
             return Some(dy);
         }
         let below = Vec2i::new(col_x, surface_y + dy + 1);
         if sg.index(below).is_none() {
             continue;
         }
-        if sg.get(below).material == material::EMPTY {
+        if sg.get(below).material() == material::EMPTY {
             return Some(dy);
         }
     }
@@ -1587,13 +1550,13 @@ fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, acid_props: &M
         return;
     }
     let mut acid = sg.get(p);
-    let corrosive_mat = acid.material;
-    if corrosive_mat == material::EMPTY || acid.lifetime == 0 {
+    let corrosive_mat = acid.material();
+    if corrosive_mat == material::EMPTY || acid.lifetime() == 0 {
         return;
     }
     for &(dx, dy) in &CARDINAL {
         acid = sg.get(p);
-        if acid.material != corrosive_mat || acid.lifetime == 0 {
+        if acid.material() != corrosive_mat || acid.lifetime() == 0 {
             return;
         }
         let np = Vec2i::new(p.x + dx, p.y + dy);
@@ -1601,10 +1564,10 @@ fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, acid_props: &M
             continue;
         }
         let ncell = sg.get(np);
-        if ncell.material == material::EMPTY {
+        if ncell.material() == material::EMPTY {
             continue;
         }
-        let nprops = world.material_props(ncell.material);
+        let nprops = world.material_props(ncell.material());
         if !nprops.acid_vulnerability.affected {
             continue;
         }
@@ -1617,26 +1580,26 @@ fn acid_corrode_neighbors(sg: &SimGrids, world: &World, p: Vec2i, acid_props: &M
         }
 
         if nprops.corrosion_max_hp == 0 {
-            sg.set_cell(np, Cell::default());
+            sg.set_cell(np, Cell::new());
         } else {
-            let cur_hp = if ncell.lifetime == 0 {
+            let cur_hp = if ncell.lifetime() == 0 {
                 nprops.corrosion_max_hp
             } else {
-                ncell.lifetime
+                ncell.lifetime()
             };
             let new_hp = cur_hp.saturating_sub(src.neighbor_damage);
             if new_hp == 0 {
-                sg.set_cell(np, Cell::default());
+                sg.set_cell(np, Cell::new());
             } else {
                 let mut c = ncell;
-                c.lifetime = new_hp;
+                c.set_lifetime(new_hp);
                 sg.set_cell(np, c);
             }
         }
 
-        let next_acid = acid.lifetime.saturating_sub(src.self_lifetime_cost);
+        let next_acid = acid.lifetime().saturating_sub(src.self_lifetime_cost);
         if next_acid == 0 {
-            sg.set_cell(p, Cell::default());
+            sg.set_cell(p, Cell::new());
             return;
         }
         sg.set_lifetime(p, next_acid);
@@ -1647,12 +1610,12 @@ fn scan_lateral_target(sg: &SimGrids, from: Vec2i, dir: i32, max_dist: i32) -> O
     for i in 1..=max_dist {
         let p = Vec2i::new(from.x + dir * i, from.y);
         let cell = sg.get(p);
-        if cell.material == material::EMPTY {
+        if cell.material() == material::EMPTY {
             return Some(i);
         }
         let below = Vec2i::new(p.x, p.y + 1);
         let below_cell = sg.get(below);
-        if below_cell.material == material::EMPTY {
+        if below_cell.material() == material::EMPTY {
             return Some(i);
         }
     }
@@ -1661,8 +1624,8 @@ fn scan_lateral_target(sg: &SimGrids, from: Vec2i, dir: i32, max_dist: i32) -> O
 
 fn step_gas(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     let cell = sg.get(p);
-    let props = world.material_props(cell.material);
-    let new_vel = ((cell.velocity as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
+    let props = world.material_props(cell.material());
+    let new_vel = ((cell.velocity_x() as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
     sg.set_velocity(p, new_vel);
 
     let steps = (new_vel as i32).max(1);
@@ -1703,53 +1666,45 @@ fn step_ember(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explos
 
     let cell = sg.get(p);
     let ember_props = world.material_props(material::EMBER);
-    let mut life = cell.lifetime;
+    let mut life = cell.lifetime();
 
     if life == 0 {
         sg.set_cell(
             p,
-            Cell {
-                material: material::SMOKE,
-                flags: 0,
-                velocity: 0,
-                lifetime: rng.gen_range(18..52),
-                variant: cell.variant,
-                scorch: cell.scorch,
-            },
+            Cell::new()
+                .with_material(material::SMOKE)
+                .with_lifetime(rng.gen_range(18..52))
+                .with_variant(cell.variant()),
         );
         return;
     }
 
     for &(dx, dy) in &NEIGHBORS8 {
         let np = Vec2i::new(p.x + dx, p.y + dy);
-        let nprops = world.material_props(sg.get(np).material);
+        let nprops = world.material_props(sg.get(np).material());
         if !nprops.extinguishes_fire() {
             continue;
         }
         sg.set_cell(np, water_to_steam_cell(rng));
         let src = sg.get(p);
-        if src.material != material::EMBER {
+        if src.material() != material::EMBER {
             return;
         }
-        let nl = src.lifetime.saturating_sub(ADJ_ACTOR_WATER_QUENCH_LIFETIME);
+        let nl = src.lifetime().saturating_sub(ADJ_ACTOR_WATER_QUENCH_LIFETIME);
         if nl == 0 {
             sg.set_cell(
                 p,
-                Cell {
-                    material: material::SMOKE,
-                    flags: 0,
-                    velocity: 0,
-                    lifetime: rng.gen_range(18..52),
-                    variant: cell.variant,
-                    scorch: cell.scorch,
-                },
+                Cell::new()
+                    .with_material(material::SMOKE)
+                    .with_lifetime(rng.gen_range(18..52))
+                    .with_variant(cell.variant()),
             );
             return;
         }
         sg.set_lifetime(p, nl);
     }
 
-    life = sg.get(p).lifetime;
+    life = sg.get(p).lifetime();
 
     let heat_factor = ember_props.ignitability as f32 / 255.0;
     if spread_burn_to_neighbors(
@@ -1765,20 +1720,16 @@ fn step_ember(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explos
         return;
     }
 
-    life = sg.get(p).lifetime;
+    life = sg.get(p).lifetime();
     let rate = ember_props.consumption_rate.max(1) as u32;
     if rng.gen_ratio(rate, 256) {
         if life <= 1 {
             sg.set_cell(
                 p,
-                Cell {
-                    material: material::SMOKE,
-                    flags: 0,
-                    velocity: 0,
-                    lifetime: rng.gen_range(18..52),
-                    variant: cell.variant,
-                    scorch: cell.scorch,
-                },
+                Cell::new()
+                    .with_material(material::SMOKE)
+                    .with_lifetime(rng.gen_range(18..52))
+                    .with_variant(cell.variant()),
             );
             return;
         }
@@ -1810,7 +1761,7 @@ fn flash_ignite_adjacent_from_burnout(
 ) {
     const HEAT: f32 = 1.0;
     const CHILD_CAP: u8 = 72;
-    let source_material = sg.get(p).material;
+    let source_material = sg.get(p).material();
     for &(dx, dy) in &FLASH_NEIGHBORS8 {
         let np = Vec2i::new(p.x + dx, p.y + dy);
         try_flash_ignite_neighbor(
@@ -1843,17 +1794,17 @@ fn try_flash_ignite_neighbor(
     explosions: &mut Vec<(Vec2i, i32)>,
 ) {
     let ncell = sg.get(np);
-    if ncell.material == material::EMPTY {
+    if ncell.material() == material::EMPTY {
         return;
     }
-    let nprops = world.material_props(ncell.material);
+    let nprops = world.material_props(ncell.material());
 
     if nprops.extinguishes_fire() {
         sg.set_cell(np, water_to_steam_cell(rng));
         return;
     }
 
-    if nprops.on_death_become != material::EMPTY && ncell.material == nprops.on_death_become {
+    if nprops.on_death_become != material::EMPTY && ncell.material() == nprops.on_death_become {
         return;
     }
 
@@ -1895,53 +1846,48 @@ fn try_flash_ignite_neighbor(
 
     if nprops.explosion_radius > 0 {
         explosions.push((np, nprops.explosion_radius as i32));
-        sg.set_cell(np, Cell::default());
+        sg.set_cell(np, Cell::new());
         return;
     }
 
     if nprops.on_heat_become != material::EMPTY {
+        let become_props = world.material_props(nprops.on_heat_become);
         sg.set_cell(
             np,
-            Cell {
-                material: nprops.on_heat_become,
-                flags: 0,
-                velocity: 0,
-                lifetime: ncell.lifetime,
-                variant: ncell.variant,
-                scorch: ncell.scorch,
-            },
+            Cell::new()
+                .with_material(nprops.on_heat_become)
+                .with_lifetime(ncell.lifetime())
+                .with_temperature(become_props.base_temperature)
+                .with_variant(ncell.variant()),
         );
         return;
     }
 
     if nprops.fuel_mass > 0 {
+        let ignite_temp = ncell.temperature().max(nprops.ignition_temperature);
         sg.set_cell(
             np,
-            Cell {
-                material: ncell.material,
-                flags: ncell.flags | cell_flags::ON_FIRE,
-                velocity: 0,
-                lifetime: nprops.fuel_mass,
-                variant: ncell.variant,
-                scorch: ncell.scorch,
-            },
+            Cell::new()
+                .with_material(ncell.material())
+                .with_flags(ncell.flags())
+                .with_lifetime(nprops.fuel_mass)
+                .with_temperature(ignite_temp)
+                .with_variant(ncell.variant()),
         );
         return;
     }
 
     let (ignite_mat, ignite_life) = instant_heat_ignition_cell(&nprops, child_life_cap, rng);
-    sg.set_cell(np, Cell {
-        material: ignite_mat,
-        flags: 0,
-        velocity: 0,
-        lifetime: ignite_life,
-        variant: if ignite_mat == material::FIRE {
+    let ignite_props = world.material_props(ignite_mat);
+    sg.set_cell(np, Cell::new()
+        .with_material(ignite_mat)
+        .with_lifetime(ignite_life)
+        .with_temperature(ignite_props.base_temperature)
+        .with_variant(if ignite_mat == material::FIRE {
             0
         } else {
-            ncell.variant
-        },
-        scorch: 0,
-    });
+            ncell.variant()
+        }));
 }
 
 /// Returns `true` if the source at `p` was extinguished (replaced with smoke).
@@ -1971,11 +1917,11 @@ fn spread_burn_to_neighbors(
     for &(dx, dy) in &NEIGHBORS {
         let np = Vec2i::new(p.x + dx, p.y + dy);
         let ncell = sg.get(np);
-        if ncell.material == material::EMPTY || ncell.material == source_material {
+        if ncell.material() == material::EMPTY || ncell.material() == source_material {
             continue;
         }
 
-        let nprops = world.material_props(ncell.material);
+        let nprops = world.material_props(ncell.material());
 
         if nprops.extinguishes_fire() {
             if source_material == material::FIRE || source_material == material::LAVA {
@@ -1983,26 +1929,21 @@ fn spread_burn_to_neighbors(
             }
             sg.set_cell(np, water_to_steam_cell(rng));
             let src = sg.get(p);
-            if src.material != source_material {
+            if src.material() != source_material {
                 continue;
             }
-            let nl = src.lifetime.saturating_sub(ADJ_ACTOR_WATER_QUENCH_LIFETIME);
+            let nl = src.lifetime().saturating_sub(ADJ_ACTOR_WATER_QUENCH_LIFETIME);
             if nl == 0 {
-                sg.set_cell(p, Cell {
-                    material: material::SMOKE,
-                    flags: 0,
-                    velocity: 0,
-                    lifetime: rng.gen_range(12..44),
-                    variant: 0,
-                    scorch: 0,
-                });
+                sg.set_cell(p, Cell::new()
+                    .with_material(material::SMOKE)
+                    .with_lifetime(rng.gen_range(12..44)));
                 return true;
             }
             sg.set_lifetime(p, nl);
             continue;
         }
 
-        if nprops.on_death_become != material::EMPTY && ncell.material == nprops.on_death_become {
+        if nprops.on_death_become != material::EMPTY && ncell.material() == nprops.on_death_become {
             continue;
         }
 
@@ -2038,58 +1979,53 @@ fn spread_burn_to_neighbors(
 
         if nprops.explosion_radius > 0 {
             explosions.push((np, nprops.explosion_radius as i32));
-            sg.set_cell(np, Cell::default());
+            sg.set_cell(np, Cell::new());
             continue;
         }
 
         if nprops.on_heat_become != material::EMPTY {
-            sg.set_cell(np, Cell {
-                material: nprops.on_heat_become,
-                flags: 0,
-                velocity: 0,
-                lifetime: ncell.lifetime,
-                variant: ncell.variant,
-                scorch: ncell.scorch,
-            });
+            let become_props = world.material_props(nprops.on_heat_become);
+            sg.set_cell(np, Cell::new()
+                .with_material(nprops.on_heat_become)
+                .with_lifetime(ncell.lifetime())
+                .with_temperature(become_props.base_temperature)
+                .with_variant(ncell.variant()));
             continue;
         }
 
         if nprops.fuel_mass > 0 {
+            let ignite_temp = ncell.temperature().max(nprops.ignition_temperature);
             sg.set_cell(
                 np,
-                Cell {
-                    material: ncell.material,
-                    flags: ncell.flags | cell_flags::ON_FIRE,
-                    velocity: 0,
-                    lifetime: nprops.fuel_mass,
-                    variant: ncell.variant,
-                    scorch: ncell.scorch,
-                },
+                Cell::new()
+                    .with_material(ncell.material())
+                    .with_flags(ncell.flags())
+                    .with_lifetime(nprops.fuel_mass)
+                    .with_temperature(ignite_temp)
+                    .with_variant(ncell.variant()),
             );
             continue;
         }
 
         let (ignite_mat, ignite_life) = instant_heat_ignition_cell(&nprops, child_life_cap, rng);
-        sg.set_cell(np, Cell {
-            material: ignite_mat,
-            flags: 0,
-            velocity: 0,
-            lifetime: ignite_life,
-            variant: if ignite_mat == material::FIRE {
+        let ignite_props = world.material_props(ignite_mat);
+        sg.set_cell(np, Cell::new()
+            .with_material(ignite_mat)
+            .with_lifetime(ignite_life)
+            .with_temperature(ignite_props.base_temperature)
+            .with_variant(if ignite_mat == material::FIRE {
                 0
             } else {
-                ncell.variant
-            },
-            scorch: 0,
-        });
+                ncell.variant()
+            }));
     }
     false
 }
 
 fn step_fire(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explosions: &mut Vec<(Vec2i, i32)>) {
     let cell = sg.get(p);
-    let fire_props = world.material_props(cell.material);
-    let life = cell.lifetime;
+    let fire_props = world.material_props(cell.material());
+    let life = cell.lifetime();
 
     if life == 0 {
         let death_mat = if fire_props.on_death_become != material::EMPTY {
@@ -2098,16 +2034,11 @@ fn step_fire(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explosi
             material::SMOKE
         };
         if death_mat == material::EMPTY {
-            sg.set_cell(p, Cell::default());
+            sg.set_cell(p, Cell::new());
         } else {
-            sg.set_cell(p, Cell {
-                material: death_mat,
-                flags: 0,
-                velocity: 0,
-                lifetime: on_death_replacement_lifetime(&fire_props, rng),
-                variant: 0,
-                scorch: 0,
-            });
+            sg.set_cell(p, Cell::new()
+                .with_material(death_mat)
+                .with_lifetime(on_death_replacement_lifetime(&fire_props, rng)));
         }
         return;
     }
@@ -2115,7 +2046,7 @@ fn step_fire(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explosi
     sg.set_lifetime(p, life - 1);
 
     let heat_factor = life as f32 / 255.0;
-    let source_mat = cell.material;
+    let source_mat = cell.material();
     if spread_burn_to_neighbors(
         sg,
         world,
@@ -2131,63 +2062,48 @@ fn step_fire(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng, explosi
 
     let current = p;
     let up = Vec2i::new(current.x, current.y - 1);
-    if sg.get(up).material == material::EMPTY {
-        let up_cell = Cell {
-            material: cell.material,
-            flags: 0,
-            velocity: 0,
-            lifetime: life.saturating_sub(1),
-            variant: 0,
-            scorch: 0,
-        };
+    if sg.get(up).material() == material::EMPTY {
+        let up_cell = Cell::new()
+            .with_material(cell.material())
+            .with_lifetime(life.saturating_sub(1));
         sg.set_cell(up, up_cell);
-        sg.set_cell(p, Cell::default());
+        sg.set_cell(p, Cell::new());
         return;
     }
 
     let drift = if rng.gen_bool(0.5) { -1 } else { 1 };
     let side_up = Vec2i::new(current.x + drift, current.y - 1);
-    if sg.get(side_up).material == material::EMPTY {
-        let moved_cell = Cell {
-            material: cell.material,
-            flags: 0,
-            velocity: 0,
-            lifetime: life.saturating_sub(1),
-            variant: 0,
-            scorch: 0,
-        };
+    if sg.get(side_up).material() == material::EMPTY {
+        let moved_cell = Cell::new()
+            .with_material(cell.material())
+            .with_lifetime(life.saturating_sub(1));
         sg.set_cell(side_up, moved_cell);
-        sg.set_cell(p, Cell::default());
+        sg.set_cell(p, Cell::new());
         return;
     }
 
     let side = Vec2i::new(current.x + drift, current.y);
-    if sg.get(side).material == material::EMPTY {
-        let moved_cell = Cell {
-            material: cell.material,
-            flags: 0,
-            velocity: 0,
-            lifetime: life.saturating_sub(1),
-            variant: 0,
-            scorch: 0,
-        };
+    if sg.get(side).material() == material::EMPTY {
+        let moved_cell = Cell::new()
+            .with_material(cell.material())
+            .with_lifetime(life.saturating_sub(1));
         sg.set_cell(side, moved_cell);
-        sg.set_cell(p, Cell::default());
+        sg.set_cell(p, Cell::new());
     }
 }
 
 fn step_smoke(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     let cell = sg.get(p);
-    let life = cell.lifetime;
+    let life = cell.lifetime();
 
     if life == 0 {
-        sg.set_cell(p, Cell::default());
+        sg.set_cell(p, Cell::new());
         return;
     }
     sg.set_lifetime(p, life - 1);
 
-    let props = world.material_props(cell.material);
-    let new_vel = ((cell.velocity as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
+    let props = world.material_props(cell.material());
+    let new_vel = ((cell.velocity_x() as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
     sg.set_velocity(p, new_vel);
 
     let steps = (new_vel as i32).max(1);
@@ -2216,26 +2132,23 @@ fn step_smoke(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
 
 fn step_steam(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     let cell = sg.get(p);
-    let life = cell.lifetime;
+    let life = cell.lifetime();
 
     if life == 0 {
+        let water_props = world.material_props(material::LIQUID);
         sg.set_cell(
             p,
-            Cell {
-                material: material::LIQUID,
-                flags: 0,
-                velocity: 0,
-                lifetime: 0,
-                variant: cell.variant,
-                scorch: 0,
-            },
+            Cell::new()
+                .with_material(material::LIQUID)
+                .with_temperature(water_props.base_temperature)
+                .with_variant(cell.variant()),
         );
         return;
     }
     sg.set_lifetime(p, life - 1);
 
     let props = world.material_props(material::STEAM);
-    let new_vel = ((cell.velocity as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
+    let new_vel = ((cell.velocity_x() as i16) + props.acceleration() as i16).min(props.max_speed() as i16) as i8;
     sg.set_velocity(p, new_vel);
 
     let mut current = p;
@@ -2311,8 +2224,8 @@ impl ParticleSim {
             particle.lifetime -= dt;
 
             let cell_pos = Vec2i::new(particle.pos.0.round() as i32, particle.pos.1.round() as i32);
-            if particle.lifetime <= 0.0 || world.get_cell(cell_pos).material == material::EMPTY {
-                if world.get_cell(cell_pos).material == material::EMPTY {
+            if particle.lifetime <= 0.0 || world.get_cell(cell_pos).material() == material::EMPTY {
+                if world.get_cell(cell_pos).material() == material::EMPTY {
                     world.set_cell(cell_pos, particle.cell);
                 } else {
                     survivors.push(particle);
@@ -2339,11 +2252,11 @@ pub fn deterministic_hash(world: &World) -> Option<u64> {
     for y in bounds.min.y..=bounds.max.y {
         for x in bounds.min.x..=bounds.max.x {
             let c = world.get_cell(Vec2i::new(x, y));
-            hash ^= c.material as u64;
+            hash ^= c.material() as u64;
             hash = hash.wrapping_mul(1099511628211);
-            hash ^= c.flags as u64;
+            hash ^= c.flags() as u64;
             hash = hash.wrapping_mul(1099511628211);
-            hash ^= c.velocity as u64;
+            hash ^= c.velocity_x() as u64;
             hash = hash.wrapping_mul(1099511628211);
         }
     }

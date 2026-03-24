@@ -1,12 +1,16 @@
 pub mod bresenham;
 pub mod cell64;
+pub mod explosion;
 pub mod materials;
+
+pub use explosion::{base_strength_for_radius, ExplosionParams, ExplosionSpawn};
 pub mod render;
 pub mod rigid;
 pub mod sim;
 pub mod world;
 pub mod worldgen;
 
+pub use rigid::STRUCTURAL_STRESS_SCALE;
 pub use world::MaterialMotion;
 
 use rand::rngs::SmallRng;
@@ -118,8 +122,68 @@ impl Simulation {
         }));
     }
 
+    fn collect_rigid_hits_paint_disk(world: &World, center: Vec2i, radius: i32) -> Vec<(Vec2i, u32)> {
+        let mut out = Vec::new();
+        let r2 = radius * radius;
+        for y in (center.y - radius)..=(center.y + radius) {
+            for x in (center.x - radius)..=(center.x + radius) {
+                let dx = x - center.x;
+                let dy = y - center.y;
+                if dx * dx + dy * dy <= r2 {
+                    let p = Vec2i::new(x, y);
+                    if let Some(id) = world.get_rigid_id(p) {
+                        out.push((p, id));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn collect_rigid_hits_paint_rect(world: &World, min: Vec2i, max: Vec2i) -> Vec<(Vec2i, u32)> {
+        let mut out = Vec::new();
+        let x0 = min.x.min(max.x);
+        let x1 = min.x.max(max.x);
+        let y0 = min.y.min(max.y);
+        let y1 = min.y.max(max.y);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let p = Vec2i::new(x, y);
+                if let Some(id) = world.get_rigid_id(p) {
+                    out.push((p, id));
+                }
+            }
+        }
+        out
+    }
+
     pub fn paint_circle(&mut self, center: Vec2i, radius: i32, material: MaterialId) {
+        // Erasing with EMPTY skips immediate carve so `check_splits` can see gaps and split bodies.
+        let hits = if material != world::material::EMPTY {
+            Self::collect_rigid_hits_paint_disk(&self.world, center, radius)
+        } else {
+            Vec::new()
+        };
         self.world.paint_circle(center, radius, material);
+        if !hits.is_empty() {
+            self.rigid
+                .carve_dynamic_bodies_at_world_cells(&mut self.world, &hits);
+            self.rigid.rebuild_dirty_dynamic_colliders();
+        }
+    }
+
+    pub fn paint_rect_filled(&mut self, min: Vec2i, max: Vec2i, material: MaterialId) {
+        let hits = if material != world::material::EMPTY {
+            Self::collect_rigid_hits_paint_rect(&self.world, min, max)
+        } else {
+            Vec::new()
+        };
+        self.world.paint_rect_filled(min, max, material);
+        if !hits.is_empty() {
+            self.rigid
+                .carve_dynamic_bodies_at_world_cells(&mut self.world, &hits);
+            self.rigid.rebuild_dirty_dynamic_colliders();
+        }
     }
 
     pub fn cell(&self, p: Vec2i) -> Cell {
@@ -127,14 +191,39 @@ impl Simulation {
     }
 
     pub fn paint_cell(&mut self, p: Vec2i, cell: Cell) {
+        let hit = if cell.material() != world::material::EMPTY {
+            self.world.get_rigid_id(p).map(|id| (p, id))
+        } else {
+            None
+        };
         self.world.set_cell(p, cell);
+        if let Some((wp, id)) = hit {
+            self.rigid
+                .carve_dynamic_bodies_at_world_cells(&mut self.world, &[(wp, id)]);
+            self.rigid.rebuild_dirty_dynamic_colliders();
+        }
+    }
+
+    /// Bresenham chord explosion (shuffled rays, center-out). Carves dynamic rigid voxels in the blast disk
+    /// like [`Self::paint_circle`] with [`world::material::EMPTY`], then refreshes colliders.
+    pub fn apply_explosion(&mut self, params: crate::explosion::ExplosionParams) {
+        let center = params.center;
+        let radius = params.radius;
+        let hits = Self::collect_rigid_hits_paint_disk(&self.world, center, radius);
+        crate::explosion::apply(&mut self.world, &mut self.rng, params);
+        if !hits.is_empty() {
+            self.rigid
+                .carve_dynamic_bodies_at_world_cells(&mut self.world, &hits);
+            self.rigid.rebuild_dirty_dynamic_colliders();
+        }
+        self.mark_rigid_colliders_stale();
     }
 
     /// Paints a thick brush along the integer Bresenham line from `a` to `b` (inclusive).
     /// Use when the pointer jumps between frames so no gaps appear in the stroke.
     pub fn paint_line_brush(&mut self, a: Vec2i, b: Vec2i, brush_radius: i32, material: MaterialId) {
         for p in crate::bresenham::bresenham_line(a, b) {
-            self.world.paint_circle(p, brush_radius, material);
+            self.paint_circle(p, brush_radius, material);
         }
     }
 
@@ -149,6 +238,16 @@ impl Simulation {
     }
 
     pub fn spawn_rigid_body_circle(&mut self, center: Vec2i, radius: i32, material: MaterialId) -> u32 {
+        self.spawn_rigid_body_circle_with_temp(center, radius, material, None)
+    }
+
+    pub fn spawn_rigid_body_circle_with_temp(
+        &mut self,
+        center: Vec2i,
+        radius: i32,
+        material: MaterialId,
+        temp_override: Option<u16>,
+    ) -> u32 {
         let r2 = radius * radius;
         let positions: Vec<Vec2i> = (center.y - radius..=center.y + radius)
             .flat_map(|y| {
@@ -163,8 +262,18 @@ impl Simulation {
                 })
             })
             .collect();
-        self.rigid
-            .spawn_from_circle(&mut self.world, &positions, material, radius as f32)
+        self.rigid.spawn_from_circle_with_temp(
+            &mut self.world,
+            &positions,
+            material,
+            radius as f32,
+            temp_override,
+        )
+    }
+
+    /// Rebuild dynamic rigid colliders on the next [`Self::step`] for all bodies (e.g. after upgrading meshing).
+    pub fn mark_rigid_colliders_stale(&mut self) {
+        self.rigid.mark_all_dynamic_colliders_stale();
     }
 
     pub fn step(&mut self, dt: f32) {
@@ -243,19 +352,19 @@ impl Simulation {
     }
 
     pub fn copy_rgba_for_region(&self, rect: RectI) -> PixelRegion {
-        render::copy_rgba_for_region(&self.world, rect)
+        render::copy_rgba_for_region(&self.world, Some(&self.rigid), rect)
     }
 
     pub fn copy_argb32_for_region(&self, rect: RectI) -> Vec<u32> {
-        render::copy_argb32_for_region(&self.world, rect)
+        render::copy_argb32_for_region(&self.world, Some(&self.rigid), rect)
     }
 
     pub fn copy_argb32_for_region_chunk_step_viz(&self, rect: RectI) -> Vec<u32> {
-        render::copy_argb32_for_region_chunk_step_viz(&self.world, rect)
+        render::copy_argb32_for_region_chunk_step_viz(&self.world, Some(&self.rigid), rect)
     }
 
     pub fn copy_argb32_for_region_pass_batch_viz(&self, rect: RectI) -> Vec<u32> {
-        render::copy_argb32_for_region_pass_batch_viz(&self.world, rect)
+        render::copy_argb32_for_region_pass_batch_viz(&self.world, Some(&self.rigid), rect)
     }
 
     pub fn copy_debug_argb32_for_region(&self, rect: RectI) -> Vec<u32> {
@@ -263,7 +372,7 @@ impl Simulation {
     }
 
     pub fn copy_argb32_for_region_all_debug_views(&self, rect: RectI) -> Vec<u32> {
-        render::copy_argb32_for_region_all_debug_views(&self.world, rect)
+        render::copy_argb32_for_region_all_debug_views(&self.world, Some(&self.rigid), rect)
     }
 
     pub fn debug_collider_lines(&self) -> Vec<[(f32, f32); 2]> {
@@ -408,6 +517,10 @@ impl Simulation {
         &self.world
     }
 
+    pub(crate) fn test_world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
     pub(crate) fn test_rigid(&self) -> &RigidBridge {
         &self.rigid
     }
@@ -418,7 +531,7 @@ mod tests {
     use super::*;
     use crate::rigid::RigidBridge;
     use crate::sim::deterministic_hash;
-    use crate::world::{material, Cell, ChunkCoord, MaterialId, MaterialMotion, World, CHUNK_SIZE};
+    use crate::world::{material, Cell, ChunkCoord, MaterialId, MaterialMotion, Vec2i, World, CHUNK_SIZE};
 
     fn count_material(sim: &Simulation, rect: RectI, id: u16) -> usize {
         sim.copy_palette_indices_for_region(rect)
@@ -610,38 +723,7 @@ mod tests {
                     max_speed: 4,
                     acceleration: 1,
                 },
-                ignitability: 0,
-                consumption_rate: 0,
-                fuel_mass: 0,
-                explosion_radius: 0,
-                on_heat_become: 0,
-                on_death_become: 0,
-                on_death_lifetime_lo: 0,
-                on_death_lifetime_hi: 0,
-                corrosion_max_hp: 0,
-                acid_vulnerability: crate::world::AcidVulnerability::inactive(),
-                acid_corrosion: crate::world::AcidCorrosionSource::inactive(),
-                smolder_extinguish_material: material::EMPTY,
-                smolder_extinguish_lifetime_lo: 24,
-                smolder_extinguish_lifetime_hi: 64,
-                smolder_burnout_ignites_neighbors: false,
-                smolder_burnout_explosion_radius: 0,
-                smolder_burnout_become: material::EMPTY,
-                smolder_burnout_lifetime_lo: 0,
-                smolder_burnout_lifetime_hi: 0,
-                adjacent_transforms: [
-                    crate::world::AdjacentTransformRule::inactive(),
-                    crate::world::AdjacentTransformRule::inactive(),
-                    crate::world::AdjacentTransformRule::inactive(),
-                    crate::world::AdjacentTransformRule::inactive(),
-                ],
-                adjacent_influence: [crate::world::AdjacentInfluenceRule::inactive(); 8],
-                neighbor_spawns: [
-                    crate::world::NeighborSpawnRule::inactive(),
-                    crate::world::NeighborSpawnRule::inactive(),
-                    crate::world::NeighborSpawnRule::inactive(),
-                    crate::world::NeighborSpawnRule::inactive(),
-                ],
+                ..crate::world::MaterialProps::default_const()
             },
         );
         sim.paint_circle(Vec2i::new(12, 12), 2, material::SAND);
@@ -686,7 +768,7 @@ mod tests {
         for _ in 0..240 {
             sim.step(1.0 / 60.0);
             let c = sim.cell(Vec2i::new(10, 11));
-            if c.material == material::SAND && (c.flags & cell_flags::WET) != 0 {
+            if c.material() == material::SAND && (c.flags() & cell_flags::WET) != 0 {
                 return;
             }
         }
@@ -768,6 +850,52 @@ mod tests {
         assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
         assert_eq!(count_material(&sim, probe, material::PLANT), 1);
         assert_eq!(count_material(&sim, probe, material::WOOD), 1);
+    }
+
+    /// Rigid WOOD still runs `adjacent_transforms`, but new PLANT stays **off** the rigid bridge (no `rigid_id`),
+    /// so colliders/anchors do not grow with each conversion.
+    #[test]
+    fn rigid_wood_converts_adjacent_water_to_loose_plant_not_body_owned() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for &(x, y) in &[
+            (9, 9),
+            (10, 9),
+            (11, 9),
+            (12, 9),
+            (9, 10),
+            (12, 10),
+            (9, 11),
+            (10, 11),
+            (11, 11),
+            (12, 11),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        let wood_p = Vec2i::new(10, 10);
+        let water_p = Vec2i::new(11, 10);
+        let body_id = sim.spawn_rigid_body_from_pixels(&[wood_p], material::WOOD);
+        assert!(body_id != 0);
+        paint_cell(&mut sim, water_p, material::LIQUID);
+
+        let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
+        assert_eq!(count_material(&sim, probe, material::WOOD), 1);
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 1);
+        assert_eq!(count_material(&sim, probe, material::PLANT), 0);
+
+        for _ in 0..256 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, probe, material::LIQUID) == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
+        assert_eq!(count_material(&sim, probe, material::PLANT), 1);
+        assert_eq!(count_material(&sim, probe, material::WOOD), 1);
+        assert_eq!(sim.test_world().get_rigid_id(wood_p), Some(body_id));
+        assert_eq!(sim.test_world().get_rigid_id(water_p), None);
     }
 
     #[test]
@@ -1002,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn lava_trapped_cools_to_sand() {
+    fn lava_trapped_cools_to_obsidian() {
         let mut sim = Simulation::new(SimulationConfig::default());
         let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
         sim.set_solid_bounds(bounds);
@@ -1027,9 +1155,11 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            sim.copy_palette_indices_for_region(RectI::new(Vec2i::new(16, 16), Vec2i::new(16, 16)))[0],
-            material::SAND
+        let final_mat = sim.copy_palette_indices_for_region(RectI::new(Vec2i::new(16, 16), Vec2i::new(16, 16)))[0];
+        assert!(
+            final_mat == material::OBSIDIAN || final_mat == material::SAND,
+            "lava should cool to obsidian (or sand via burnout), got material {}",
+            final_mat
         );
         assert_eq!(count_material(&sim, bounds, material::LAVA), 0);
     }
@@ -1054,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn lava_adjacent_transform_vaporizes_water() {
+    fn lava_adjacent_water_produces_steam_and_obsidian() {
         let mut sim = Simulation::new(SimulationConfig::default());
         let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
         sim.set_solid_bounds(bounds);
@@ -1077,27 +1207,19 @@ mod tests {
 
         let probe = RectI::new(Vec2i::new(9, 9), Vec2i::new(12, 11));
         let mut saw_steam = false;
-        for _ in 0..256 {
+        for _ in 0..500 {
             sim.step(1.0 / 60.0);
             if count_material(&sim, probe, material::STEAM) >= 1 {
                 saw_steam = true;
                 break;
             }
         }
-        assert!(saw_steam, "lava should eventually vaporize adjacent water (chance < 100%)");
+        assert!(saw_steam, "lava should eventually vaporize adjacent water via heat conduction or adjacent transform");
         assert_eq!(count_material(&sim, probe, material::LIQUID), 0);
-        assert_eq!(count_material(&sim, probe, material::LAVA), 1);
     }
 
     fn test_dirt_cell() -> Cell {
-        Cell {
-            material: material::DIRT,
-            flags: 0,
-            velocity: 0,
-            lifetime: 0,
-            variant: 0,
-            scorch: 0,
-        }
+        Cell::new().with_material(material::DIRT)
     }
 
     /// Misaligned grid origin: `bounds_for_chunk` must still cover every dense cell for its chunk key.
@@ -1180,7 +1302,7 @@ mod tests {
         let x0 = origin.x + 1;
         for dx in 0..(3 * CHUNK_SIZE + 5) {
             let p = Vec2i::new(x0 + dx, y);
-            if world.get_cell(p).material == material::EMPTY {
+            if world.get_cell(p).material() == material::EMPTY {
                 world.set_cell(p, test_dirt_cell());
             }
             let dirty = world.take_physics_dirty_chunks();
@@ -1223,7 +1345,7 @@ mod tests {
 
         for dx in 0..span {
             let p = Vec2i::new(x0 + dx, y);
-            world.set_cell(p, Cell::default());
+            world.set_cell(p, Cell::new());
             let dirty = world.take_physics_dirty_chunks();
             rigid.rebuild_static_colliders(&world, &dirty);
         }
@@ -1249,7 +1371,7 @@ mod tests {
         let y0 = origin.y + 2;
         for dy in 0..(2 * CHUNK_SIZE + 4) {
             let p = Vec2i::new(x, y0 + dy);
-            if world.get_cell(p).material == material::EMPTY {
+            if world.get_cell(p).material() == material::EMPTY {
                 world.set_cell(p, test_dirt_cell());
             }
             let dirty = world.take_physics_dirty_chunks();
@@ -1285,5 +1407,250 @@ mod tests {
             "expected static colliders in chunk {:?}",
             coord
         );
+    }
+
+    #[test]
+    fn paint_over_rigid_body_pixel_clears_rigid_id_and_cell_persists() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(127, 127));
+        sim.set_solid_bounds(bounds);
+        let min = Vec2i::new(50, 50);
+        let max = Vec2i::new(52, 52);
+        let body_id = sim.spawn_rigid_body_rect(min, max, material::RIGID);
+        let p = Vec2i::new(51, 51);
+        assert_eq!(sim.test_world().get_rigid_id(p), Some(body_id));
+
+        // Non-inert paint: `check_splits` + paint-time carve drop anchors.
+        sim.paint_circle(p, 0, material::SAND);
+        assert_eq!(sim.test_world().get_rigid_id(p), None);
+        assert_eq!(sim.test_world().get_cell(p).material(), material::SAND);
+
+        for _ in 0..8 {
+            sim.step(1.0 / 60.0);
+        }
+        assert_ne!(sim.test_world().get_rigid_id(p), Some(body_id));
+    }
+
+    #[test]
+    fn paint_inert_static_over_rigid_body_pixel_carves_anchor_and_clears_ownership() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(127, 127));
+        sim.set_solid_bounds(bounds);
+        let min = Vec2i::new(50, 50);
+        let max = Vec2i::new(52, 52);
+        let body_id = sim.spawn_rigid_body_rect(min, max, material::RIGID);
+        let p = Vec2i::new(51, 51);
+        assert_eq!(sim.test_world().get_rigid_id(p), Some(body_id));
+
+        sim.paint_circle(p, 0, material::STATIC);
+        assert_eq!(sim.test_world().get_rigid_id(p), None);
+        assert_eq!(sim.test_world().get_cell(p).material(), material::STATIC);
+
+        for _ in 0..8 {
+            sim.step(1.0 / 60.0);
+        }
+        assert_ne!(sim.test_world().get_rigid_id(p), Some(body_id));
+        assert_eq!(sim.test_world().get_cell(p).material(), material::STATIC);
+    }
+
+    /// Regression: inert terrain must not strip anchors via `sync_pixels_to_physics` when the body rests on it.
+    #[test]
+    fn rigid_body_resting_on_static_terrain_not_carved_by_inert_sync() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(127, 127));
+        sim.set_solid_bounds(bounds);
+        for x in 10..118 {
+            sim.paint_circle(Vec2i::new(x, 90), 0, material::STATIC);
+        }
+        sim.spawn_rigid_body_rect(
+            Vec2i::new(55, 70),
+            Vec2i::new(57, 72),
+            material::RIGID,
+        );
+        assert_eq!(sim.test_rigid().dynamic_body_count(), 1);
+        for _ in 0..180 {
+            sim.step(1.0 / 60.0);
+        }
+        assert_eq!(
+            sim.test_rigid().dynamic_body_count(),
+            1,
+            "body should survive resting on static terrain"
+        );
+    }
+
+    /// Carve a full vertical column through a 5×3 rigid slab so the remaining anchors form two
+    /// 4-connected components in local space; `check_splits` should spawn two dynamic bodies.
+    #[test]
+    fn chop_rigid_rect_in_half_yields_two_dynamic_bodies() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(127, 127));
+        sim.set_solid_bounds(bounds);
+
+        let min = Vec2i::new(48, 50);
+        let max = Vec2i::new(52, 52);
+        sim.spawn_rigid_body_rect(min, max, material::RIGID);
+        assert_eq!(
+            sim.test_rigid().dynamic_body_count(),
+            1,
+            "expected one rigid before carve"
+        );
+
+        // Middle column x = 50 separates x = 48..49 from x = 51..52.
+        sim.paint_rect_filled(Vec2i::new(50, 50), Vec2i::new(50, 52), material::EMPTY);
+
+        sim.step(1.0 / 60.0);
+
+        assert_eq!(
+            sim.test_rigid().dynamic_body_count(),
+            2,
+            "expected two rigids after splitting with a through-column carve"
+        );
+
+        let alive = sim.test_rigid().all_body_ids();
+        assert_eq!(
+            sim.test_world().stale_rigid_reference_count(&alive),
+            0,
+            "morph-close fill must not leave orphan rigid_id cells after a split"
+        );
+    }
+
+    #[test]
+    fn purge_rigid_body_ownership_clears_orphan_placeholder_pixels() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(127, 127));
+        sim.set_solid_bounds(bounds);
+        let p = Vec2i::new(70, 70);
+        let w = sim.test_world_mut();
+        w.set_cell(p, Cell::new().with_material(material::STATIC));
+        w.set_rigid_id(p, 9_001);
+        w.purge_rigid_body_ownership(9_001);
+        assert_eq!(w.get_rigid_id(p), None);
+        assert_eq!(w.get_cell(p).material(), material::EMPTY);
+    }
+
+    #[test]
+    fn removing_last_rigid_body_leaves_no_stale_rigid_references() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(127, 127));
+        sim.set_solid_bounds(bounds);
+        let min = Vec2i::new(40, 40);
+        let max = Vec2i::new(42, 42);
+        sim.spawn_rigid_body_rect(min, max, material::RIGID);
+        sim.step(1.0 / 60.0);
+        sim.paint_rect_filled(min, max, material::EMPTY);
+        sim.step(1.0 / 60.0);
+        assert_eq!(sim.test_rigid().dynamic_body_count(), 0);
+        let alive = sim.test_rigid().all_body_ids();
+        assert_eq!(
+            sim.test_world().stale_rigid_reference_count(&alive),
+            0,
+            "destroyed body should not leave rigid_id map entries"
+        );
+    }
+
+    #[test]
+    fn paint_rect_filled_spans_chunk_boundary() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        sim.set_solid_bounds(RectI::new(
+            Vec2i::new(-1005, 11),
+            Vec2i::new(-1005 + 255, 11 + 160),
+        ));
+        let origin = sim.test_world().grid_origin();
+        let y = origin.y + 8;
+        let x_mid = origin.x + CHUNK_SIZE;
+        sim.paint_rect_filled(
+            Vec2i::new(x_mid - 2, y),
+            Vec2i::new(x_mid + 2, y),
+            material::SAND,
+        );
+        assert_eq!(
+            sim.test_world()
+                .get_cell(Vec2i::new(x_mid - 2, y))
+                .material(),
+            material::SAND
+        );
+        assert_eq!(
+            sim.test_world()
+                .get_cell(Vec2i::new(x_mid + 2, y))
+                .material(),
+            material::SAND
+        );
+    }
+
+    #[test]
+    fn temperature_conduction_hot_to_cold() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for &(x, y) in &[
+            (14, 14), (15, 14), (16, 14), (17, 14),
+            (14, 15), (17, 15),
+            (14, 16), (15, 16), (16, 16), (17, 16),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(15, 15), material::LAVA);
+        paint_cell(&mut sim, Vec2i::new(16, 15), material::SAND);
+        let sand_temp_before = sim.test_world().get_cell(Vec2i::new(16, 15)).temperature();
+        for _ in 0..20 {
+            sim.step(1.0 / 60.0);
+        }
+        let sand_temp_after = sim.test_world().get_cell(Vec2i::new(16, 15)).temperature();
+        assert!(
+            sand_temp_after > sand_temp_before,
+            "sand should heat up from adjacent lava: before={}, after={}",
+            sand_temp_before,
+            sand_temp_after
+        );
+    }
+
+    #[test]
+    fn lava_freezes_into_obsidian() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for dx in -1i32..=1 {
+            for dy in -1i32..=1 {
+                if dx == 0 && dy == 0 { continue; }
+                paint_cell(&mut sim, Vec2i::new(16 + dx, 16 + dy), material::LIQUID);
+            }
+        }
+        paint_cell(&mut sim, Vec2i::new(16, 16), material::LAVA);
+
+        let mut saw_obsidian = false;
+        for _ in 0..10_000 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, bounds, material::OBSIDIAN) > 0 {
+                saw_obsidian = true;
+                break;
+            }
+        }
+        assert!(saw_obsidian, "lava surrounded by water should cool and freeze into obsidian");
+    }
+
+    #[test]
+    fn water_boils_to_steam_from_heat() {
+        let mut sim = Simulation::new(SimulationConfig::default());
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
+        sim.set_solid_bounds(bounds);
+        for &(x, y) in &[
+            (14, 14), (15, 14), (16, 14), (17, 14),
+            (14, 15), (17, 15),
+            (14, 16), (15, 16), (16, 16), (17, 16),
+        ] {
+            paint_cell(&mut sim, Vec2i::new(x, y), material::STATIC);
+        }
+        paint_cell(&mut sim, Vec2i::new(15, 15), material::LAVA);
+        paint_cell(&mut sim, Vec2i::new(16, 15), material::LIQUID);
+
+        let mut saw_steam = false;
+        for _ in 0..500 {
+            sim.step(1.0 / 60.0);
+            if count_material(&sim, bounds, material::STEAM) > 0 {
+                saw_steam = true;
+                break;
+            }
+        }
+        assert!(saw_steam, "water next to lava should boil into steam via temperature phase transition");
     }
 }

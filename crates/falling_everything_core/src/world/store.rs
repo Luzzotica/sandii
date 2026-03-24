@@ -14,7 +14,7 @@ impl DenseCellStore {
     pub fn new(width: i32, height: i32, origin: Vec2i) -> Self {
         let total = (width * height) as usize;
         Self {
-            grids: [vec![Cell::default(); total], vec![Cell::default(); total]],
+            grids: [vec![Cell::new(); total], vec![Cell::new(); total]],
             read_idx: 0,
             width,
             height,
@@ -42,7 +42,7 @@ impl DenseCellStore {
             return;
         }
         let total = (width * height) as usize;
-        self.grids = [vec![Cell::default(); total], vec![Cell::default(); total]];
+        self.grids = [vec![Cell::new(); total], vec![Cell::new(); total]];
         self.read_idx = 0;
         self.width = width;
         self.height = height;
@@ -129,7 +129,7 @@ impl DenseCellStore {
         let old_read = self.grids[self.read_idx].clone();
 
         let new_total = (new_w * new_h) as usize;
-        let mut new_grid = vec![Cell::default(); new_total];
+        let mut new_grid = vec![Cell::new(); new_total];
 
         let overlap_min_x = old_origin.x.max(new_origin.x);
         let overlap_min_y = old_origin.y.max(new_origin.y);
@@ -161,8 +161,8 @@ impl DenseCellStore {
                 let p = Vec2i::new(x, y);
                 if !bounds.contains(p) {
                     if let Some(idx) = self.grid_index(p) {
-                        if self.grids[self.read_idx][idx].material != super::material::EMPTY {
-                            self.grids[self.read_idx][idx] = Cell::default();
+                        if self.grids[self.read_idx][idx].material() != super::material::EMPTY {
+                            self.grids[self.read_idx][idx] = Cell::new();
                         }
                     }
                 }
@@ -182,7 +182,7 @@ impl ChunkPool {
         let mut slabs = Vec::with_capacity(chunk_capacity);
         let mut free = Vec::with_capacity(chunk_capacity);
         for i in 0..chunk_capacity {
-            slabs.push(vec![Cell::default(); CHUNK_AREA]);
+            slabs.push(vec![Cell::new(); CHUNK_AREA]);
             free.push(i);
         }
         Self { slabs, free }
@@ -193,14 +193,14 @@ impl ChunkPool {
             idx
         } else {
             let idx = self.slabs.len();
-            self.slabs.push(vec![Cell::default(); CHUNK_AREA]);
+            self.slabs.push(vec![Cell::new(); CHUNK_AREA]);
             idx
         }
     }
 
     pub fn release(&mut self, idx: usize) {
         if let Some(slab) = self.slabs.get_mut(idx) {
-            slab.fill(Cell::default());
+            slab.fill(Cell::new());
             self.free.push(idx);
         }
     }
@@ -327,12 +327,9 @@ mod tests {
         assert_eq!(s.chunk_count(), 1);
         {
             let chunk = s.get_chunk_mut(c).expect("chunk");
-            chunk[0] = Cell {
-                material: material::SAND,
-                ..Cell::default()
-            };
+            chunk[0] = Cell::new().with_material(material::SAND);
         }
-        assert_eq!(s.get_chunk(c).expect("chunk")[0].material, material::SAND);
+        assert_eq!(s.get_chunk(c).expect("chunk")[0].material(), material::SAND);
         s.remove_chunk(c);
         assert_eq!(s.chunk_count(), 0);
     }

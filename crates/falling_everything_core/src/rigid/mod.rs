@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use nalgebra::{point, vector};
@@ -8,21 +8,29 @@ use rapier2d::prelude::*;
 use crate::world::cell_flags;
 use crate::world::{material, Cell, ChunkCoord, MaterialId, RectI, Vec2i, World, CHUNK_SIZE};
 
-fn rigid_body_cell_at_spawn(world: &World, _p: Vec2i, material_id: MaterialId, variant: u8) -> Cell {
+/// Extra radius (world units = grid pixels) for [`RigidBridge::spawn_from_circle_with_temp`] ball colliders
+/// so the continuous circle encloses the discrete filled disk; avoids spurious inert overlap / anchor carve on contact.
+const BALL_COLLIDER_RADIUS_PIXEL_PAD: f32 = 1.0;
+
+fn rigid_body_cell_at_spawn(
+    world: &World,
+    _p: Vec2i,
+    material_id: MaterialId,
+    variant: u8,
+    temp_override: Option<u16>,
+) -> Cell {
     let props = world.material_props(material_id);
-    let mut cell = Cell::default();
-    cell.material = material_id;
-    cell.variant = variant;
-    cell.flags = 0;
-    cell.velocity = 0;
-    cell.scorch = 0;
-    if material_id == material::LAVA && props.fuel_mass > 0 {
-        cell.flags |= cell_flags::ON_FIRE;
-        cell.lifetime = props.fuel_mass;
+    let lifetime = if material_id == material::LAVA && props.fuel_mass > 0 {
+        props.fuel_mass
     } else {
-        cell.lifetime = World::initial_lifetime_for(material_id, &props);
-    }
-    cell
+        World::initial_lifetime_for(material_id, &props)
+    };
+    let temp = temp_override.unwrap_or(props.base_temperature);
+    Cell::new()
+        .with_material(material_id)
+        .with_variant(variant)
+        .with_lifetime(lifetime)
+        .with_temperature(temp)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,13 +66,17 @@ pub struct RigidBridge {
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
     bodies_by_id: HashMap<u32, PixelRigidBody>,
-    pre_physics_positions: HashMap<u32, HashSet<(i32, i32)>>,
     next_id: u32,
 
     static_body_handle: RigidBodyHandle,
     static_chunk_colliders: HashMap<ChunkCoord, Vec<ColliderHandle>>,
     static_chunk_hashes: HashMap<ChunkCoord, u64>,
 }
+
+/// Impact stress (linear speed + angular term) at which a rigid pixel with
+/// [`MaterialProps::structure_integrity`] `== 1.0` loses anchors when overlapping inert terrain without
+/// `rigid_id`. Break threshold is `this * integrity` (per-anchor material).
+pub const STRUCTURAL_STRESS_SCALE: f32 = 80.0;
 
 impl RigidBridge {
     pub fn new() -> Self {
@@ -85,7 +97,6 @@ impl RigidBridge {
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             bodies_by_id: HashMap::new(),
-            pre_physics_positions: HashMap::new(),
             next_id: 1,
             static_body_handle,
             static_chunk_colliders: HashMap::new(),
@@ -109,77 +120,15 @@ impl RigidBridge {
         positions: &[Vec2i],
         material_id: MaterialId,
     ) -> u32 {
-        if positions.is_empty() {
-            return 0;
-        }
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-
-        let sum_x: i64 = positions.iter().map(|p| p.x as i64).sum();
-        let sum_y: i64 = positions.iter().map(|p| p.y as i64).sum();
-        let n = positions.len() as i64;
-        let center = Vec2i::new((sum_x / n) as i32, (sum_y / n) as i32);
-
-        let mut rng = rand::thread_rng();
-        let mut anchors = Vec::new();
-        for &p in positions {
-            let cell = rigid_body_cell_at_spawn(world, p, material_id, rng.gen_range(0..=40));
-            world.set_cell(p, cell);
-            world.set_rigid_id(p, id);
-            anchors.push(PixelAnchor {
-                local: Vec2i::new(p.x - center.x, p.y - center.y),
-                cell,
-            });
-        }
-
-        let local_positions: Vec<(i32, i32)> = positions
-            .iter()
-            .map(|p| (p.x - center.x, p.y - center.y))
-            .collect();
-        let contours = extract_contours_from_pixels(&local_positions);
-
-        let rb = RigidBodyBuilder::dynamic()
-            .translation(vector![center.x as f32, center.y as f32])
-            .build();
-        let handle = self.bodies.insert(rb);
-
-        if let Some(outer) = contours
-            .iter()
-            .max_by(|a, b| {
-                polygon_area(a)
-                    .abs()
-                    .partial_cmp(&polygon_area(b).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        {
-            let mut simplified = simplify_douglas_peucker(outer, 0.5);
-            if polygon_area(&simplified) < 0.0 {
-                simplified.reverse();
-            }
-            let triangles = triangulate_ear_clip(&simplified);
-            for tri in triangles {
-                let shape = SharedShape::triangle(tri[0], tri[1], tri[2]);
-                let collider = ColliderBuilder::new(shape)
-                    .density(5.0)
-                    .friction(0.6)
-                    .restitution(0.2)
-                    .build();
-                self.colliders
-                    .insert_with_parent(collider, handle, &mut self.bodies);
-            }
-        }
-
-        self.bodies_by_id
-            .insert(id, PixelRigidBody { id, anchors, handle, needs_collider_refresh: false });
-        id
+        self.spawn_from_pixels_with_temp(world, positions, material_id, None)
     }
 
-    pub fn spawn_from_circle(
+    pub fn spawn_from_pixels_with_temp(
         &mut self,
         world: &mut World,
         positions: &[Vec2i],
         material_id: MaterialId,
-        radius: f32,
+        temp_override: Option<u16>,
     ) -> u32 {
         if positions.is_empty() {
             return 0;
@@ -195,7 +144,70 @@ impl RigidBridge {
         let mut rng = rand::thread_rng();
         let mut anchors = Vec::new();
         for &p in positions {
-            let cell = rigid_body_cell_at_spawn(world, p, material_id, rng.gen_range(0..=40));
+            let cell = rigid_body_cell_at_spawn(world, p, material_id, rng.gen_range(0..=40), temp_override);
+            world.set_cell(p, cell);
+            world.set_rigid_id(p, id);
+            anchors.push(PixelAnchor {
+                local: Vec2i::new(p.x - center.x, p.y - center.y),
+                cell,
+            });
+        }
+
+        let local_positions: Vec<(i32, i32)> = positions
+            .iter()
+            .map(|p| (p.x - center.x, p.y - center.y))
+            .collect();
+
+        let rb = RigidBodyBuilder::dynamic()
+            .translation(vector![center.x as f32, center.y as f32])
+            .build();
+        let handle = self.bodies.insert(rb);
+
+        build_and_insert_dynamic_pixel_colliders(
+            &mut self.colliders,
+            &mut self.bodies,
+            handle,
+            &local_positions,
+        );
+
+        self.bodies_by_id
+            .insert(id, PixelRigidBody { id, anchors, handle, needs_collider_refresh: false });
+        id
+    }
+
+    pub fn spawn_from_circle(
+        &mut self,
+        world: &mut World,
+        positions: &[Vec2i],
+        material_id: MaterialId,
+        radius: f32,
+    ) -> u32 {
+        self.spawn_from_circle_with_temp(world, positions, material_id, radius, None)
+    }
+
+    pub fn spawn_from_circle_with_temp(
+        &mut self,
+        world: &mut World,
+        positions: &[Vec2i],
+        material_id: MaterialId,
+        radius: f32,
+        temp_override: Option<u16>,
+    ) -> u32 {
+        if positions.is_empty() {
+            return 0;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+
+        let sum_x: i64 = positions.iter().map(|p| p.x as i64).sum();
+        let sum_y: i64 = positions.iter().map(|p| p.y as i64).sum();
+        let n = positions.len() as i64;
+        let center = Vec2i::new((sum_x / n) as i32, (sum_y / n) as i32);
+
+        let mut rng = rand::thread_rng();
+        let mut anchors = Vec::new();
+        for &p in positions {
+            let cell = rigid_body_cell_at_spawn(world, p, material_id, rng.gen_range(0..=40), temp_override);
             world.set_cell(p, cell);
             world.set_rigid_id(p, id);
             anchors.push(PixelAnchor {
@@ -209,7 +221,7 @@ impl RigidBridge {
             .build();
         let handle = self.bodies.insert(rb);
 
-        let collider = ColliderBuilder::ball(radius)
+        let collider = ColliderBuilder::ball(radius + BALL_COLLIDER_RADIUS_PIXEL_PAD)
             .density(5.0)
             .friction(0.6)
             .restitution(0.2)
@@ -222,11 +234,55 @@ impl RigidBridge {
         id
     }
 
+    /// Spawn a rigid body from pre-existing anchors, each with its own cell/material.
+    /// `anchors_with_world_pos` provides (world_pos, anchor_cell) pairs.
+    fn spawn_from_anchors(
+        &mut self,
+        world: &mut World,
+        anchors_with_world_pos: &[(Vec2i, Cell)],
+    ) -> u32 {
+        if anchors_with_world_pos.is_empty() {
+            return 0;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+
+        let n = anchors_with_world_pos.len() as i64;
+        let sum_x: i64 = anchors_with_world_pos.iter().map(|(p, _)| p.x as i64).sum();
+        let sum_y: i64 = anchors_with_world_pos.iter().map(|(p, _)| p.y as i64).sum();
+        let center = Vec2i::new((sum_x / n) as i32, (sum_y / n) as i32);
+
+        let mut anchors = Vec::with_capacity(anchors_with_world_pos.len());
+        let mut local_positions = Vec::with_capacity(anchors_with_world_pos.len());
+        for &(wp, cell) in anchors_with_world_pos {
+            world.set_cell(wp, cell);
+            world.set_rigid_id(wp, id);
+            let local = Vec2i::new(wp.x - center.x, wp.y - center.y);
+            local_positions.push((local.x, local.y));
+            anchors.push(PixelAnchor { local, cell });
+        }
+
+        let rb = RigidBodyBuilder::dynamic()
+            .translation(vector![center.x as f32, center.y as f32])
+            .build();
+        let handle = self.bodies.insert(rb);
+
+        build_and_insert_dynamic_pixel_colliders(
+            &mut self.colliders,
+            &mut self.bodies,
+            handle,
+            &local_positions,
+        );
+
+        self.bodies_by_id
+            .insert(id, PixelRigidBody { id, anchors, handle, needs_collider_refresh: false });
+        id
+    }
+
     /// Record each body's current world-pixel positions (pre-physics).
-    /// Body pixels are set to STATIC so the sim step treats them as inert
-    /// solid walls — sand/water can't enter or displace them.
+    /// Anchor-rounded pixels get [`cell_flags::RIGID_PIXEL`] and `rigid_id`.
+    /// Morphological hole-fill is render-only (see [`Self::collect_visual_morph_overlay_tiles`]).
     pub fn record_positions(&mut self, world: &mut World) {
-        self.pre_physics_positions.clear();
         for rigid in self.bodies_by_id.values() {
             let Some(body) = self.bodies.get(rigid.handle) else {
                 continue;
@@ -235,29 +291,57 @@ impl RigidBridge {
             let angle = body.rotation().angle();
             let cos_a = angle.cos();
             let sin_a = angle.sin();
-            let mut positions = HashSet::new();
-            for anchor in &rigid.anchors {
-                let wp = rotated_world_pos(pos.x, pos.y, cos_a, sin_a, anchor.local);
-                let key = (wp.x, wp.y);
-                if positions.insert(key) {
-                    if world.get_rigid_id(wp) == Some(rigid.id) {
-                        let logical = anchor.cell;
-                        let mut cell = logical;
-                        cell.material = material::STATIC;
-                        // Only molten on-fire lava uses the heat proxy; cooled sand/etc. stay plain STATIC.
-                        if logical.material == material::LAVA
-                            && (logical.flags & cell_flags::ON_FIRE) != 0
-                            && logical.lifetime > 0
-                        {
-                            cell.flags |= cell_flags::RIGID_BODY_SIM;
-                        } else {
-                            cell.flags &= !cell_flags::RIGID_BODY_SIM;
-                        }
-                        world.set_cell(wp, cell);
-                    }
+
+            let cell_map = rounded_anchor_cell_map(pos.x, pos.y, cos_a, sin_a, &rigid.anchors);
+
+            let positions: HashSet<(i32, i32)> = cell_map.keys().copied().collect();
+
+            for (x, y) in &positions {
+                let wp = Vec2i::new(*x, *y);
+                if world.get_rigid_id(wp) != Some(rigid.id) {
+                    continue;
                 }
+                let logical = cell_map[&(*x, *y)];
+                let mut cell = logical;
+                cell.or_flags(cell_flags::RIGID_PIXEL);
+                world.set_cell(wp, cell);
+                world.set_rigid_id(wp, rigid.id);
             }
-            self.pre_physics_positions.insert(rigid.id, positions);
+        }
+    }
+
+    /// Morphological closing fill tiles for rendering only (not simulated / not in the grid).
+    /// For each dynamic body, fills 1-cell gaps from rotation rounding; skips occupied world cells.
+    pub fn collect_visual_morph_overlay_tiles(
+        &self,
+        world: &World,
+        rect: RectI,
+        out: &mut Vec<(u32, Vec2i, Cell)>,
+    ) {
+        let mut body_ids: Vec<u32> = self.bodies_by_id.keys().copied().collect();
+        body_ids.sort_unstable();
+        for id in body_ids {
+            let Some(rigid) = self.bodies_by_id.get(&id) else {
+                continue;
+            };
+            let Some(body) = self.bodies.get(rigid.handle) else {
+                continue;
+            };
+            let pos = body.translation();
+            let angle = body.rotation().angle();
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            for ((kx, ky), mut cell) in compute_morph_fill_cells(&rigid.anchors, pos.x, pos.y, cos_a, sin_a) {
+                let p = Vec2i::new(kx, ky);
+                if !rect.contains(p) {
+                    continue;
+                }
+                if world.get_cell(p).material() != material::EMPTY {
+                    continue;
+                }
+                cell.clear_flag_bits(cell_flags::RIGID_PIXEL);
+                out.push((id, p, cell));
+            }
         }
     }
 
@@ -280,13 +364,58 @@ impl RigidBridge {
         );
     }
 
+    /// Drop anchors whose rounded world position matches a painted cell. Call after user paint
+    /// (`World::set_cell` clears `rigid_id`) so dynamic colliders match the grid. Does not run for
+    /// terrain collision — see [`Self::sync_pixels_to_physics`] inert branch.
+    pub fn carve_dynamic_bodies_at_world_cells(&mut self, world: &mut World, hits: &[(Vec2i, u32)]) {
+        if hits.is_empty() {
+            return;
+        }
+        let mut by_body: HashMap<u32, Vec<Vec2i>> = HashMap::new();
+        for &(wp, id) in hits {
+            by_body.entry(id).or_default().push(wp);
+        }
+        let mut empty: Vec<u32> = Vec::new();
+        for (body_id, wps) in by_body {
+            let Some(rigid) = self.bodies_by_id.get_mut(&body_id) else {
+                continue;
+            };
+            let Some(body) = self.bodies.get(rigid.handle) else {
+                continue;
+            };
+            let pos = *body.translation();
+            let angle = body.rotation().angle();
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let mut locals: HashSet<Vec2i> = HashSet::new();
+            for wp in wps {
+                for a in &rigid.anchors {
+                    if rotated_world_pos(pos.x, pos.y, cos_a, sin_a, a.local) == wp {
+                        locals.insert(a.local);
+                        break;
+                    }
+                }
+            }
+            if locals.is_empty() {
+                continue;
+            }
+            rigid.anchors.retain(|a| !locals.contains(&a.local));
+            rigid.needs_collider_refresh = true;
+            if rigid.anchors.is_empty() {
+                empty.push(body_id);
+            }
+        }
+        for id in empty {
+            self.remove_body_physics(world, id);
+        }
+    }
+
     /// After the physics step, diff old vs new positions for each body.
     /// Clear cells the body is leaving; place pixels where it is entering.
     pub fn sync_pixels_to_physics(
         &mut self,
         world: &mut World,
     ) {
-        let empty_set = HashSet::new();
         let mut drag_list: Vec<(RigidBodyHandle, u32)> = Vec::new();
 
         // Pull sim results (lifetime, lava→sand, etc.) into anchors before we write back.
@@ -313,22 +442,17 @@ impl RigidBridge {
                     continue;
                 }
                 let wc = world.get_cell(wp);
-                let before_mat = anchor.cell.material;
-                if wc.material == material::STATIC {
-                    // `record_positions` uses STATIC as a sim placeholder; the real material lives on the anchor.
-                    // Copy ticked fields (lifetime, flags) but keep logical material until the sim replaces
-                    // the cell with something else (e.g. lava burnout → sand).
-                    anchor.cell = Cell {
-                        material: anchor.cell.material,
-                        flags: wc.flags & !cell_flags::RIGID_BODY_SIM,
-                        lifetime: wc.lifetime,
-                        velocity: wc.velocity,
-                        variant: wc.variant,
-                        scorch: wc.scorch,
-                    };
+                let before_mat = anchor.cell.material();
+                if wc.has_flag(cell_flags::RIGID_PIXEL) {
+                    let mut c = wc;
+                    c.clear_flag_bits(cell_flags::RIGID_PIXEL);
+                    if c.material() != before_mat {
+                        material_changed = true;
+                    }
+                    anchor.cell = c;
                 } else {
                     anchor.cell = wc;
-                    if anchor.cell.material != before_mat {
+                    if anchor.cell.material() != before_mat {
                         material_changed = true;
                     }
                 }
@@ -347,30 +471,20 @@ impl RigidBridge {
             let cos_a = angle.cos();
             let sin_a = angle.sin();
 
-            let new_cells: HashMap<(i32, i32), Cell> = {
-                let mut map = HashMap::new();
-                for anchor in &rigid.anchors {
-                    let wp = rotated_world_pos(pos.x, pos.y, cos_a, sin_a, anchor.local);
-                    map.entry((wp.x, wp.y)).or_insert(anchor.cell);
-                }
-                map
-            };
+            let new_cells = rounded_anchor_cell_map(pos.x, pos.y, cos_a, sin_a, &rigid.anchors);
+            let new_keys: HashSet<(i32, i32)> = new_cells.keys().copied().collect();
 
-            let old_cells = self.pre_physics_positions.get(&rigid.id).unwrap_or(&empty_set);
-
-            // Clear cells the body is leaving (old but not new)
-            for &(ox, oy) in old_cells {
-                if !new_cells.contains_key(&(ox, oy)) {
-                    let wp = Vec2i::new(ox, oy);
-                    if world.get_rigid_id(wp) == Some(rigid.id) {
-                        world.set_cell(wp, Cell::default());
-                        world.clear_rigid_id(wp);
-                    }
-                }
+            // Clear every grid cell still tagged with this body that is not in the authoritative
+            // anchor footprint (orphans with matching `rigid_id`, e.g. legacy morph-fill in the grid).
+            let stale: Vec<Vec2i> = world
+                .rigid_ids_iter_for_body(rigid.id)
+                .filter(|p| !new_keys.contains(&(p.x, p.y)))
+                .collect();
+            for p in stale {
+                world.set_cell(p, Cell::new());
             }
 
             // Place/update cells the body now occupies
-            let new_keys: HashSet<(i32, i32)> = new_cells.keys().copied().collect();
             let search_radius = (rigid.anchors.len() as f32).sqrt().ceil() as i32 + 4;
             let mut displaced_count: u32 = 0;
 
@@ -379,25 +493,49 @@ impl RigidBridge {
 
                 if world.get_rigid_id(wp) == Some(rigid.id) {
                     world.set_cell(wp, cell);
+                    world.set_rigid_id(wp, rigid.id);
                     continue;
                 }
 
                 let occupant = world.get_cell(wp);
 
-                if occupant.material == material::EMPTY {
+                if occupant.material() == material::EMPTY {
                     world.set_cell(wp, cell);
                     world.set_rigid_id(wp, rigid.id);
                     continue;
                 }
 
-                if world.material_props(occupant.material).inert() {
+                let occ_rid = world.get_rigid_id(wp);
+
+                if occ_rid.is_some_and(|oid| oid != rigid.id) {
+                    displaced_count += 1;
+                    if let Some(dest) = find_empty_above(world, wp, &new_keys, search_radius) {
+                        world.set_cell(dest, occupant);
+                        if let Some(rid) = occ_rid {
+                            world.set_rigid_id(dest, rid);
+                        }
+                        world.set_cell(wp, cell);
+                        world.set_rigid_id(wp, rigid.id);
+                    } else {
+                        world.set_cell(wp, cell);
+                        world.set_rigid_id(wp, rigid.id);
+                    }
                     continue;
                 }
 
-                // Entering a cell with non-inert material — displace it upward
+                if world.material_props(occupant.material()).inert() {
+                    // Do not carve here: terrain and user-painted inert solids look the same on the
+                    // grid. User paint overwrite is handled in `carve_dynamic_bodies_at_world_cells`
+                    // (see `Simulation` paint APIs).
+                    continue;
+                }
+
                 displaced_count += 1;
                 if let Some(dest) = find_empty_above(world, wp, &new_keys, search_radius) {
                     world.set_cell(dest, occupant);
+                    if let Some(rid) = occ_rid {
+                        world.set_rigid_id(dest, rid);
+                    }
                     world.set_cell(wp, cell);
                     world.set_rigid_id(wp, rigid.id);
                 }
@@ -498,7 +636,7 @@ impl RigidBridge {
 
         for id in ids_to_remove {
             if let Some(rigid) = self.bodies_by_id.remove(&id) {
-                self.clear_pixels_for_body(world, &rigid);
+                world.purge_rigid_body_ownership(id);
                 self.bodies.remove(
                     rigid.handle,
                     &mut self.islands,
@@ -507,7 +645,6 @@ impl RigidBridge {
                     &mut self.multibody_joints,
                     true,
                 );
-                self.pre_physics_positions.remove(&id);
             }
         }
 
@@ -523,23 +660,6 @@ impl RigidBridge {
             .collect();
         for coord in stale {
             self.remove_static_chunk(coord);
-        }
-    }
-
-    fn clear_pixels_for_body(&self, world: &mut World, rigid: &PixelRigidBody) {
-        let Some(body) = self.bodies.get(rigid.handle) else {
-            return;
-        };
-        let pos = body.translation();
-        let angle = body.rotation().angle();
-        let cos_a = angle.cos();
-        let sin_a = angle.sin();
-        for anchor in &rigid.anchors {
-            let wp = rotated_world_pos(pos.x, pos.y, cos_a, sin_a, anchor.local);
-            if world.get_rigid_id(wp) == Some(rigid.id) {
-                world.set_cell(wp, Cell::default());
-                world.clear_rigid_id(wp);
-            }
         }
     }
 
@@ -605,6 +725,13 @@ impl RigidBridge {
 
     // --- Dynamic body collider refresh ---
 
+    /// Next [`Self::rebuild_dirty_dynamic_colliders`] rebuilds colliders for every dynamic pixel body.
+    pub fn mark_all_dynamic_colliders_stale(&mut self) {
+        for rb in self.bodies_by_id.values_mut() {
+            rb.needs_collider_refresh = true;
+        }
+    }
+
     pub fn rebuild_dirty_dynamic_colliders(&mut self) {
         let ids: Vec<u32> = self
             .bodies_by_id
@@ -637,39 +764,16 @@ impl RigidBridge {
                 .iter()
                 .map(|a| (a.local.x, a.local.y))
                 .collect();
-            let contours = extract_contours_from_pixels(&local_positions);
-
-            if let Some(outer) = contours
-                .iter()
-                .max_by(|a, b| {
-                    polygon_area(a)
-                        .abs()
-                        .partial_cmp(&polygon_area(b).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                let mut simplified = simplify_douglas_peucker(outer, 0.5);
-                if polygon_area(&simplified) < 0.0 {
-                    simplified.reverse();
-                }
-                let triangles = triangulate_ear_clip(&simplified);
-                for tri in triangles {
-                    let shape = SharedShape::triangle(tri[0], tri[1], tri[2]);
-                    let collider = ColliderBuilder::new(shape)
-                        .density(5.0)
-                        .friction(0.6)
-                        .restitution(0.2)
-                        .build();
-                    self.colliders
-                        .insert_with_parent(collider, handle, &mut self.bodies);
-                }
-            }
+            build_and_insert_dynamic_pixel_colliders(
+                &mut self.colliders,
+                &mut self.bodies,
+                handle,
+                &local_positions,
+            );
         }
     }
 
     pub fn check_splits(&mut self, world: &mut World) {
-        const DAMAGE_SPEED: f32 = 80.0;
-
         let body_ids: Vec<u32> = self.bodies_by_id.keys().copied().collect();
         let mut splits_to_process = Vec::new();
 
@@ -687,17 +791,15 @@ impl RigidBridge {
             let cos_a = angle.cos();
             let sin_a = angle.sin();
 
-            let speed = (linvel.x * linvel.x + linvel.y * linvel.y).sqrt()
-                + angvel.abs() * 5.0;
+            let stress = (linvel.x * linvel.x + linvel.y * linvel.y).sqrt() + angvel.abs() * 5.0;
 
             let mut surviving = Vec::new();
             let mut has_env_missing = false;
-            let mut has_impact_missing = false;
 
             for anchor in &rigid.anchors {
                 let wp = rotated_world_pos(pos.x, pos.y, cos_a, sin_a, anchor.local);
                 let rid = world.get_rigid_id(wp);
-                let mat = world.get_cell(wp).material;
+                let mat = world.get_cell(wp).material();
 
                 if rid == Some(body_id) {
                     surviving.push(anchor.clone());
@@ -710,17 +812,31 @@ impl RigidBridge {
                     continue;
                 }
 
-                if rid.is_some() || world.material_props(mat).inert() {
-                    // Another rigid body or terrain blocking this slot — keep anchor.
-                    surviving.push(anchor.clone());
+                if rid.is_some() {
+                    // Another rigid owns this cell — always drop our anchor.
+                    has_env_missing = true;
+                    continue;
+                }
+
+                let world_inert = world.material_props(mat).inert();
+                if world_inert {
+                    let integrity = world
+                        .material_props(anchor.cell.material())
+                        .structure_integrity
+                        .max(0.05);
+                    let break_at = STRUCTURAL_STRESS_SCALE * integrity;
+                    if stress >= break_at {
+                        has_env_missing = true;
+                    } else {
+                        surviving.push(anchor.clone());
+                    }
                 } else {
-                    // Non-inert occupant without our rigid_id (e.g. violent displacement).
-                    has_impact_missing = true;
+                    // Fluids, granular, etc. — paint and displacement always carve.
+                    has_env_missing = true;
                 }
             }
 
-            let should_split =
-                has_env_missing || (has_impact_missing && speed >= DAMAGE_SPEED);
+            let should_split = has_env_missing;
             if should_split {
                 splits_to_process.push((body_id, surviving, pos, linvel, angvel, angle));
             }
@@ -728,7 +844,7 @@ impl RigidBridge {
 
         for (body_id, surviving, pos, linvel, angvel, angle) in splits_to_process {
             if surviving.is_empty() {
-                self.remove_body_physics(body_id);
+                self.remove_body_physics(world, body_id);
                 continue;
             }
 
@@ -747,19 +863,20 @@ impl RigidBridge {
             for anchor in &surviving {
                 let wp = rotated_world_pos(pos.x, pos.y, cos_a, sin_a, anchor.local);
                 if world.get_rigid_id(wp) == Some(body_id) {
-                    world.set_cell(wp, Cell::default());
-                    world.clear_rigid_id(wp);
+                    world.set_cell(wp, Cell::new());
                 }
             }
-            self.remove_body_physics(body_id);
+            self.remove_body_physics(world, body_id);
 
             for component in components {
-                let world_positions: Vec<Vec2i> = component
+                let anchors_wp: Vec<(Vec2i, Cell)> = component
                     .iter()
-                    .map(|a| rotated_world_pos(pos.x, pos.y, cos_a, sin_a, a.local))
+                    .map(|a| {
+                        let wp = rotated_world_pos(pos.x, pos.y, cos_a, sin_a, a.local);
+                        (wp, a.cell)
+                    })
                     .collect();
-                let mat = component[0].cell.material;
-                let new_id = self.spawn_from_pixels(world, &world_positions, mat);
+                let new_id = self.spawn_from_anchors(world, &anchors_wp);
                 if let Some(new_rigid) = self.bodies_by_id.get(&new_id) {
                     if let Some(new_body) = self.bodies.get_mut(new_rigid.handle) {
                         new_body.set_linvel(linvel, true);
@@ -770,7 +887,8 @@ impl RigidBridge {
         }
     }
 
-    fn remove_body_physics(&mut self, body_id: u32) {
+    fn remove_body_physics(&mut self, world: &mut World, body_id: u32) {
+        world.purge_rigid_body_ownership(body_id);
         if let Some(rigid) = self.bodies_by_id.remove(&body_id) {
             self.bodies.remove(
                 rigid.handle,
@@ -780,8 +898,18 @@ impl RigidBridge {
                 &mut self.multibody_joints,
                 true,
             );
-            self.pre_physics_positions.remove(&body_id);
         }
+    }
+}
+
+#[cfg(test)]
+impl RigidBridge {
+    pub(crate) fn dynamic_body_count(&self) -> usize {
+        self.bodies_by_id.len()
+    }
+
+    pub(crate) fn all_body_ids(&self) -> std::collections::HashSet<u32> {
+        self.bodies_by_id.keys().copied().collect()
     }
 }
 
@@ -825,63 +953,197 @@ fn find_connected_components(anchors: &[PixelAnchor]) -> Vec<Vec<PixelAnchor>> {
     components
 }
 
-fn extract_contours_from_pixels(local_positions: &[(i32, i32)]) -> Vec<Vec<(f32, f32)>> {
-    let filled: HashSet<(i32, i32)> = local_positions.iter().copied().collect();
-
-    // Boundary edges using doubled integer coords to avoid FP comparison during chaining.
-    // Pixel (px,py) corners: TL=(2px-1,2py-1) TR=(2px+1,2py-1) BR=(2px+1,2py+1) BL=(2px-1,2py+1)
-    let mut edge_map: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
-
-    for &(px, py) in local_positions {
-        let tl = (2 * px - 1, 2 * py - 1);
-        let tr = (2 * px + 1, 2 * py - 1);
-        let br = (2 * px + 1, 2 * py + 1);
-        let bl = (2 * px - 1, 2 * py + 1);
-
-        if !filled.contains(&(px, py - 1)) {
-            edge_map.insert(tl, tr);
+fn build_and_insert_dynamic_pixel_colliders(
+    colliders: &mut ColliderSet,
+    bodies: &mut RigidBodySet,
+    handle: RigidBodyHandle,
+    local_positions: &[(i32, i32)],
+) {
+    let mut inserted_triangle = false;
+    let contours = marching_squares_contours(local_positions);
+    for contour in &contours {
+        if contour.len() < 3 {
+            continue;
         }
-        if !filled.contains(&(px + 1, py)) {
-            edge_map.insert(tr, br);
+        let simplified = simplify_douglas_peucker(contour, 0.5);
+        if polygon_area(&simplified) <= 0.0 {
+            continue;
         }
-        if !filled.contains(&(px, py + 1)) {
-            edge_map.insert(br, bl);
-        }
-        if !filled.contains(&(px - 1, py)) {
-            edge_map.insert(bl, tl);
+        for tri in triangulate_ear_clip(&simplified) {
+            let shape = SharedShape::triangle(tri[0], tri[1], tri[2]);
+            let collider = ColliderBuilder::new(shape)
+                .density(5.0)
+                .friction(0.6)
+                .restitution(0.2)
+                .build();
+            colliders.insert_with_parent(collider, handle, bodies);
+            inserted_triangle = true;
         }
     }
 
-    let mut loops = Vec::new();
-    let mut visited: HashSet<(i32, i32)> = HashSet::new();
-    let starts: Vec<(i32, i32)> = edge_map.keys().copied().collect();
+    if inserted_triangle || local_positions.is_empty() {
+        return;
+    }
 
-    for start in starts {
+    let min_lx = local_positions.iter().map(|p| p.0).min().unwrap();
+    let max_lx = local_positions.iter().map(|p| p.0).max().unwrap();
+    let min_ly = local_positions.iter().map(|p| p.1).min().unwrap();
+    let max_ly = local_positions.iter().map(|p| p.1).max().unwrap();
+    let cx = (min_lx + max_lx) as f32 * 0.5;
+    let cy = (min_ly + max_ly) as f32 * 0.5;
+    let hx = ((max_lx - min_lx + 1) as f32 * 0.5).max(0.25);
+    let hy = ((max_ly - min_ly + 1) as f32 * 0.5).max(0.25);
+    let collider = ColliderBuilder::cuboid(hx, hy)
+        .translation(vector![cx, cy])
+        .density(5.0)
+        .friction(0.6)
+        .restitution(0.2)
+        .build();
+    colliders.insert_with_parent(collider, handle, bodies);
+}
+
+/// Marching-squares iso-contour extraction on a binary pixel grid.
+/// Returns closed polylines in local float coords (pixel-center space).
+/// Outer boundaries wind CCW (positive `polygon_area`); holes wind CW (negative).
+fn marching_squares_contours(local_positions: &[(i32, i32)]) -> Vec<Vec<(f32, f32)>> {
+    if local_positions.is_empty() {
+        return Vec::new();
+    }
+    let filled: HashSet<(i32, i32)> = local_positions.iter().copied().collect();
+    let min_x = local_positions.iter().map(|p| p.0).min().unwrap() - 1;
+    let min_y = local_positions.iter().map(|p| p.1).min().unwrap() - 1;
+    let max_x = local_positions.iter().map(|p| p.0).max().unwrap() + 1;
+    let max_y = local_positions.iter().map(|p| p.1).max().unwrap() + 1;
+    let w = (max_x - min_x + 1) as usize;
+
+    let sample = |gx: i32, gy: i32| -> bool { filled.contains(&(gx, gy)) };
+
+    // Each marching-squares cell sits between four sample points at grid positions
+    // (cx, cy), (cx+1, cy), (cx, cy+1), (cx+1, cy+1).
+    // Edges are keyed by (cell_index, edge_side) for cycle tracing.
+    // Edge midpoints sit on the boundary between filled/empty samples.
+    // cell_index = (cy - min_y) * w + (cx - min_x)
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    struct EdgeKey {
+        cell: usize,
+        side: u8, // 0=top, 1=right, 2=bottom, 3=left
+    }
+
+    fn edge_midpoint(cx: i32, cy: i32, side: u8) -> (f32, f32) {
+        let x = cx as f32;
+        let y = cy as f32;
+        match side {
+            0 => (x + 0.5, y),       // top
+            1 => (x + 1.0, y + 0.5), // right
+            2 => (x + 0.5, y + 1.0), // bottom
+            3 => (x, y + 0.5),       // left
+            _ => unreachable!(),
+        }
+    }
+
+    // Shift from pixel-grid to local coords: sample (gx,gy) corresponds to pixel center (gx,gy),
+    // but marching cell (cx,cy) has corners at samples cx..cx+1, cy..cy+1. Edge midpoints are in
+    // the same space as pixel centers, offset by (-0.5, -0.5) from corner-aligned grids — but since
+    // our samples ARE pixel centers, the midpoints are already correct.
+
+    let mut edge_next: HashMap<EdgeKey, EdgeKey> = HashMap::new();
+
+    for cy in min_y..max_y {
+        for cx in min_x..max_x {
+            let tl = sample(cx, cy) as u8;
+            let tr = sample(cx + 1, cy) as u8;
+            let br = sample(cx + 1, cy + 1) as u8;
+            let bl = sample(cx, cy + 1) as u8;
+            let case = (tl << 3) | (tr << 2) | (br << 1) | bl;
+            if case == 0 || case == 15 {
+                continue;
+            }
+            let ci = ((cy - min_y) as usize) * w + ((cx - min_x) as usize);
+
+            // For each case, list (entry_side, exit_side) pairs. The edge with the filled corner
+            // on its left is the "entry", the edge with filled on its right is "exit".
+            // (entry_side, exit_side) — winding keeps filled region to the RIGHT
+            // of travel in screen coords (Y-down), producing CCW / positive-area
+            // outer boundaries and CW / negative-area holes.
+            let pairs: &[(u8, u8)] = match case {
+                1  => &[(3, 2)],
+                2  => &[(2, 1)],
+                3  => &[(3, 1)],
+                4  => &[(1, 0)],
+                5  => &[(3, 0), (1, 2)], // saddle: TL+BR
+                6  => &[(2, 0)],
+                7  => &[(3, 0)],
+                8  => &[(0, 3)],
+                9  => &[(0, 2)],
+                10 => &[(0, 1), (2, 3)], // saddle: TR+BL
+                11 => &[(0, 1)],
+                12 => &[(1, 3)],
+                13 => &[(1, 2)],
+                14 => &[(2, 3)],
+                _ => continue,
+            };
+
+            for &(entry_side, exit_side) in pairs {
+                let from = EdgeKey { cell: ci, side: entry_side };
+                // The neighbor sharing this edge
+                let to = match exit_side {
+                    0 => { // top edge → neighbor above enters from bottom
+                        let nci = (((cy - 1) - min_y) as usize) * w + ((cx - min_x) as usize);
+                        EdgeKey { cell: nci, side: 2 }
+                    }
+                    1 => { // right edge → neighbor right enters from left
+                        let nci = ((cy - min_y) as usize) * w + (((cx + 1) - min_x) as usize);
+                        EdgeKey { cell: nci, side: 3 }
+                    }
+                    2 => { // bottom edge → neighbor below enters from top
+                        let nci = (((cy + 1) - min_y) as usize) * w + ((cx - min_x) as usize);
+                        EdgeKey { cell: nci, side: 0 }
+                    }
+                    3 => { // left edge → neighbor left enters from right
+                        let nci = ((cy - min_y) as usize) * w + (((cx - 1) - min_x) as usize);
+                        EdgeKey { cell: nci, side: 1 }
+                    }
+                    _ => unreachable!(),
+                };
+                edge_next.insert(from, to);
+            }
+        }
+    }
+
+    // Trace closed loops
+    let mut visited: HashSet<EdgeKey> = HashSet::new();
+    let mut loops = Vec::new();
+    let all_keys: Vec<EdgeKey> = edge_next.keys().copied().collect();
+    for start in all_keys {
         if visited.contains(&start) {
             continue;
         }
-        let mut loop_points = Vec::new();
-        let mut current = start;
+        let mut poly = Vec::new();
+        let mut cur = start;
         loop {
-            if visited.contains(&current) && current != start {
+            if visited.contains(&cur) && cur != start {
                 break;
             }
-            visited.insert(current);
-            loop_points.push((current.0 as f32 * 0.5, current.1 as f32 * 0.5));
-            if let Some(&next) = edge_map.get(&current) {
-                current = next;
-                if current == start {
+            visited.insert(cur);
+            let row = cur.cell / w;
+            let col = cur.cell % w;
+            let cx = col as i32 + min_x;
+            let cy = row as i32 + min_y;
+            poly.push(edge_midpoint(cx, cy, cur.side));
+            if let Some(&next) = edge_next.get(&cur) {
+                cur = next;
+                if cur == start {
                     break;
                 }
             } else {
                 break;
             }
         }
-        if loop_points.len() >= 3 {
-            loops.push(loop_points);
+        if poly.len() >= 3 {
+            loops.push(poly);
         }
     }
-
     loops
 }
 
@@ -1046,6 +1308,130 @@ fn rotated_world_pos(tx: f32, ty: f32, cos_a: f32, sin_a: f32, local: Vec2i) -> 
     )
 }
 
+/// 8-neighborhood dilation (Chebyshev radius 1).
+fn dilate_8(keys: &HashSet<(i32, i32)>) -> HashSet<(i32, i32)> {
+    let mut out = HashSet::with_capacity(keys.len() * 2);
+    for &(x, y) in keys {
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                out.insert((x + dx, y + dy));
+            }
+        }
+    }
+    out
+}
+
+/// 8-neighborhood erosion: keep cells whose full 3×3 neighborhood lies in `fg`.
+fn erode_8(fg: &HashSet<(i32, i32)>) -> HashSet<(i32, i32)> {
+    let mut out = HashSet::new();
+    for &(x, y) in fg {
+        let mut ok = true;
+        'nei: for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if !fg.contains(&(x + dx, y + dy)) {
+                    ok = false;
+                    break 'nei;
+                }
+            }
+        }
+        if ok {
+            out.insert((x, y));
+        }
+    }
+    out
+}
+
+/// Closing = erode(dilate(B)). Fills 1-cell (and some thin) interior gaps from rotation rounding.
+fn morph_close_8(keys: &HashSet<(i32, i32)>) -> HashSet<(i32, i32)> {
+    if keys.is_empty() {
+        return HashSet::new();
+    }
+    let d = dilate_8(keys);
+    erode_8(&d)
+}
+
+/// Pixels in `closed` that are 4-connected to any seed through cells in `closed` only.
+/// Drops morph-close islands that only touch the real anchor footprint diagonally or float outside it,
+/// which otherwise become gray `fill_cell` artifacts in world space.
+fn closed_cells_reachable_from_seeds(
+    seeds: &HashSet<(i32, i32)>,
+    closed: &HashSet<(i32, i32)>,
+) -> HashSet<(i32, i32)> {
+    let mut out = HashSet::new();
+    let mut q = VecDeque::new();
+    for &p in seeds {
+        if closed.contains(&p) {
+            out.insert(p);
+            q.push_back(p);
+        }
+    }
+    const D4: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    while let Some((x, y)) = q.pop_front() {
+        for (dx, dy) in D4 {
+            let n = (x + dx, y + dy);
+            if closed.contains(&n) && out.insert(n) {
+                q.push_back(n);
+            }
+        }
+    }
+    out
+}
+
+/// Rounded anchor positions → cell map (colliding anchors keep first cell).
+fn rounded_anchor_cell_map(
+    tx: f32,
+    ty: f32,
+    cos_a: f32,
+    sin_a: f32,
+    anchors: &[PixelAnchor],
+) -> HashMap<(i32, i32), Cell> {
+    let mut map = HashMap::with_capacity(anchors.len());
+    for anchor in anchors {
+        let wp = rotated_world_pos(tx, ty, cos_a, sin_a, anchor.local);
+        map.entry((wp.x, wp.y)).or_insert(anchor.cell);
+    }
+    map
+}
+
+/// Pixels added by morphological closing (not anchor-rounded). Used for render overlays only.
+fn compute_morph_fill_cells(
+    anchors: &[PixelAnchor],
+    tx: f32,
+    ty: f32,
+    cos_a: f32,
+    sin_a: f32,
+) -> Vec<((i32, i32), Cell)> {
+    let map = rounded_anchor_cell_map(tx, ty, cos_a, sin_a, anchors);
+    let anchor_keys: HashSet<(i32, i32)> = map.keys().copied().collect();
+    if anchor_keys.is_empty() {
+        return Vec::new();
+    }
+    let closed_raw = morph_close_8(&anchor_keys);
+    let closed = closed_cells_reachable_from_seeds(&anchor_keys, &closed_raw);
+    let new_keys: Vec<(i32, i32)> = closed.into_iter().filter(|k| !map.contains_key(k)).collect();
+    if new_keys.is_empty() {
+        return Vec::new();
+    }
+    let anchor_world: Vec<((i32, i32), Cell)> = anchors
+        .iter()
+        .map(|a| {
+            let wp = rotated_world_pos(tx, ty, cos_a, sin_a, a.local);
+            ((wp.x, wp.y), a.cell)
+        })
+        .collect();
+    let fallback = anchors.first().map(|a| a.cell).unwrap_or(Cell::new());
+    let mut out = Vec::with_capacity(new_keys.len());
+    for k in new_keys {
+        let cell = anchor_world
+            .iter()
+            .min_by_key(|&&(wp, _)| (wp.0 - k.0).abs() + (wp.1 - k.1).abs())
+            .map(|&(_, c)| c)
+            .unwrap_or(fallback);
+        out.push((k, cell));
+    }
+    out
+}
+
 /// Scan rows of a chunk for contiguous runs of inert cells and merge vertically
 /// into rectangles. Returns (center_x, center_y, half_width, half_height) for each.
 fn build_run_rectangles(world: &World, bounds: &RectI) -> Vec<(f32, f32, f32, f32)> {
@@ -1129,11 +1515,93 @@ fn find_empty_above(
                 if body_cells.contains(&(candidate.x, candidate.y)) {
                     continue;
                 }
-                if world.get_cell(candidate).material == material::EMPTY {
+                if world.get_cell(candidate).material() == material::EMPTY {
                     return Some(candidate);
                 }
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod morph_tests {
+    use super::*;
+
+    #[test]
+    fn marching_squares_two_disconnected_islands() {
+        let p = [
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (5, 0),
+            (6, 0),
+            (5, 1),
+            (6, 1),
+        ];
+        let loops = marching_squares_contours(&p);
+        assert_eq!(
+            loops.len(),
+            2,
+            "two separated groups should each get a boundary loop"
+        );
+        for l in &loops {
+            assert!(polygon_area(l) > 0.0, "outer boundary should be CCW (positive area)");
+        }
+    }
+
+    #[test]
+    fn marching_squares_single_pixel() {
+        let loops = marching_squares_contours(&[(0, 0)]);
+        assert_eq!(loops.len(), 1);
+        assert!(polygon_area(&loops[0]) > 0.0);
+    }
+
+    #[test]
+    fn marching_squares_hole_produces_two_loops() {
+        // 5x5 ring with hollow center (3x3 hole)
+        let mut pixels = Vec::new();
+        for y in 0..5 {
+            for x in 0..5 {
+                if x >= 1 && x <= 3 && y >= 1 && y <= 3 {
+                    continue; // hole
+                }
+                pixels.push((x, y));
+            }
+        }
+        let loops = marching_squares_contours(&pixels);
+        assert_eq!(loops.len(), 2, "ring should produce outer + hole loop");
+        let mut areas: Vec<f32> = loops.iter().map(|l| polygon_area(l)).collect();
+        areas.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert!(areas[0] > 0.0, "outer boundary positive");
+        assert!(areas[1] < 0.0, "hole boundary negative");
+    }
+
+    #[test]
+    fn morph_close_8_fills_center_of_3x3_ring() {
+        let mut keys = HashSet::new();
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                keys.insert((dx, dy));
+            }
+        }
+        let closed_raw = morph_close_8(&keys);
+        let closed = closed_cells_reachable_from_seeds(&keys, &closed_raw);
+        assert!(closed.contains(&(0, 0)));
+        assert_eq!(closed.len(), 9);
+    }
+
+    #[test]
+    fn closed_reachable_drops_cells_not_four_connected_to_seeds() {
+        let seeds: HashSet<_> = [(0, 0), (1, 0)].into_iter().collect();
+        let mut closed = morph_close_8(&seeds);
+        closed.insert((20, 20));
+        let kept = closed_cells_reachable_from_seeds(&seeds, &closed);
+        assert!(!kept.contains(&(20, 20)));
+        assert!(kept.contains(&(0, 0)));
+    }
 }

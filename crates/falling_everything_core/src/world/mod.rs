@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cell64::{PackedCell, MAX_PACKED_MATERIAL_ID};
+pub use crate::cell64::Cell;
+use crate::cell64::MAX_MATERIAL_ID;
 
 mod store;
 use store::{DenseCellStore, SpatialHashChunkStore};
@@ -106,6 +107,7 @@ pub mod material {
     pub const SPOUT: MaterialId = 21;
     pub const DIRT: MaterialId = 22;
     pub const GRASS: MaterialId = 23;
+    pub const OBSIDIAN: MaterialId = 24;
     pub const MAX_MATERIALS: usize = 1024;
 }
 
@@ -317,7 +319,7 @@ pub struct NeighborSpawnRule {
     /// Half-open lifetime for spawned cell when `hi > lo`; else [`World::initial_lifetime_for`].
     pub lifetime_lo: u8,
     pub lifetime_hi: u8,
-    pub spawn_flags: u16,
+    pub spawn_flags: u8,
 }
 
 impl NeighborSpawnRule {
@@ -445,18 +447,18 @@ pub struct AdjacentInfluenceRule {
     /// When false, roll uses `(chance/100) * heat_factor` (for wet/dry sand, etc.).
     pub requires_victim_ignitability: bool,
     /// If non-zero, rule only matches when `(victim.flags & mask) != 0` (e.g. only wet sand for drying).
-    pub require_victim_flags_any: u16,
+    pub require_victim_flags_any: u8,
     /// If non-zero, skip when `(victim.flags & mask) != 0` (e.g. do not wet already-wet sand).
-    pub exclude_victim_flags_any: u16,
-    pub flags_or: u16,
-    pub flags_clear: u16,
+    pub exclude_victim_flags_any: u8,
+    pub flags_or: u8,
+    pub flags_clear: u8,
     pub victim_lifetime: InfluenceVictimLifetime,
     pub source_effect: InfluenceSourceEffect,
     /// If non-zero: when this mask goes from set to clear, replace victim with `spawn_on_clear_material`.
-    pub if_cleared_mask: u16,
+    pub if_cleared_mask: u8,
     pub spawn_on_clear_material: MaterialId,
     /// If non-zero: when this mask goes from clear to set, replace victim with `spawn_on_set_material`.
-    pub if_set_mask: u16,
+    pub if_set_mask: u8,
     pub spawn_on_set_material: MaterialId,
     /// Half-open lifetime for transition spawns; if `hi <= lo`, sim uses [`World::initial_lifetime_for`].
     pub spawn_lifetime_lo: u8,
@@ -509,13 +511,16 @@ impl Default for AdjacentInfluenceRule {
 pub type AdjacentInfluenceRules = [AdjacentInfluenceRule; MAX_ADJACENT_INFLUENCE_RULES];
 
 pub mod cell_flags {
-    pub const IS_FREE_FALLING: u16 = 1 << 0;
-    pub const ON_FIRE: u16 = 1 << 1;
-    pub const WET: u16 = 1 << 2;
-    pub const ELECTRIFIED: u16 = 1 << 3;
-    /// Set during the sim step on rigid-body pixels (material forced to STATIC). Used to keep
-    /// heat/adjacent rules (e.g. lava vaporizing water, igniting wood) while blocking displacement.
-    pub const RIGID_BODY_SIM: u16 = 1 << 4;
+    pub const IS_FREE_FALLING: u8 = 1 << 0;
+    pub const WET: u8 = 1 << 1;
+    pub const ELECTRIFIED: u8 = 1 << 2;
+    /// Legacy flag kept for backward compatibility. Prefer `RIGID_PIXEL`.
+    pub const RIGID_BODY_SIM: u8 = 1 << 3;
+    /// Marks a cell as belonging to a rigid body. The cell keeps its **real** material so the
+    /// full sim rules (reactions, adjacent transforms, temperature, phase transitions) apply.
+    /// Movement (granular fall, liquid flow, gas rise) is blocked by checking this flag in
+    /// `step_pixel` and `try_displace`.
+    pub const RIGID_PIXEL: u8 = 1 << 4;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -529,6 +534,8 @@ pub struct MaterialProps {
     /// If > 0, ignition sets `ON_FIRE` and seeds `lifetime` with this value instead of immediate replacement.
     /// If 0, heat replaces the cell using `smolder_burnout_become` + `smolder_burnout_lifetime_*` (same as smolder burnout); when those are unset, becomes `FIRE` with heat-weakened lifetime.
     pub fuel_mass: u8,
+    /// Resistance to ray-style explosions: higher = more blast energy absorbed per hit. `0` = ray strength is not reduced when passing through (still may clear the cell).
+    pub durability: u8,
     pub explosion_radius: u8,
     pub on_heat_become: MaterialId,
     pub on_death_become: MaterialId,
@@ -573,6 +580,33 @@ pub struct MaterialProps {
 
     /// Spawn materials into random empty 8-neighbors (smolder, ember, and inert props like torches).
     pub neighbor_spawns: NeighborSpawnRules,
+
+    /// How much collision stress a rigid-body pixel made of this material can take before anchors are
+    /// dropped against **inert** world cells with no `rigid_id` (terrain squeeze). Higher = tougher.
+    /// Overlap with non-inert materials (liquids, sand, etc.) always removes anchors regardless of this value.
+    /// Tuned relative to [`crate::rigid::STRUCTURAL_STRESS_SCALE`].
+    pub structure_integrity: f32,
+
+    // --- Temperature system ---
+
+    /// Temperature when spawned/painted (e.g. lava ~1200, water ~20, sand ~20).
+    pub base_temperature: u16,
+    /// 0–255: how fast heat flows to/from neighbors. 0 = perfect insulator.
+    pub thermal_conductivity: u8,
+    /// 0–255: resistance to temperature change. Higher = harder to heat/cool.
+    pub specific_heat: u8,
+    /// Temperature at which fuel_mass starts burning (replaces `ignitability`). 0 = never ignites.
+    pub ignition_temperature: u16,
+    /// Above this temperature, the cell melts into `melt_into`. 0 = never melts.
+    pub melt_temperature: u16,
+    /// Material to become when melting (e.g. ICE → LIQUID).
+    pub melt_into: MaterialId,
+    /// Below this temperature, the cell freezes into `freeze_into`. 0 = never freezes.
+    pub freeze_temperature: u16,
+    /// Material to become when freezing (e.g. LAVA → OBSIDIAN).
+    pub freeze_into: MaterialId,
+    /// Temperature added per tick while burning (fuel being consumed).
+    pub heat_output: u16,
 }
 
 impl Default for MaterialProps {
@@ -590,6 +624,7 @@ impl MaterialProps {
             ignitability: 0,
             consumption_rate: 0,
             fuel_mass: 0,
+            durability: 0,
             explosion_radius: 0,
             on_heat_become: material::EMPTY,
             on_death_become: material::EMPTY,
@@ -632,6 +667,16 @@ impl MaterialProps {
                 NeighborSpawnRule::inactive(),
                 NeighborSpawnRule::inactive(),
             ],
+            structure_integrity: 1.0,
+            base_temperature: 20,
+            thermal_conductivity: 50,
+            specific_heat: 128,
+            ignition_temperature: 0,
+            melt_temperature: 0,
+            melt_into: material::EMPTY,
+            freeze_temperature: 0,
+            freeze_into: material::EMPTY,
+            heat_output: 0,
         }
     }
 
@@ -703,52 +748,7 @@ fn default_reactions() -> Vec<ReactionOutcome> {
     vec![ReactionOutcome::None; material::MAX_MATERIALS * material::MAX_MATERIALS]
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cell {
-    pub material: MaterialId,
-    pub flags: u16,
-    pub velocity: i8,
-    pub lifetime: u8,
-    pub variant: u8,
-    pub scorch: u8,
-}
-
-const _: () = assert!(std::mem::size_of::<Cell>() == 8);
-
-const STATIC_CELL: Cell = Cell {
-    material: material::STATIC,
-    flags: 0,
-    velocity: 0,
-    lifetime: 0,
-    variant: 0,
-    scorch: 0,
-};
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            material: material::EMPTY,
-            flags: 0,
-            velocity: 0,
-            lifetime: 0,
-            variant: 0,
-            scorch: 0,
-        }
-    }
-}
-
-impl Cell {
-    #[inline]
-    pub fn to_packed(self) -> PackedCell {
-        PackedCell::from_legacy_cell(self)
-    }
-
-    #[inline]
-    pub fn from_packed(cell: PackedCell) -> Self {
-        cell.to_legacy_cell()
-    }
-}
+const STATIC_CELL: Cell = Cell::new().with_material(material::STATIC);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkCoord {
@@ -823,22 +823,23 @@ fn cell_contributes_static_collider_refs(
         return false;
     }
     material_props
-        .get(cell.material as usize)
+        .get(cell.material() as usize)
         .copied()
         .unwrap_or_default()
         .inert()
-        && cell.material != material::EMPTY
+        && cell.material() != material::EMPTY
         && !rigid_ids.contains_key(&p)
+        && !cell.has_flag(cell_flags::RIGID_PIXEL)
 }
 
 impl World {
     #[inline]
     fn assert_supported_material_id(id: MaterialId) {
         debug_assert!(
-            id <= MAX_PACKED_MATERIAL_ID,
+            id <= MAX_MATERIAL_ID,
             "material id {} exceeds packed u10 limit {}",
             id,
-            MAX_PACKED_MATERIAL_ID
+            MAX_MATERIAL_ID
         );
     }
 
@@ -961,7 +962,7 @@ impl World {
                             continue; // overlap — preserved by relocate
                         }
                         if let Some(cell) = self.store.get_read(Vec2i::new(x, y)) {
-                            if cell.material != material::EMPTY {
+                            if cell.material() != material::EMPTY {
                                 has_content = true;
                                 break;
                             }
@@ -979,7 +980,7 @@ impl World {
                             continue;
                         }
                         if let Some(cell) = self.store.get_read(Vec2i::new(x, y)) {
-                            if cell.material != material::EMPTY {
+                            if cell.material() != material::EMPTY {
                                 let lx = x - coord.x * CHUNK_SIZE;
                                 let ly = y - coord.y * CHUNK_SIZE;
                                 let local_idx = chunk_local_index(lx, ly);
@@ -1023,7 +1024,7 @@ impl World {
                             let ly = y - coord.y * CHUNK_SIZE;
                             let local_idx = chunk_local_index(lx, ly);
                             let cell = slab_copy[local_idx];
-                            if cell.material != material::EMPTY {
+                            if cell.material() != material::EMPTY {
                                 self.store.set_read(Vec2i::new(x, y), cell);
                             }
                         }
@@ -1108,6 +1109,14 @@ impl World {
         self.rigid_ids.get(&p).copied()
     }
 
+    /// Positions currently listed in `rigid_ids` for `body_id` (for sync / cleanup).
+    pub fn rigid_ids_iter_for_body(&self, body_id: u32) -> impl Iterator<Item = Vec2i> + '_ {
+        self.rigid_ids
+            .iter()
+            .filter(move |(_, id)| **id == body_id)
+            .map(|(p, _)| *p)
+    }
+
     pub fn set_rigid_id(&mut self, p: Vec2i, id: u32) {
         let cell = self.get_cell(p);
         let before = self.cell_contributes_static_collider(p, cell);
@@ -1125,6 +1134,21 @@ impl World {
         let after = self.cell_contributes_static_collider(p, cell);
         if before != after {
             self.mark_chunk_physics_dirty_for(p);
+        }
+    }
+
+    /// Clears every cell that still claims `body_id` (including morph-close fill pixels that are not
+    /// represented in [`crate::rigid::PixelRigidBody::anchors`]). Call when removing that body from
+    /// the physics bridge so stale STATIC / rigid pixels cannot outlive the body.
+    pub fn purge_rigid_body_ownership(&mut self, body_id: u32) {
+        let positions: Vec<Vec2i> = self
+            .rigid_ids
+            .iter()
+            .filter(|(_, id)| **id == body_id)
+            .map(|(p, _)| *p)
+            .collect();
+        for p in positions {
+            self.set_cell(p, Cell::new());
         }
     }
 
@@ -1270,7 +1294,7 @@ impl World {
     }
 
     pub fn set_cell(&mut self, p: Vec2i, cell: Cell) {
-        Self::assert_supported_material_id(cell.material);
+        Self::assert_supported_material_id(cell.material());
         let old = self.store.get_read(p);
         if self.store.set_read(p, cell) {
             let (coord, idx) = SpatialHashChunkStore::split_world_to_chunk(p);
@@ -1284,6 +1308,7 @@ impl World {
             self.wake_chunk_and_neighbors(p);
 
             let before = old.map_or(false, |c| self.cell_contributes_static_collider(p, c));
+            self.clear_rigid_id(p);
             let after = self.cell_contributes_static_collider(p, cell);
             if before != after {
                 self.mark_chunk_physics_dirty_for(p);
@@ -1349,29 +1374,37 @@ impl World {
         Self::assert_supported_material_id(mat);
         let props = self.material_props(mat);
         let initial_lifetime = Self::initial_lifetime_for(mat, &props);
-        let (paint_flags, paint_lifetime) = if mat == material::LAVA && props.fuel_mass > 0 {
-            (cell_flags::ON_FIRE, props.fuel_mass)
-        } else {
-            (0, initial_lifetime)
-        };
+        let cell = Cell::new()
+            .with_material(mat)
+            .with_lifetime(initial_lifetime)
+            .with_temperature(props.base_temperature);
         let r2 = radius * radius;
         for y in (center.y - radius)..=(center.y + radius) {
             for x in (center.x - radius)..=(center.x + radius) {
                 let dx = x - center.x;
                 let dy = y - center.y;
                 if dx * dx + dy * dy <= r2 {
-                    self.set_cell(
-                        Vec2i::new(x, y),
-                        Cell {
-                            material: mat,
-                            flags: paint_flags,
-                            velocity: 0,
-                            lifetime: paint_lifetime,
-                            variant: 0,
-                            scorch: 0,
-                        },
-                    );
+                    self.set_cell(Vec2i::new(x, y), cell);
                 }
+            }
+        }
+    }
+
+    pub fn paint_rect_filled(&mut self, min: Vec2i, max: Vec2i, mat: MaterialId) {
+        Self::assert_supported_material_id(mat);
+        let props = self.material_props(mat);
+        let initial_lifetime = Self::initial_lifetime_for(mat, &props);
+        let cell = Cell::new()
+            .with_material(mat)
+            .with_lifetime(initial_lifetime)
+            .with_temperature(props.base_temperature);
+        let x0 = min.x.min(max.x);
+        let x1 = min.x.max(max.x);
+        let y0 = min.y.min(max.y);
+        let y1 = min.y.max(max.y);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.set_cell(Vec2i::new(x, y), cell);
             }
         }
     }
@@ -1395,17 +1428,26 @@ impl World {
         if props.corrosion_max_hp > 0 {
             return props.corrosion_max_hp;
         }
+        if props.fuel_mass > 0 {
+            return 0;
+        }
+        if props.phase() == Phase::Gas {
+            return 0;
+        }
+        if props.durability > 0 {
+            return props.durability;
+        }
         0
     }
 
     pub fn try_swap(&mut self, from: Vec2i, to: Vec2i) -> bool {
         let from_cell = self.get_cell(from);
         let to_cell = self.get_cell(to);
-        if to_cell.material != material::EMPTY {
+        if to_cell.material() != material::EMPTY {
             return false;
         }
         self.set_cell(to, from_cell);
-        self.set_cell(from, Cell::default());
+        self.set_cell(from, Cell::new());
         true
     }
 
@@ -1493,7 +1535,7 @@ impl World {
     pub fn prune_rigid_ids_for_empty_cells(&mut self) {
         let keys: Vec<Vec2i> = self.rigid_ids.keys().copied().collect();
         for p in keys {
-            if self.get_cell(p).material == material::EMPTY {
+            if self.get_cell(p).material() == material::EMPTY {
                 self.clear_rigid_id(p);
             }
         }
@@ -1699,7 +1741,7 @@ impl World {
         for cy in chunk_min_cy..=chunk_max_cy {
             for cx in chunk_min_cx..=chunk_max_cx {
                 let coord = ChunkCoord { x: cx, y: cy };
-                let mut cells = vec![Cell::default(); (cs * cs) as usize];
+                let mut cells = vec![Cell::new(); (cs * cs) as usize];
                 for ly in 0..cs {
                     for lx in 0..cs {
                         let p = Vec2i::new(cx * cs + lx, cy * cs + ly);
@@ -1708,7 +1750,7 @@ impl World {
                         }
                     }
                 }
-                if cells.iter().any(|c| c.material != material::EMPTY) {
+                if cells.iter().any(|c| c.material() != material::EMPTY) {
                     chunk_cells.push((coord, cells));
                 }
             }
@@ -1745,7 +1787,7 @@ impl World {
                 for lx in 0..cs {
                     let p = Vec2i::new(coord.x * cs + lx, coord.y * cs + ly);
                     let cell = cells[(ly * cs + lx) as usize];
-                    if cell.material != material::EMPTY {
+                    if cell.material() != material::EMPTY {
                         if self.store.set_read(p, cell) {
                             let (chunk, local_idx) = SpatialHashChunkStore::split_world_to_chunk(p);
                             self.hash_chunks.ensure_chunk(chunk);
@@ -1759,6 +1801,17 @@ impl World {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl World {
+    /// Count of grid cells whose `rigid_id` is not in `alive_ids` (orphaned ownership).
+    pub(crate) fn stale_rigid_reference_count(&self, alive_ids: &std::collections::HashSet<u32>) -> usize {
+        self.rigid_ids
+            .values()
+            .filter(|id| !alive_ids.contains(id))
+            .count()
     }
 }
 

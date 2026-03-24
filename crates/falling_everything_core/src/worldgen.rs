@@ -82,14 +82,7 @@ pub fn paint_terrain(sim: &mut crate::Simulation, config: &TerrainConfig) {
         for &(y, mat) in &col.cells {
             sim.paint_cell(
                 Vec2i::new(col.x, y),
-                Cell {
-                    material: mat,
-                    flags: 0,
-                    velocity: 0,
-                    lifetime: 0,
-                    variant: 0,
-                    scorch: 0,
-                },
+                Cell::new().with_material(mat),
             );
         }
     }

@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use crate::rigid::RigidBridge;
 use crate::world::{cell_flags, material, Cell, MaterialId, RectI, Vec2i, World};
 
 #[derive(Debug, Clone, Copy)]
@@ -23,7 +26,7 @@ pub fn get_dirty_chunks(world: &World) -> Vec<DirtyChunkView> {
         .collect()
 }
 
-pub fn copy_rgba_for_region(world: &World, rect: RectI) -> PixelRegion {
+pub fn copy_rgba_for_region(world: &World, rigid: Option<&RigidBridge>, rect: RectI) -> PixelRegion {
     let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
     let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
     let mut rgba = Vec::with_capacity(width * height * 4);
@@ -34,11 +37,39 @@ pub fn copy_rgba_for_region(world: &World, rect: RectI) -> PixelRegion {
             rgba.extend_from_slice(&color);
         }
     }
+    if let Some(r) = rigid {
+        apply_rigid_morph_overlays_rgba(world, r, rect, &mut rgba, width);
+    }
     PixelRegion { width, height, rgba }
 }
 
+fn apply_rigid_morph_overlays_rgba(
+    world: &World,
+    rigid: &RigidBridge,
+    rect: RectI,
+    rgba: &mut [u8],
+    width: usize,
+) {
+    let mut tiles = Vec::new();
+    rigid.collect_visual_morph_overlay_tiles(world, rect, &mut tiles);
+    let mut by_pos: HashMap<Vec2i, Cell> = HashMap::new();
+    for (_, p, c) in tiles {
+        by_pos.insert(p, c);
+    }
+    for (p, cell) in by_pos {
+        let ix = (p.x - rect.min.x) as usize;
+        let iy = (p.y - rect.min.y) as usize;
+        let i = iy * width + ix;
+        let base = i * 4;
+        if base + 3 < rgba.len() {
+            let [r, g, b, a] = cell_to_rgba(cell, p.x, p.y);
+            rgba[base..base + 4].copy_from_slice(&[r, g, b, a]);
+        }
+    }
+}
+
 /// Returns ARGB32 pixels for a region, suitable for minifb / sandbox rendering.
-pub fn copy_argb32_for_region(world: &World, rect: RectI) -> Vec<u32> {
+pub fn copy_argb32_for_region(world: &World, rigid: Option<&RigidBridge>, rect: RectI) -> Vec<u32> {
     let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
     let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
     let mut buf = Vec::with_capacity(width * height);
@@ -48,7 +79,33 @@ pub fn copy_argb32_for_region(world: &World, rect: RectI) -> Vec<u32> {
             buf.push(cell_to_argb32(cell, x, y));
         }
     }
+    if let Some(r) = rigid {
+        apply_rigid_morph_overlays_argb32(world, r, rect, &mut buf, width);
+    }
     buf
+}
+
+fn apply_rigid_morph_overlays_argb32(
+    world: &World,
+    rigid: &RigidBridge,
+    rect: RectI,
+    buf: &mut [u32],
+    width: usize,
+) {
+    let mut tiles = Vec::new();
+    rigid.collect_visual_morph_overlay_tiles(world, rect, &mut tiles);
+    let mut by_pos: HashMap<Vec2i, Cell> = HashMap::new();
+    for (_, p, c) in tiles {
+        by_pos.insert(p, c);
+    }
+    for (p, cell) in by_pos {
+        let ix = (p.x - rect.min.x) as usize;
+        let iy = (p.y - rect.min.y) as usize;
+        let i = iy * width + ix;
+        if i < buf.len() {
+            buf[i] = cell_to_argb32(cell, p.x, p.y);
+        }
+    }
 }
 
 #[inline]
@@ -130,7 +187,11 @@ fn draw_all_pass_batch_outlines(world: &World, buf: &mut [u32], width: usize, re
 
 /// Same as [`copy_argb32_for_region`], then 1px outlines per chunk in checkerboard pass color (red/green/blue/yellow batches).
 /// In [`crate::sim::SchedulerMode::ThreadPool`], all chunks of one color are stepped **in parallel** (one chunk per rayon task).
-pub fn copy_argb32_for_region_pass_batch_viz(world: &World, rect: RectI) -> Vec<u32> {
+pub fn copy_argb32_for_region_pass_batch_viz(
+    world: &World,
+    rigid: Option<&RigidBridge>,
+    rect: RectI,
+) -> Vec<u32> {
     let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
     let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
     let mut buf = Vec::with_capacity(width * height);
@@ -140,12 +201,19 @@ pub fn copy_argb32_for_region_pass_batch_viz(world: &World, rect: RectI) -> Vec<
             buf.push(cell_to_argb32(cell, x, y));
         }
     }
+    if let Some(r) = rigid {
+        apply_rigid_morph_overlays_argb32(world, r, rect, &mut buf, width);
+    }
     draw_all_pass_batch_outlines(world, &mut buf, width, rect);
     buf
 }
 
 /// Same as [`copy_argb32_for_region`], optional pass-batch outlines, then a thick outline on the chunk being stepped.
-pub fn copy_argb32_for_region_chunk_step_viz(world: &World, rect: RectI) -> Vec<u32> {
+pub fn copy_argb32_for_region_chunk_step_viz(
+    world: &World,
+    rigid: Option<&RigidBridge>,
+    rect: RectI,
+) -> Vec<u32> {
     let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
     let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
     let mut buf = Vec::with_capacity(width * height);
@@ -154,6 +222,9 @@ pub fn copy_argb32_for_region_chunk_step_viz(world: &World, rect: RectI) -> Vec<
             let cell = world.get_cell(Vec2i::new(x, y));
             buf.push(cell_to_argb32(cell, x, y));
         }
+    }
+    if let Some(r) = rigid {
+        apply_rigid_morph_overlays_argb32(world, r, rect, &mut buf, width);
     }
     if world.debug_pass_batch_outlines() {
         draw_all_pass_batch_outlines(world, &mut buf, width, rect);
@@ -171,43 +242,43 @@ pub fn copy_palette_indices_for_region(world: &World, rect: RectI) -> Vec<u16> {
     let mut indices = Vec::new();
     for y in rect.min.y..=rect.max.y {
         for x in rect.min.x..=rect.max.x {
-            indices.push(world.get_cell(Vec2i::new(x, y)).material);
+            indices.push(world.get_cell(Vec2i::new(x, y)).material());
         }
     }
     indices
 }
 
 fn cell_to_rgba(cell: Cell, x: i32, y: i32) -> [u8; 4] {
-    let [mut r, mut g, mut b, a] = if (cell.material == material::PLANT || cell.material == material::WOOD)
-        && (cell.flags & cell_flags::ON_FIRE != 0)
+    let temp = cell.temperature();
+    if (cell.material() == material::PLANT || cell.material() == material::WOOD)
+        && temp >= 250 && cell.lifetime() > 0
     {
-        burning_vegetation_rgba(cell.lifetime, x, y)
+        burning_vegetation_rgba(cell.lifetime(), x, y)
     } else {
-        match cell.material {
-            m if m == material::FIRE => fire_rgba(cell.lifetime, x, y),
-            m if m == material::LAVA => lava_rgba(cell.lifetime, x, y),
-            m if m == material::EMBER => ember_pile_rgba(cell.lifetime, x, y),
-            m if m == material::SMOKE => smoke_rgba(cell.lifetime, x, y),
-            m if m == material::STEAM => steam_rgba(cell.lifetime, x, y),
+        let [mut r, mut g, b, a] = match cell.material() {
+            m if m == material::FIRE => fire_rgba(cell.lifetime(), x, y),
+            m if m == material::LAVA => lava_rgba(cell.lifetime(), x, y),
+            m if m == material::EMBER => ember_pile_rgba(cell.lifetime(), x, y),
+            m if m == material::SMOKE => smoke_rgba(cell.lifetime(), x, y),
+            m if m == material::STEAM => steam_rgba(cell.lifetime(), x, y),
             m => {
                 let base = static_palette_rgba(m);
-                let mut v = apply_variant(base, cell.variant);
-                if cell.flags & cell_flags::WET != 0 && m == material::SAND {
+                let mut v = apply_variant(base, cell.variant());
+                if cell.has_flag(cell_flags::WET) && m == material::SAND {
                     v[0] = ((v[0] as u16 * 88) / 100) as u8;
                     v[1] = ((v[1] as u16 * 92) / 100) as u8;
                     v[2] = v[2].saturating_add(20).min(255);
                 }
                 v
             }
+        };
+        if temp > 200 && cell.material() != material::FIRE && cell.material() != material::LAVA {
+            let glow = ((temp as u32 - 200).min(800) * 255 / 800) as u8;
+            r = r.saturating_add(glow);
+            g = g.saturating_add(glow / 3);
         }
-    };
-    if cell.scorch > 0 {
-        let factor = (255u16 - cell.scorch as u16) as u32;
-        r = ((r as u32 * factor) / 255) as u8;
-        g = ((g as u32 * factor) / 255) as u8;
-        b = ((b as u32 * factor) / 255) as u8;
+        [r, g, b, a]
     }
-    [r, g, b, a]
 }
 
 fn cell_to_argb32(cell: Cell, x: i32, y: i32) -> u32 {
@@ -381,9 +452,16 @@ pub fn copy_debug_argb32_for_region(world: &World, rect: RectI) -> Vec<u32> {
 }
 
 /// Per-pixel pass tint, pass-colored chunk grid, and (if set) the active chunk-step outline.
-pub fn copy_argb32_for_region_all_debug_views(world: &World, rect: RectI) -> Vec<u32> {
+pub fn copy_argb32_for_region_all_debug_views(
+    world: &World,
+    rigid: Option<&RigidBridge>,
+    rect: RectI,
+) -> Vec<u32> {
     let mut buf = copy_debug_argb32_for_region(world, rect);
     let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
+    if let Some(r) = rigid {
+        apply_rigid_morph_overlays_argb32(world, r, rect, &mut buf, width);
+    }
     draw_all_pass_batch_outlines(world, &mut buf, width, rect);
     if let Some((coord, pass)) = world.debug_chunk_highlight() {
         let b = world.bounds_for_chunk(coord);

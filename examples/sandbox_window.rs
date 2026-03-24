@@ -1,10 +1,14 @@
+use std::collections::HashSet;
 use std::time::Instant;
 
 use falling_everything_core::bresenham;
 use falling_everything_core::materials;
-use falling_everything_core::world::{material, MaterialId, RectI, Vec2i};
+use falling_everything_core::world::{material, MaterialId, Phase, RectI, Vec2i};
 use falling_everything_core::worldgen::{self, TerrainConfig};
-use falling_everything_core::{Simulation, SimulationConfig, SimulationStats};
+use falling_everything_core::{
+    base_strength_for_radius, ExplosionParams, ExplosionSpawn, Simulation, SimulationConfig,
+    SimulationStats,
+};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
 
 const SIM_WIDTH: usize = 640;
@@ -15,35 +19,83 @@ const DISP_H: usize = SIM_HEIGHT * SCALE;
 const TARGET_FPS: usize = 60;
 const PAN_SPEED: i32 = 8;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    /// Paint / erase immediately (brush and Shift+rect paint).
+    Draw,
+    /// LMB drag defines pixels; rigid body spawns on mouse release. Shift+drag rect → rigid rectangle on release.
+    RigidBody,
+    /// LMB click: Bresenham chord explosion at cursor; `[` / `]` adjust blast radius.
+    Explosion,
+}
+
+fn is_rigid_body_eligible(def: &materials::MaterialDef) -> bool {
+    def.props.phase() == Phase::Solid
+        && def.id != material::EMPTY
+        && def.id != material::STATIC
+}
+
 struct PaletteLayout {
     panel_x: usize,
     panel_y: usize,
     panel_w: usize,
     panel_h: usize,
-    swatch_x0: usize,
-    swatch_y: usize,
+    /// Y offset from panel top to swatch row (after header text).
+    swatch_y_off: usize,
     swatch_w: usize,
     swatch_h: usize,
     stride: usize,
     count: usize,
+    /// Y offset from panel top to first shortcut help line.
+    help_y_off: usize,
+    mode_btn_y_off: usize,
+    mode_btn_h: usize,
 }
 
 impl PaletteLayout {
+    const INNER: usize = 4 * SCALE;
+    /// One line of 5×7 text (scale 1) + gap.
+    const LINE: usize = 12;
+
     fn new() -> Self {
         let count = materials::BUILTINS.len();
         let panel_w = (count * 16 + 70) * SCALE;
+        let swatch_w = 12 * SCALE;
+        let swatch_h = 14 * SCALE;
+        let stride = 16 * SCALE;
+
+        let header_lines = 2;
+        let swatch_y_off = Self::INNER + header_lines * Self::LINE;
+        let after_swatches = swatch_y_off + swatch_h + 4;
+        let brush_row_h = Self::LINE;
+        let help_lines = 6;
+        let help_y_off = after_swatches + brush_row_h + 2;
+        let mode_btn_y_off = help_y_off + help_lines * Self::LINE + 6;
+        let mode_btn_h = 14 * SCALE;
+        let panel_h = mode_btn_y_off + mode_btn_h + Self::INNER + 4;
+
         Self {
             panel_x: 4 * SCALE,
             panel_y: 4 * SCALE,
             panel_w,
-            panel_h: 26 * SCALE,
-            swatch_x0: 8 * SCALE,
-            swatch_y: 8 * SCALE,
-            swatch_w: 12 * SCALE,
-            swatch_h: 14 * SCALE,
-            stride: 16 * SCALE,
+            panel_h,
+            swatch_y_off,
+            swatch_w,
+            swatch_h,
+            stride,
             count,
+            help_y_off,
+            mode_btn_y_off,
+            mode_btn_h,
         }
+    }
+
+    fn swatch_base_x(&self) -> usize {
+        self.panel_x + Self::INNER
+    }
+
+    fn swatch_base_y(&self) -> usize {
+        self.panel_y + self.swatch_y_off
     }
 
     fn panel_contains(&self, mx: i32, my: i32) -> bool {
@@ -53,19 +105,48 @@ impl PaletteLayout {
             && my < (self.panel_y + self.panel_h) as i32
     }
 
-    fn material_at(&self, mx: i32, my: i32) -> Option<MaterialId> {
+    fn material_at(&self, mx: i32, my: i32, mode: InteractionMode) -> Option<MaterialId> {
+        let bx = self.swatch_base_x() as i32;
+        let by = self.swatch_base_y() as i32;
         for i in 0..self.count {
-            let sx = self.swatch_x0 + i * self.stride;
-            let sy = self.swatch_y;
-            if mx >= sx as i32
-                && mx < (sx + self.swatch_w) as i32
-                && my >= sy as i32
-                && my < (sy + self.swatch_h) as i32
+            let sx = bx + (i * self.stride) as i32;
+            if mx >= sx
+                && mx < sx + self.swatch_w as i32
+                && my >= by
+                && my < by + self.swatch_h as i32
             {
-                return Some(materials::BUILTINS[i].id);
+                let def = &materials::BUILTINS[i];
+                if mode == InteractionMode::RigidBody && !is_rigid_body_eligible(def) {
+                    return None;
+                }
+                return Some(def.id);
             }
         }
         None
+    }
+
+    fn brush_row_y(&self) -> usize {
+        self.panel_y + self.swatch_y_off + self.swatch_h + 4
+    }
+
+    /// Large clickable mode buttons at bottom of panel.
+    fn mode_click(&self, mx: i32, my: i32) -> Option<InteractionMode> {
+        let x0 = (self.panel_x + Self::INNER) as i32;
+        let y0 = (self.panel_y + self.mode_btn_y_off) as i32;
+        let w = (self.panel_w - 2 * Self::INNER) as i32;
+        let h = self.mode_btn_h as i32;
+        if mx < x0 || my < y0 || mx >= x0 + w || my >= y0 + h {
+            return None;
+        }
+        let t = w / 3;
+        let lx = mx - x0;
+        if lx < t {
+            Some(InteractionMode::Draw)
+        } else if lx < 2 * t {
+            Some(InteractionMode::RigidBody)
+        } else {
+            Some(InteractionMode::Explosion)
+        }
     }
 }
 
@@ -115,7 +196,7 @@ fn main() {
         .collect::<Vec<_>>()
         .join(" ");
     let title = format!(
-        "Sandii Sandbox - {} | Arrows Pan | R Rigid | T Boulder | L Lava rock | F Physics | C Clear | P Parallel | D Debug | Y Slow",
+        "Sandii Sandbox - {} | Mode bar or Tab (Draw/Rigid/Explode) | [] blast radius in Explode | Arrows pan | T/L spawn | F physics | C clear",
         mat_list
     );
     let mut window = Window::new(
@@ -136,6 +217,16 @@ fn main() {
     let mut brush_radius: i32 = 4;
     let mut last_left_paint: Option<Vec2i> = None;
     let mut last_right_paint: Option<Vec2i> = None;
+    let mut prev_left_down = false;
+    let mut prev_right_down = false;
+    let mut shift_left_rect_anchor: Option<Vec2i> = None;
+    let mut shift_left_rect_last = Vec2i::new(0, 0);
+    let mut shift_right_rect_anchor: Option<Vec2i> = None;
+    let mut shift_right_rect_last = Vec2i::new(0, 0);
+    let mut rigid_rect_corner: Option<Vec2i> = None;
+    let mut interaction_mode = InteractionMode::Draw;
+    let mut rigid_stroke: HashSet<(i32, i32)> = HashSet::new();
+    let mut rigid_stroke_last: Option<Vec2i> = None;
     let mut last_step = Instant::now();
     let mut fps_last = Instant::now();
     let mut fps_frames: u32 = 0;
@@ -147,6 +238,17 @@ fn main() {
     let mut mid_drag_origin: Option<(f32, f32)> = None;
     let mut camera_at_drag_start = camera;
     let mut show_physics = false;
+    /// Full-disk erase (no ray simulation).
+    let mut explosion_obliterate = false;
+    /// Destroyed interior becomes selected material (when not EMPTY).
+    let mut explosion_spawn_interior = false;
+    /// Outer annulus uses `explosion_edge_spawn` when true.
+    let mut explosion_edge_enabled = true;
+    let mut explosion_edge_spawn = ExplosionSpawn {
+        material: material::FIRE,
+        lifetime: Some(40),
+        temperature: Some(800),
+    };
 
     blit_full_world(&sim, &mut frame, camera);
 
@@ -183,6 +285,41 @@ fn main() {
         }
         if window.is_key_pressed(Key::C, KeyRepeat::No) {
             sim.paint_circle(camera_center(camera), 10_000, material::EMPTY);
+        }
+        if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
+            interaction_mode = match interaction_mode {
+                InteractionMode::Draw => InteractionMode::RigidBody,
+                InteractionMode::RigidBody => InteractionMode::Explosion,
+                InteractionMode::Explosion => InteractionMode::Draw,
+            };
+            rigid_stroke.clear();
+            rigid_stroke_last = None;
+        }
+        if interaction_mode == InteractionMode::Explosion {
+            if window.is_key_pressed(Key::O, KeyRepeat::No) {
+                explosion_obliterate = !explosion_obliterate;
+            }
+            if window.is_key_pressed(Key::I, KeyRepeat::No) {
+                let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+                if shift {
+                    explosion_spawn_interior = false;
+                } else {
+                    explosion_spawn_interior = !explosion_spawn_interior;
+                }
+            }
+            if window.is_key_pressed(Key::E, KeyRepeat::No) {
+                let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+                if shift {
+                    explosion_edge_enabled = !explosion_edge_enabled;
+                } else {
+                    explosion_edge_spawn = ExplosionSpawn {
+                        material: selected,
+                        lifetime: None,
+                        temperature: None,
+                    };
+                    explosion_edge_enabled = true;
+                }
+            }
         }
 
         let mut cam_changed = false;
@@ -222,7 +359,12 @@ fn main() {
             blit_full_world(&sim, &mut frame, camera);
         }
 
-        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Clamp) {
+        // Pass matches framebuffer coords more reliably than Clamp on some platforms (e.g. macOS).
+        if let Some((mx, my)) = window.get_mouse_pos(MouseMode::Pass) {
+            let mx = mx.clamp(0.0, (DISP_W.saturating_sub(1)) as f32);
+            let my = my.clamp(0.0, (DISP_H.saturating_sub(1)) as f32);
+            let mx = mx as i32;
+            let my = my as i32;
             let world_p = Vec2i::new(
                 mx as i32 / SCALE as i32 + camera.x,
                 my as i32 / SCALE as i32 + camera.y,
@@ -234,42 +376,177 @@ fn main() {
             if layout.panel_contains(sx, sy) {
                 last_left_paint = None;
                 last_right_paint = None;
+                rigid_stroke.clear();
+                rigid_stroke_last = None;
                 if window.get_mouse_down(MouseButton::Left) {
-                    if let Some(id) = layout.material_at(sx, sy) {
+                    if let Some(id) = layout.material_at(sx, sy, interaction_mode) {
                         selected = id;
+                    } else if !prev_left_down {
+                        if let Some(m) = layout.mode_click(sx, sy) {
+                            interaction_mode = m;
+                            rigid_stroke.clear();
+                            rigid_stroke_last = None;
+                        }
                     }
                 }
             } else if mid_drag_origin.is_none() {
-                if window.get_mouse_down(MouseButton::Left) {
-                    if let Some(prev) = last_left_paint {
-                        sim.paint_line_brush(prev, world_p, brush_radius, selected);
-                    } else {
-                        sim.paint_circle(world_p, brush_radius, selected);
+                let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+                let left_down = window.get_mouse_down(MouseButton::Left);
+                let right_down = window.get_mouse_down(MouseButton::Right);
+
+                if shift && !layout.panel_contains(sx, sy) {
+                    if left_down {
+                        if shift_left_rect_anchor.is_none() {
+                            shift_left_rect_anchor = Some(world_p);
+                        }
+                        shift_left_rect_last = world_p;
+                    } else if prev_left_down {
+                        if let Some(a) = shift_left_rect_anchor.take() {
+                            match interaction_mode {
+                                InteractionMode::Draw => {
+                                    sim.paint_rect_filled(a, shift_left_rect_last, selected);
+                                }
+                                InteractionMode::RigidBody => {
+                                    let _ = sim.spawn_rigid_body_rect(
+                                        a,
+                                        shift_left_rect_last,
+                                        selected,
+                                    );
+                                }
+                                InteractionMode::Explosion => {}
+                            }
+                        }
                     }
-                    last_left_paint = Some(world_p);
-                } else {
-                    last_left_paint = None;
-                }
-                if window.get_mouse_down(MouseButton::Right) {
-                    if let Some(prev) = last_right_paint {
-                        sim.paint_line_brush(prev, world_p, brush_radius, material::EMPTY);
-                    } else {
-                        sim.paint_circle(world_p, brush_radius, material::EMPTY);
+                    if right_down {
+                        if shift_right_rect_anchor.is_none() {
+                            shift_right_rect_anchor = Some(world_p);
+                        }
+                        shift_right_rect_last = world_p;
+                    } else if prev_right_down {
+                        if let Some(a) = shift_right_rect_anchor.take() {
+                            sim.paint_rect_filled(a, shift_right_rect_last, material::EMPTY);
+                        }
                     }
-                    last_right_paint = Some(world_p);
                 } else {
-                    last_right_paint = None;
+                    if !shift {
+                        shift_left_rect_anchor = None;
+                        shift_right_rect_anchor = None;
+                    }
+                    match interaction_mode {
+                        InteractionMode::Draw => {
+                            if left_down {
+                                if let Some(prev) = last_left_paint {
+                                    sim.paint_line_brush(prev, world_p, brush_radius, selected);
+                                } else {
+                                    sim.paint_circle(world_p, brush_radius, selected);
+                                }
+                                last_left_paint = Some(world_p);
+                            } else {
+                                last_left_paint = None;
+                            }
+                            if right_down {
+                                if let Some(prev) = last_right_paint {
+                                    sim.paint_line_brush(prev, world_p, brush_radius, material::EMPTY);
+                                } else {
+                                    sim.paint_circle(world_p, brush_radius, material::EMPTY);
+                                }
+                                last_right_paint = Some(world_p);
+                            } else {
+                                last_right_paint = None;
+                            }
+                        }
+                        InteractionMode::RigidBody => {
+                            if left_down {
+                                if rigid_stroke_last.is_none() {
+                                    rigid_stroke.clear();
+                                    collect_brush_disk(&mut rigid_stroke, world_p, brush_radius);
+                                } else if let Some(prev) = rigid_stroke_last {
+                                    collect_line_brush(&mut rigid_stroke, prev, world_p, brush_radius);
+                                }
+                                rigid_stroke_last = Some(world_p);
+                            } else if prev_left_down {
+                                if !rigid_stroke.is_empty() {
+                                    let positions: Vec<Vec2i> = rigid_stroke
+                                        .iter()
+                                        .map(|(x, y)| Vec2i::new(*x, *y))
+                                        .collect();
+                                    let _ = sim.spawn_rigid_body_from_pixels(&positions, selected);
+                                }
+                                rigid_stroke.clear();
+                                rigid_stroke_last = None;
+                            }
+                            last_left_paint = None;
+                            if right_down {
+                                if let Some(prev) = last_right_paint {
+                                    sim.paint_line_brush(prev, world_p, brush_radius, material::EMPTY);
+                                } else {
+                                    sim.paint_circle(world_p, brush_radius, material::EMPTY);
+                                }
+                                last_right_paint = Some(world_p);
+                            } else {
+                                last_right_paint = None;
+                            }
+                        }
+                        InteractionMode::Explosion => {
+                            last_left_paint = None;
+                            last_right_paint = None;
+                            rigid_stroke.clear();
+                            rigid_stroke_last = None;
+                            if left_down && !prev_left_down {
+                                let r = brush_radius.max(1);
+                                let fill_on_destroy =
+                                    if explosion_spawn_interior && selected != material::EMPTY {
+                                        Some(ExplosionSpawn {
+                                            material: selected,
+                                            lifetime: None,
+                                            temperature: None,
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                let edge_on_destroy = if explosion_edge_enabled {
+                                    Some(explosion_edge_spawn)
+                                } else {
+                                    None
+                                };
+                                sim.apply_explosion(ExplosionParams {
+                                    center: world_p,
+                                    radius: r,
+                                    base_strength: base_strength_for_radius(r),
+                                    obliterate_disk: explosion_obliterate,
+                                    fill_on_destroy,
+                                    edge_on_destroy,
+                                    edge_band_inward: 2,
+                                });
+                            }
+                        }
+                    }
                 }
-                if window.is_key_pressed(Key::R, KeyRepeat::No) {
-                    let min = Vec2i::new(world_p.x - 6, world_p.y - 4);
-                    let max = Vec2i::new(world_p.x + 6, world_p.y + 4);
-                    let _ = sim.spawn_rigid_body_rect(min, max, material::RIGID);
+
+                if shift
+                    && window.is_key_pressed(Key::R, KeyRepeat::No)
+                    && !layout.panel_contains(sx, sy)
+                {
+                    if let Some(a) = rigid_rect_corner.take() {
+                        let mat = match interaction_mode {
+                            InteractionMode::Draw | InteractionMode::Explosion => material::RIGID,
+                            InteractionMode::RigidBody => selected,
+                        };
+                        let _ = sim.spawn_rigid_body_rect(a, world_p, mat);
+                    } else {
+                        rigid_rect_corner = Some(world_p);
+                    }
                 }
                 if window.is_key_pressed(Key::T, KeyRepeat::No) {
                     let _ = sim.spawn_rigid_body_circle(world_p, brush_radius, material::RIGID);
                 }
                 if window.is_key_pressed(Key::L, KeyRepeat::No) {
-                    let _ = sim.spawn_rigid_body_circle(world_p, brush_radius, material::LAVA);
+                    let _ = sim.spawn_rigid_body_circle_with_temp(
+                        world_p,
+                        brush_radius,
+                        material::OBSIDIAN,
+                        Some(1100),
+                    );
                 }
             }
         }
@@ -288,6 +565,12 @@ fn main() {
         if show_physics {
             draw_physics_debug(&sim, &mut frame, camera);
         }
+        if interaction_mode == InteractionMode::RigidBody {
+            draw_rigid_mode_chrome(&mut frame);
+            if !rigid_stroke.is_empty() {
+                draw_rigid_stroke_preview(&mut frame, camera, &rigid_stroke);
+            }
+        }
         render_ms = render_start.elapsed().as_secs_f32() * 1000.0;
 
         fps_frames = fps_frames.saturating_add(1);
@@ -297,7 +580,16 @@ fn main() {
             fps_frames = 0;
             fps_last = Instant::now();
         }
-        draw_ui_hint(&mut frame, selected, brush_radius);
+        draw_ui_hint(
+            &mut frame,
+            selected,
+            brush_radius,
+            interaction_mode,
+            explosion_obliterate,
+            explosion_spawn_interior,
+            explosion_edge_enabled,
+            explosion_edge_spawn.material,
+        );
         draw_fps_top_right(
             &mut frame,
             fps_display,
@@ -309,6 +601,9 @@ fn main() {
                 .then_some(sim.debug_chunk_step_stride_frames()),
         );
         draw_perf_hud(&mut frame, sim_stats, render_ms);
+
+        prev_left_down = window.get_mouse_down(MouseButton::Left);
+        prev_right_down = window.get_mouse_down(MouseButton::Right);
 
         window
             .update_with_buffer(&frame, DISP_W, DISP_H)
@@ -462,6 +757,146 @@ fn handle_material_shortcuts(window: &Window, selected: &mut MaterialId) {
     }
 }
 
+fn collect_brush_disk(into: &mut HashSet<(i32, i32)>, center: Vec2i, radius: i32) {
+    let r2 = radius * radius;
+    for y in (center.y - radius)..=(center.y + radius) {
+        for x in (center.x - radius)..=(center.x + radius) {
+            let dx = x - center.x;
+            let dy = y - center.y;
+            if dx * dx + dy * dy <= r2 {
+                into.insert((x, y));
+            }
+        }
+    }
+}
+
+fn collect_line_brush(into: &mut HashSet<(i32, i32)>, a: Vec2i, b: Vec2i, radius: i32) {
+    for p in bresenham::bresenham_line(a, b) {
+        collect_brush_disk(into, p, radius);
+    }
+}
+
+/// Orange frame so rigid mode is obvious even before the first drag.
+fn draw_rigid_mode_chrome(frame: &mut [u32]) {
+    let th = (2 * SCALE).max(3);
+    let c = 0xFFFF9800;
+    let w = DISP_W;
+    let h = DISP_H;
+    for t in 0..th {
+        for x in 0..w {
+            frame[t * DISP_W + x] = c;
+            frame[(h - 1 - t) * DISP_W + x] = c;
+        }
+    }
+    for t in 0..th {
+        for y in 0..h {
+            frame[y * DISP_W + t] = c;
+            frame[y * DISP_W + (w - 1 - t)] = c;
+        }
+    }
+}
+
+/// 5×7 pixel font (bit 4 = left column). Used for sandbox HUD labels.
+fn glyph_5x7_rows(c: u8) -> Option<[u8; 7]> {
+    let c = c.to_ascii_uppercase();
+    Some(match c {
+        b'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+        b'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+        b'D' => [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C],
+        b'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        b'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        b'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E],
+        b'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        b'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        b'J' => [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C],
+        b'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        b'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        b'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+        b'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        b'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        b'Q' => [0x0E, 0x11, 0x11, 0x15, 0x13, 0x12, 0x0D],
+        b'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        b'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        b'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11],
+        b'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        b'Y' => [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+        b'Z' => [0x1F, 0x02, 0x04, 0x08, 0x10, 0x10, 0x1F],
+        _ => return None,
+    })
+}
+
+fn text_width_5x7(s: &str, ps: usize) -> usize {
+    let mut w = 0usize;
+    for b in s.bytes() {
+        if b == b' ' {
+            w += 3 * ps;
+        } else if glyph_5x7_rows(b).is_some() {
+            w += 6 * ps;
+        }
+    }
+    w
+}
+
+fn draw_str_5x7(frame: &mut [u32], s: &str, mut x: usize, y: usize, color: u32, ps: usize) {
+    for b in s.bytes() {
+        if b == b' ' {
+            x += 3 * ps;
+            continue;
+        }
+        let Some(rows) = glyph_5x7_rows(b) else {
+            continue;
+        };
+        for (row, bits) in rows.iter().enumerate() {
+            for col in 0..5 {
+                if (bits >> (4 - col)) & 1 == 0 {
+                    continue;
+                }
+                for dy in 0..ps {
+                    for dx in 0..ps {
+                        let px = x + col * ps + dx;
+                        let py = y + row * ps + dy;
+                        if px < DISP_W && py < DISP_H {
+                            frame[py * DISP_W + px] = color;
+                        }
+                    }
+                }
+            }
+        }
+        x += 6 * ps;
+    }
+}
+
+fn draw_rigid_stroke_preview(frame: &mut [u32], camera: Vec2i, stroke: &HashSet<(i32, i32)>) {
+    let hi = 0xCCFFEB3B;
+    for &(wx, wy) in stroke {
+        let sx = wx - camera.x;
+        let sy = wy - camera.y;
+        if sx < 0
+            || sy < 0
+            || sx >= SIM_WIDTH as i32
+            || sy >= SIM_HEIGHT as i32
+        {
+            continue;
+        }
+        let px = sx as usize * SCALE;
+        let py = sy as usize * SCALE;
+        for oy in 0..SCALE {
+            for ox in 0..SCALE {
+                let pxx = px + ox;
+                let pyy = py + oy;
+                if pxx < DISP_W && pyy < DISP_H {
+                    frame[pyy * DISP_W + pxx] = hi;
+                }
+            }
+        }
+    }
+}
+
 fn handle_brush_shortcuts(window: &Window, brush_radius: &mut i32) {
     if window.is_key_pressed(Key::LeftBracket, KeyRepeat::Yes) {
         *brush_radius = (*brush_radius - 1).max(1);
@@ -471,7 +906,16 @@ fn handle_brush_shortcuts(window: &Window, brush_radius: &mut i32) {
     }
 }
 
-fn draw_ui_hint(frame: &mut [u32], material: MaterialId, brush_radius: i32) {
+fn draw_ui_hint(
+    frame: &mut [u32],
+    material: MaterialId,
+    brush_radius: i32,
+    mode: InteractionMode,
+    explosion_obliterate: bool,
+    explosion_spawn_interior: bool,
+    explosion_edge_enabled: bool,
+    explosion_edge_material: MaterialId,
+) {
     let layout = PaletteLayout::new();
     draw_panel(
         frame,
@@ -479,50 +923,244 @@ fn draw_ui_hint(frame: &mut [u32], material: MaterialId, brush_radius: i32) {
         layout.panel_y,
         layout.panel_w,
         layout.panel_h,
-        0xAA101010,
+        0xCC101018,
     );
-    draw_material_palette(frame, material);
-    draw_brush_meter(frame, brush_radius);
+    let tx = layout.panel_x + PaletteLayout::INNER;
+    let mut ty = layout.panel_y + PaletteLayout::INNER;
+    draw_str_5x7(
+        frame,
+        "CLICK A COLORED SQUARE",
+        tx,
+        ty,
+        0xFFFFFFFF,
+        1,
+    );
+    ty += PaletteLayout::LINE;
+    draw_str_5x7(
+        frame,
+        "TO CHOOSE BRUSH MATERIAL",
+        tx,
+        ty,
+        0xFFB3E5FC,
+        1,
+    );
+    draw_material_palette(frame, material, &layout, mode);
+    draw_brush_row(frame, brush_radius, &layout);
+    draw_help_lines(
+        frame,
+        &layout,
+        mode,
+        explosion_obliterate,
+        explosion_spawn_interior,
+        explosion_edge_enabled,
+        explosion_edge_material,
+    );
+    draw_mode_buttons(frame, &layout, mode);
 }
 
-fn draw_material_palette(frame: &mut [u32], selected: MaterialId) {
-    let layout = PaletteLayout::new();
-    let mut x = layout.swatch_x0;
+fn draw_help_lines(
+    frame: &mut [u32],
+    layout: &PaletteLayout,
+    mode: InteractionMode,
+    explosion_obliterate: bool,
+    explosion_spawn_interior: bool,
+    explosion_edge_enabled: bool,
+    explosion_edge_material: MaterialId,
+) {
+    let tx = layout.panel_x + PaletteLayout::INNER;
+    let mut ty = layout.panel_y + layout.help_y_off;
+    draw_str_5x7(
+        frame,
+        "SHIFT LEFT DRAG  RECT PAINT",
+        tx,
+        ty,
+        0xFFFFE082,
+        1,
+    );
+    ty += PaletteLayout::LINE;
+    draw_str_5x7(
+        frame,
+        "SHIFT RIGHT DRAG RECT ERASE",
+        tx,
+        ty,
+        0xFF90CAF9,
+        1,
+    );
+    ty += PaletteLayout::LINE;
+    draw_str_5x7(
+        frame,
+        "SHIFT R TWICE      RIGID RECT",
+        tx,
+        ty,
+        0xFFA5D6A7,
+        1,
+    );
+    ty += PaletteLayout::LINE;
+    draw_str_5x7(
+        frame,
+        "EXPLODE LMB      [] RADIUS",
+        tx,
+        ty,
+        0xFFFFAB91,
+        1,
+    );
+    ty += PaletteLayout::LINE;
+    if mode == InteractionMode::Explosion {
+        let nuke = if explosion_obliterate { "ON " } else { "OFF" };
+        let fill = if explosion_spawn_interior { "ON " } else { "OFF" };
+        let edge = if explosion_edge_enabled { "ON " } else { "OFF" };
+        let edge_name = materials::BUILTINS
+            .iter()
+            .find(|d| d.id == explosion_edge_material)
+            .map(|d| d.name)
+            .unwrap_or("?");
+        let line5 = format!("O NUKE {} I FILL {}", nuke, fill);
+        draw_str_5x7(frame, &line5, tx, ty, 0xFFFFCC80, 1);
+        ty += PaletteLayout::LINE;
+        let line6 = format!("E CAPTURE EDGE {}  SHF-E RING {}", edge_name, edge);
+        draw_str_5x7(frame, &line6, tx, ty, 0xFFFFCC80, 1);
+    } else {
+        draw_str_5x7(
+            frame,
+            "TAB CYCLE MODES",
+            tx,
+            ty,
+            0xFF9E9E9E,
+            1,
+        );
+        ty += PaletteLayout::LINE;
+        draw_str_5x7(
+            frame,
+            "EXPLODE: O I E KEYS",
+            tx,
+            ty,
+            0xFF9E9E9E,
+            1,
+        );
+    }
+}
+
+/// Three mode segments; Tab cycles Draw → Rigid → Explosion.
+fn draw_mode_buttons(frame: &mut [u32], layout: &PaletteLayout, mode: InteractionMode) {
+    let x = layout.panel_x + PaletteLayout::INNER;
+    let y = layout.panel_y + layout.mode_btn_y_off;
+    let w = layout.panel_w - 2 * PaletteLayout::INNER;
+    let h = layout.mode_btn_h;
+    let tw = w / 3;
+    let seg = [
+        (InteractionMode::Draw, 0xFF2E7D32, 0xFF37474F),
+        (InteractionMode::RigidBody, 0xFFE65100, 0xFF37474F),
+        (InteractionMode::Explosion, 0xFF6D1B7B, 0xFF37474F),
+    ];
+    for (i, (m, on_c, off_c)) in seg.iter().enumerate() {
+        let x0 = x + i * tw;
+        let on = mode == *m;
+        draw_panel(frame, x0, y, tw, h, if on { *on_c } else { *off_c });
+        let border = if on { 0xFFFFFFFF } else { 0xFF888888 };
+        draw_rect_outline(frame, x0, y, tw, h, border);
+    }
+
+    let ty = y + 3 * SCALE;
+    let labels = [["DRAW", "PAINT"], ["RIGID", "REL."], ["BLAST", "LMB"]];
+    let subcols = [0xFFC8E6C9u32, 0xFFFFE0B2u32, 0xFFE1BEE7u32];
+    for i in 0..3 {
+        let cxi = x + i * tw + tw / 2;
+        for li in 0..2 {
+            let s = labels[i][li];
+            let col = if li == 0 { 0xFFFFFFFFu32 } else { subcols[i] };
+            let sw = text_width_5x7(s, 1);
+            draw_str_5x7(
+                frame,
+                s,
+                cxi.saturating_sub(sw / 2),
+                ty + li * 9,
+                col,
+                1,
+            );
+        }
+    }
+}
+
+fn draw_material_palette(
+    frame: &mut [u32],
+    selected: MaterialId,
+    layout: &PaletteLayout,
+    mode: InteractionMode,
+) {
+    let mut x = layout.swatch_base_x();
+    let sy = layout.swatch_base_y();
     for (idx, def) in materials::BUILTINS.iter().enumerate() {
-        let color = def.color_argb;
-        draw_panel(frame, x, layout.swatch_y, layout.swatch_w, layout.swatch_h, color);
-        if def.id == selected {
-            draw_rect_outline(frame, x - SCALE, 7 * SCALE, 14 * SCALE, 16 * SCALE, 0xFFFFFFFF);
+        let disabled = mode == InteractionMode::RigidBody && !is_rigid_body_eligible(def);
+        let color = if disabled {
+            dim_argb(def.color_argb)
+        } else {
+            def.color_argb
+        };
+        draw_panel(frame, x, sy, layout.swatch_w, layout.swatch_h, color);
+        if def.id == selected && !disabled {
+            draw_rect_outline(
+                frame,
+                x.saturating_sub(SCALE),
+                sy.saturating_sub(SCALE),
+                layout.swatch_w + 2 * SCALE,
+                layout.swatch_h + 2 * SCALE,
+                0xFFFFFFFF,
+            );
         }
         if idx < 10 {
-            draw_digit(frame, idx as u8, x + 3 * SCALE, 10 * SCALE, 0xFF000000);
+            draw_digit(
+                frame,
+                idx as u8,
+                x + 3 * SCALE,
+                sy + 10 * SCALE,
+                if disabled { 0xFF444444 } else { 0xFF000000 },
+            );
         }
         x += layout.stride;
     }
 }
 
-fn draw_brush_meter(frame: &mut [u32], brush_radius: i32) {
-    let layout = PaletteLayout::new();
-    let meter_x = layout.swatch_x0 + layout.count * layout.stride + 4 * SCALE;
-    let meter_y = 10 * SCALE;
-    let w = 56 * SCALE;
-    let fill = ((brush_radius.clamp(1, 32) as usize) * w) / 32;
-    draw_rect_outline(frame, meter_x, meter_y, w, 8 * SCALE, 0xFFFFFFFF);
+fn dim_argb(c: u32) -> u32 {
+    let a = c & 0xFF000000;
+    let r = ((c >> 16) & 0xFF) / 4;
+    let g = ((c >> 8) & 0xFF) / 4;
+    let b = (c & 0xFF) / 4;
+    a | (r << 16) | (g << 8) | b
+}
+
+fn draw_brush_row(frame: &mut [u32], brush_radius: i32, layout: &PaletteLayout) {
+    let y = layout.brush_row_y();
+    let tx = layout.swatch_base_x();
+    draw_str_5x7(frame, "BRUSH SIZE", tx, y + 2, 0xFFFFD166, 1);
+
+    let meter_w = 48 * SCALE;
+    let meter_x = layout.panel_x + layout.panel_w - PaletteLayout::INNER - meter_w - 14 * SCALE;
+    let bracket_lbl = "BRACKET KEYS";
+    let lx = meter_x.saturating_sub(text_width_5x7(bracket_lbl, 1) + 6);
+    draw_str_5x7(frame, bracket_lbl, lx, y + 2, 0xFF9E9E9E, 1);
+    let fill = ((brush_radius.clamp(1, 32) as usize) * meter_w) / 32;
+    draw_rect_outline(frame, meter_x, y, meter_w, 8 * SCALE, 0xFFFFFFFF);
     draw_panel(
         frame,
         meter_x + SCALE,
-        meter_y + SCALE,
+        y + SCALE,
         fill.saturating_sub(2 * SCALE),
         6 * SCALE,
         0xFFFFD166,
     );
-
     let tens = ((brush_radius / 10) % 10).max(0) as u8;
     let ones = (brush_radius % 10).max(0) as u8;
+    let num_x = meter_x + meter_w + 4 * SCALE;
     if brush_radius >= 10 {
-        draw_digit(frame, tens, meter_x + w + 6 * SCALE, meter_y + SCALE, 0xFFFFFFFF);
+        draw_digit(frame, tens, num_x, y + 2 * SCALE, 0xFFFFFFFF);
     }
-    draw_digit(frame, ones, meter_x + w + 10 * SCALE, meter_y + SCALE, 0xFFFFFFFF);
+    draw_digit(
+        frame,
+        ones,
+        num_x + if brush_radius >= 10 { 4 * SCALE } else { 0 },
+        y + 2 * SCALE,
+        0xFFFFFFFF,
+    );
 }
 
 fn draw_panel(frame: &mut [u32], x: usize, y: usize, w: usize, h: usize, color: u32) {
