@@ -26,7 +26,11 @@ pub fn get_dirty_chunks(world: &World) -> Vec<DirtyChunkView> {
         .collect()
 }
 
-pub fn copy_rgba_for_region(world: &World, rigid: Option<&RigidBridge>, rect: RectI) -> PixelRegion {
+pub fn copy_rgba_for_region(
+    world: &World,
+    rigid: Option<&RigidBridge>,
+    rect: RectI,
+) -> PixelRegion {
     let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
     let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
     let mut rgba = Vec::with_capacity(width * height * 4);
@@ -40,7 +44,11 @@ pub fn copy_rgba_for_region(world: &World, rigid: Option<&RigidBridge>, rect: Re
     if let Some(r) = rigid {
         apply_rigid_morph_overlays_rgba(world, r, rect, &mut rgba, width);
     }
-    PixelRegion { width, height, rgba }
+    PixelRegion {
+        width,
+        height,
+        rgba,
+    }
 }
 
 fn apply_rigid_morph_overlays_rgba(
@@ -154,7 +162,10 @@ fn draw_chunk_outline_on_buf(
     }
     for y in y_lo..=y_hi {
         for x in x_lo..=x_hi {
-            let edge = x < chunk.min.x + t || x > chunk.max.x - t || y < chunk.min.y + t || y > chunk.max.y - t;
+            let edge = x < chunk.min.x + t
+                || x > chunk.max.x - t
+                || y < chunk.min.y + t
+                || y > chunk.max.y - t;
             if !edge {
                 continue;
             }
@@ -251,7 +262,8 @@ pub fn copy_palette_indices_for_region(world: &World, rect: RectI) -> Vec<u16> {
 fn cell_to_rgba(cell: Cell, x: i32, y: i32) -> [u8; 4] {
     let temp = cell.temperature();
     if (cell.material() == material::PLANT || cell.material() == material::WOOD)
-        && temp >= 250 && cell.lifetime() > 0
+        && temp >= 523
+        && cell.lifetime() > 0
     {
         burning_vegetation_rgba(cell.lifetime(), x, y)
     } else {
@@ -272,8 +284,8 @@ fn cell_to_rgba(cell: Cell, x: i32, y: i32) -> [u8; 4] {
                 v
             }
         };
-        if temp > 200 && cell.material() != material::FIRE && cell.material() != material::LAVA {
-            let glow = ((temp as u32 - 200).min(800) * 255 / 800) as u8;
+        if temp > 800 && cell.material() != material::FIRE && cell.material() != material::LAVA {
+            let glow = ((temp as u32 - 800).min(1200) * 255 / 1200) as u8;
             r = r.saturating_add(glow);
             g = g.saturating_add(glow / 3);
         }
@@ -407,7 +419,8 @@ fn steam_rgba(life: u8, x: i32, y: i32) -> [u8; 4] {
 }
 
 fn simple_hash(x: i32, y: i32, z: i32) -> u32 {
-    let mut h = (x as u32).wrapping_mul(374761393)
+    let mut h = (x as u32)
+        .wrapping_mul(374761393)
         .wrapping_add((y as u32).wrapping_mul(668265263))
         .wrapping_add((z as u32).wrapping_mul(2147483647));
     h = (h ^ (h >> 13)).wrapping_mul(1274126177);
@@ -427,7 +440,12 @@ fn cell_to_debug_rgba(cell: Cell, x: i32, y: i32, pass: u8) -> [u8; 4] {
         _ => [80, 80, 80],
     };
     let blend = |b: u8, t: u8| -> u8 { ((b as u16 + t as u16) / 2) as u8 };
-    [blend(base[0], tint[0]), blend(base[1], tint[1]), blend(base[2], tint[2]), base[3]]
+    [
+        blend(base[0], tint[0]),
+        blend(base[1], tint[1]),
+        blend(base[2], tint[2]),
+        base[3],
+    ]
 }
 
 fn cell_to_debug_argb32(cell: Cell, x: i32, y: i32, pass: u8) -> u32 {

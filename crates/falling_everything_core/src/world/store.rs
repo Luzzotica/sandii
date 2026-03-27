@@ -122,7 +122,12 @@ impl DenseCellStore {
     /// Move the grid to a new origin+size, preserving cells in the overlapping region.
     /// Non-overlapping cells are zeroed. Returns the old read buffer and old (origin, w, h)
     /// so the caller can extract outgoing chunk data.
-    pub fn relocate(&mut self, new_origin: Vec2i, new_w: i32, new_h: i32) -> (Vec<Cell>, Vec2i, i32, i32) {
+    pub fn relocate(
+        &mut self,
+        new_origin: Vec2i,
+        new_w: i32,
+        new_h: i32,
+    ) -> (Vec<Cell>, Vec2i, i32, i32) {
         let old_origin = self.origin;
         let old_w = self.width;
         let old_h = self.height;
@@ -139,8 +144,10 @@ impl DenseCellStore {
         if overlap_min_x <= overlap_max_x && overlap_min_y <= overlap_max_y {
             let row_len = (overlap_max_x - overlap_min_x + 1) as usize;
             for y in overlap_min_y..=overlap_max_y {
-                let old_start = ((y - old_origin.y) * old_w + (overlap_min_x - old_origin.x)) as usize;
-                let new_start = ((y - new_origin.y) * new_w + (overlap_min_x - new_origin.x)) as usize;
+                let old_start =
+                    ((y - old_origin.y) * old_w + (overlap_min_x - old_origin.x)) as usize;
+                let new_start =
+                    ((y - new_origin.y) * new_w + (overlap_min_x - new_origin.x)) as usize;
                 new_grid[new_start..new_start + row_len]
                     .copy_from_slice(&old_read[old_start..old_start + row_len]);
             }
@@ -294,7 +301,10 @@ impl SpatialHashChunkStore {
         let cy = super::div_floor(p.y, CHUNK_SIZE);
         let lx = p.x - cx * CHUNK_SIZE;
         let ly = p.y - cy * CHUNK_SIZE;
-        (ChunkCoord { x: cx, y: cy }, super::chunk_local_index(lx, ly))
+        (
+            ChunkCoord { x: cx, y: cy },
+            super::chunk_local_index(lx, ly),
+        )
     }
 }
 

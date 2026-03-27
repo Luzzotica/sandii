@@ -64,7 +64,7 @@ pub fn generate_terrain(config: &TerrainConfig) -> Vec<TerrainColumn> {
             } else if y < dirt_bottom {
                 material::DIRT
             } else {
-                material::STATIC
+                material::STONE
             };
             cells.push((y, mat));
         }
@@ -80,10 +80,7 @@ pub fn paint_terrain(sim: &mut crate::Simulation, config: &TerrainConfig) {
     let columns = generate_terrain(config);
     for col in &columns {
         for &(y, mat) in &col.cells {
-            sim.paint_cell(
-                Vec2i::new(col.x, y),
-                Cell::new().with_material(mat),
-            );
+            sim.paint_cell(Vec2i::new(col.x, y), Cell::new().with_material(mat));
         }
     }
 }

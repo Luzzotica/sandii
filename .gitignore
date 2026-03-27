@@ -1,5 +1,7 @@
 # Rust / Cargo
 /target/
+crates/sandii_web/dist/
+crates/sandii_web/pkg/
 **/*.rs.bk
 *.pdb
 

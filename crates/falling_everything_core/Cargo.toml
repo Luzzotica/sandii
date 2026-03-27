@@ -3,11 +3,20 @@ name = "falling_everything_core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["parallel"]
+# Chunk stepping across threads (native). Disabled for wasm builds.
+parallel = ["dep:rayon"]
+
 [dependencies]
+web-time = "1.1"
 bincode = "1"
 nalgebra = "0.33"
 rand = { version = "0.8", features = ["small_rng"] }
 rapier2d = "0.23"
-rayon = "1"
+rayon = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

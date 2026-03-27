@@ -6,11 +6,12 @@ use rand::Rng;
 use rapier2d::prelude::*;
 
 use crate::world::cell_flags;
-use crate::world::{material, Cell, ChunkCoord, MaterialId, RectI, Vec2i, World, CHUNK_SIZE};
+use crate::world::{
+    material, Cell, ChunkCoord, MaterialId, Phase, RectI, Vec2i, World, CHUNK_SIZE,
+};
 
-/// Extra radius (world units = grid pixels) for [`RigidBridge::spawn_from_circle_with_temp`] ball colliders
-/// so the continuous circle encloses the discrete filled disk; avoids spurious inert overlap / anchor carve on contact.
-const BALL_COLLIDER_RADIUS_PIXEL_PAD: f32 = 1.0;
+/// Extra radius (world units = grid pixels) for [`RigidBridge::spawn_from_circle_with_temp`] ball colliders.
+const BALL_COLLIDER_RADIUS_PIXEL_PAD: f32 = 0.0;
 
 fn rigid_body_cell_at_spawn(
     world: &World,
@@ -71,6 +72,8 @@ pub struct RigidBridge {
     static_body_handle: RigidBodyHandle,
     static_chunk_colliders: HashMap<ChunkCoord, Vec<ColliderHandle>>,
     static_chunk_hashes: HashMap<ChunkCoord, u64>,
+    /// Fixed walls just outside the playable [`RectI`] (see [`Self::set_world_border_colliders`]).
+    world_border_colliders: Vec<ColliderHandle>,
 }
 
 /// Impact stress (linear speed + angular term) at which a rigid pixel with
@@ -101,7 +104,56 @@ impl RigidBridge {
             static_body_handle,
             static_chunk_colliders: HashMap::new(),
             static_chunk_hashes: HashMap::new(),
+            world_border_colliders: Vec::new(),
         }
+    }
+
+    pub fn remove_world_border_colliders(&mut self) {
+        for h in self.world_border_colliders.drain(..) {
+            self.colliders
+                .remove(h, &mut self.islands, &mut self.bodies, true);
+        }
+    }
+
+    /// Four axis-aligned boxes **outside** the map edge pixels.
+    ///
+    /// Each cell `(ix, iy)` is treated as a unit square centered on the integer: x ∈ [ix−½, ix+½],
+    /// y ∈ [iy−½, iy+½]. Walls sit flush on the **outer** faces at ±½ past the min/max indices,
+    /// so there is no gap for rigid bodies to slip through (unlike placing walls at ±½ from the
+    /// min/max indices, which leaves holes on the bottom and right).
+    pub fn set_world_border_colliders(&mut self, bounds: RectI) {
+        self.remove_world_border_colliders();
+
+        let min_x = bounds.min.x as f32;
+        let max_x = bounds.max.x as f32;
+        let min_y = bounds.min.y as f32;
+        let max_y = bounds.max.y as f32;
+        let w = max_x - min_x + 1.0;
+        let h = max_y - min_y + 1.0;
+        let cx = (min_x + max_x) * 0.5;
+        let cy = (min_y + max_y) * 0.5;
+        let t = 0.5_f32;
+
+        let mut push_wall = |tx: f32, ty: f32, hx: f32, hy: f32| {
+            let collider = ColliderBuilder::cuboid(hx, hy)
+                .translation(vector![tx, ty])
+                .friction(0.5)
+                .restitution(0.0)
+                .build();
+            let handle = self.colliders.insert_with_parent(
+                collider,
+                self.static_body_handle,
+                &mut self.bodies,
+            );
+            self.world_border_colliders.push(handle);
+        };
+
+        // Left / right: inner vertical faces at min_x − ½ and max_x + ½.
+        push_wall(min_x - 1.0, cy, t, h * 0.5);
+        push_wall(max_x + 1.0, cy, t, h * 0.5);
+        // Top / bottom: inner horizontal faces at min_y − ½ and max_y + ½.
+        push_wall(cx, min_y - 1.0, w * 0.5, t);
+        push_wall(cx, max_y + 1.0, w * 0.5, t);
     }
 
     pub fn spawn_from_world_rect(&mut self, world: &mut World, spec: RigidBodySpec) -> u32 {
@@ -144,7 +196,13 @@ impl RigidBridge {
         let mut rng = rand::thread_rng();
         let mut anchors = Vec::new();
         for &p in positions {
-            let cell = rigid_body_cell_at_spawn(world, p, material_id, rng.gen_range(0..=40), temp_override);
+            let cell = rigid_body_cell_at_spawn(
+                world,
+                p,
+                material_id,
+                rng.gen_range(0..=40),
+                temp_override,
+            );
             world.set_cell(p, cell);
             world.set_rigid_id(p, id);
             anchors.push(PixelAnchor {
@@ -170,8 +228,15 @@ impl RigidBridge {
             &local_positions,
         );
 
-        self.bodies_by_id
-            .insert(id, PixelRigidBody { id, anchors, handle, needs_collider_refresh: false });
+        self.bodies_by_id.insert(
+            id,
+            PixelRigidBody {
+                id,
+                anchors,
+                handle,
+                needs_collider_refresh: false,
+            },
+        );
         id
     }
 
@@ -207,7 +272,13 @@ impl RigidBridge {
         let mut rng = rand::thread_rng();
         let mut anchors = Vec::new();
         for &p in positions {
-            let cell = rigid_body_cell_at_spawn(world, p, material_id, rng.gen_range(0..=40), temp_override);
+            let cell = rigid_body_cell_at_spawn(
+                world,
+                p,
+                material_id,
+                rng.gen_range(0..=40),
+                temp_override,
+            );
             world.set_cell(p, cell);
             world.set_rigid_id(p, id);
             anchors.push(PixelAnchor {
@@ -229,8 +300,15 @@ impl RigidBridge {
         self.colliders
             .insert_with_parent(collider, handle, &mut self.bodies);
 
-        self.bodies_by_id
-            .insert(id, PixelRigidBody { id, anchors, handle, needs_collider_refresh: false });
+        self.bodies_by_id.insert(
+            id,
+            PixelRigidBody {
+                id,
+                anchors,
+                handle,
+                needs_collider_refresh: false,
+            },
+        );
         id
     }
 
@@ -274,13 +352,21 @@ impl RigidBridge {
             &local_positions,
         );
 
-        self.bodies_by_id
-            .insert(id, PixelRigidBody { id, anchors, handle, needs_collider_refresh: false });
+        self.bodies_by_id.insert(
+            id,
+            PixelRigidBody {
+                id,
+                anchors,
+                handle,
+                needs_collider_refresh: false,
+            },
+        );
         id
     }
 
     /// Record each body's current world-pixel positions (pre-physics).
-    /// Anchor-rounded pixels get [`cell_flags::RIGID_PIXEL`] and `rigid_id`.
+    /// Anchor-rounded pixels get [`cell_flags::RIGID_PIXEL`] and `rigid_id` (solids only: melted
+    /// liquids/gases must simulate as loose fluid, not skip motion in [`crate::sim::step_pixel`]).
     /// Morphological hole-fill is render-only (see [`Self::collect_visual_morph_overlay_tiles`]).
     pub fn record_positions(&mut self, world: &mut World) {
         for rigid in self.bodies_by_id.values() {
@@ -303,7 +389,10 @@ impl RigidBridge {
                 }
                 let logical = cell_map[&(*x, *y)];
                 let mut cell = logical;
-                cell.or_flags(cell_flags::RIGID_PIXEL);
+                let props = world.material_props(cell.material());
+                if props.phase() == Phase::Solid {
+                    cell.or_flags(cell_flags::RIGID_PIXEL);
+                }
                 world.set_cell(wp, cell);
                 world.set_rigid_id(wp, rigid.id);
             }
@@ -331,7 +420,9 @@ impl RigidBridge {
             let angle = body.rotation().angle();
             let cos_a = angle.cos();
             let sin_a = angle.sin();
-            for ((kx, ky), mut cell) in compute_morph_fill_cells(&rigid.anchors, pos.x, pos.y, cos_a, sin_a) {
+            for ((kx, ky), mut cell) in
+                compute_morph_fill_cells(&rigid.anchors, pos.x, pos.y, cos_a, sin_a)
+            {
                 let p = Vec2i::new(kx, ky);
                 if !rect.contains(p) {
                     continue;
@@ -367,7 +458,11 @@ impl RigidBridge {
     /// Drop anchors whose rounded world position matches a painted cell. Call after user paint
     /// (`World::set_cell` clears `rigid_id`) so dynamic colliders match the grid. Does not run for
     /// terrain collision — see [`Self::sync_pixels_to_physics`] inert branch.
-    pub fn carve_dynamic_bodies_at_world_cells(&mut self, world: &mut World, hits: &[(Vec2i, u32)]) {
+    pub fn carve_dynamic_bodies_at_world_cells(
+        &mut self,
+        world: &mut World,
+        hits: &[(Vec2i, u32)],
+    ) {
         if hits.is_empty() {
             return;
         }
@@ -412,10 +507,7 @@ impl RigidBridge {
 
     /// After the physics step, diff old vs new positions for each body.
     /// Clear cells the body is leaving; place pixels where it is entering.
-    pub fn sync_pixels_to_physics(
-        &mut self,
-        world: &mut World,
-    ) {
+    pub fn sync_pixels_to_physics(&mut self, world: &mut World) {
         let mut drag_list: Vec<(RigidBodyHandle, u32)> = Vec::new();
 
         // Pull sim results (lifetime, lava→sand, etc.) into anchors before we write back.
@@ -564,7 +656,11 @@ impl RigidBridge {
         for (_handle, collider) in self.colliders.iter() {
             let (tx, ty, angle) = if let Some(parent_handle) = collider.parent() {
                 if let Some(body) = self.bodies.get(parent_handle) {
-                    (body.translation().x, body.translation().y, body.rotation().angle())
+                    (
+                        body.translation().x,
+                        body.translation().y,
+                        body.rotation().angle(),
+                    )
                 } else {
                     continue;
                 }
@@ -575,9 +671,10 @@ impl RigidBridge {
             let cos_a = angle.cos();
             let sin_a = angle.sin();
 
-            let col_rel = collider.position_wrt_parent().map(|iso| {
-                (iso.translation.x, iso.translation.y, iso.rotation.angle())
-            }).unwrap_or((0.0, 0.0, 0.0));
+            let col_rel = collider
+                .position_wrt_parent()
+                .map(|iso| (iso.translation.x, iso.translation.y, iso.rotation.angle()))
+                .unwrap_or((0.0, 0.0, 0.0));
 
             let to_world = |lx: f32, ly: f32| -> (f32, f32) {
                 let cos_c = col_rel.2.cos();
@@ -628,7 +725,10 @@ impl RigidBridge {
                 ids_to_remove.push(*id);
                 continue;
             };
-            let center = Vec2i::new(body.translation().x.round() as i32, body.translation().y.round() as i32);
+            let center = Vec2i::new(
+                body.translation().x.round() as i32,
+                body.translation().y.round() as i32,
+            );
             if !bounds.contains(center) {
                 ids_to_remove.push(*id);
             }
@@ -656,7 +756,12 @@ impl RigidBridge {
             .static_chunk_colliders
             .keys()
             .copied()
-            .filter(|c| c.x < bounds_min_cx || c.x > bounds_max_cx || c.y < bounds_min_cy || c.y > bounds_max_cy)
+            .filter(|c| {
+                c.x < bounds_min_cx
+                    || c.x > bounds_max_cx
+                    || c.y < bounds_min_cy
+                    || c.y > bounds_max_cy
+            })
             .collect();
         for coord in stale {
             self.remove_static_chunk(coord);
@@ -670,6 +775,10 @@ impl RigidBridge {
             let bounds = world.bounds_for_chunk(coord);
             let info = analyze_inert_cells(world, &bounds);
 
+            if self.static_chunk_hashes.get(&coord) == Some(&info.hash) {
+                continue;
+            }
+
             self.remove_static_chunk(coord);
             self.static_chunk_hashes.insert(coord, info.hash);
 
@@ -677,21 +786,13 @@ impl RigidBridge {
                 continue;
             }
 
-            let mut handles = Vec::new();
-            let rects = build_run_rectangles(world, &bounds);
-            for (cx, cy, hw, hh) in rects {
-                let collider = ColliderBuilder::cuboid(hw, hh)
-                    .translation(vector![cx, cy])
-                    .friction(0.5)
-                    .restitution(0.0)
-                    .build();
-                let handle = self.colliders.insert_with_parent(
-                    collider,
-                    self.static_body_handle,
-                    &mut self.bodies,
-                );
-                handles.push(handle);
-            }
+            let positions = collect_static_positions(world, &bounds);
+            let handles = build_static_triangle_colliders(
+                &mut self.colliders,
+                &mut self.bodies,
+                self.static_body_handle,
+                &positions,
+            );
 
             if !handles.is_empty() {
                 self.static_chunk_colliders.insert(coord, handles);
@@ -702,7 +803,8 @@ impl RigidBridge {
     fn remove_static_chunk(&mut self, coord: ChunkCoord) {
         if let Some(handles) = self.static_chunk_colliders.remove(&coord) {
             for h in handles {
-                self.colliders.remove(h, &mut self.islands, &mut self.bodies, true);
+                self.colliders
+                    .remove(h, &mut self.islands, &mut self.bodies, true);
             }
         }
         self.static_chunk_hashes.remove(&coord);
@@ -736,7 +838,13 @@ impl RigidBridge {
         let ids: Vec<u32> = self
             .bodies_by_id
             .iter()
-            .filter_map(|(&id, rb)| if rb.needs_collider_refresh { Some(id) } else { None })
+            .filter_map(|(&id, rb)| {
+                if rb.needs_collider_refresh {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
             .collect();
 
         for id in ids {
@@ -756,7 +864,8 @@ impl RigidBridge {
                 .map(|b| b.colliders().to_vec())
                 .unwrap_or_default();
             for ch in attached {
-                self.colliders.remove(ch, &mut self.islands, &mut self.bodies, true);
+                self.colliders
+                    .remove(ch, &mut self.islands, &mut self.bodies, true);
             }
 
             let local_positions: Vec<(i32, i32)> = rigid
@@ -959,13 +1068,14 @@ fn build_and_insert_dynamic_pixel_colliders(
     handle: RigidBodyHandle,
     local_positions: &[(i32, i32)],
 ) {
-    let mut inserted_triangle = false;
+    let mut inserted = false;
     let contours = marching_squares_contours(local_positions);
     for contour in &contours {
         if contour.len() < 3 {
             continue;
         }
-        let simplified = simplify_douglas_peucker(contour, 0.5);
+        let eps = simplify_epsilon_for_contour(contour.len());
+        let simplified = simplify_douglas_peucker(contour, eps);
         if polygon_area(&simplified) <= 0.0 {
             continue;
         }
@@ -977,11 +1087,11 @@ fn build_and_insert_dynamic_pixel_colliders(
                 .restitution(0.2)
                 .build();
             colliders.insert_with_parent(collider, handle, bodies);
-            inserted_triangle = true;
+            inserted = true;
         }
     }
 
-    if inserted_triangle || local_positions.is_empty() {
+    if inserted || local_positions.is_empty() {
         return;
     }
 
@@ -1067,15 +1177,15 @@ fn marching_squares_contours(local_positions: &[(i32, i32)]) -> Vec<Vec<(f32, f3
             // of travel in screen coords (Y-down), producing CCW / positive-area
             // outer boundaries and CW / negative-area holes.
             let pairs: &[(u8, u8)] = match case {
-                1  => &[(3, 2)],
-                2  => &[(2, 1)],
-                3  => &[(3, 1)],
-                4  => &[(1, 0)],
-                5  => &[(3, 0), (1, 2)], // saddle: TL+BR
-                6  => &[(2, 0)],
-                7  => &[(3, 0)],
-                8  => &[(0, 3)],
-                9  => &[(0, 2)],
+                1 => &[(3, 2)],
+                2 => &[(2, 1)],
+                3 => &[(3, 1)],
+                4 => &[(1, 0)],
+                5 => &[(3, 0), (1, 2)], // saddle: TL+BR
+                6 => &[(2, 0)],
+                7 => &[(3, 0)],
+                8 => &[(0, 3)],
+                9 => &[(0, 2)],
                 10 => &[(0, 1), (2, 3)], // saddle: TR+BL
                 11 => &[(0, 1)],
                 12 => &[(1, 3)],
@@ -1085,22 +1195,29 @@ fn marching_squares_contours(local_positions: &[(i32, i32)]) -> Vec<Vec<(f32, f3
             };
 
             for &(entry_side, exit_side) in pairs {
-                let from = EdgeKey { cell: ci, side: entry_side };
+                let from = EdgeKey {
+                    cell: ci,
+                    side: entry_side,
+                };
                 // The neighbor sharing this edge
                 let to = match exit_side {
-                    0 => { // top edge → neighbor above enters from bottom
+                    0 => {
+                        // top edge → neighbor above enters from bottom
                         let nci = (((cy - 1) - min_y) as usize) * w + ((cx - min_x) as usize);
                         EdgeKey { cell: nci, side: 2 }
                     }
-                    1 => { // right edge → neighbor right enters from left
+                    1 => {
+                        // right edge → neighbor right enters from left
                         let nci = ((cy - min_y) as usize) * w + (((cx + 1) - min_x) as usize);
                         EdgeKey { cell: nci, side: 3 }
                     }
-                    2 => { // bottom edge → neighbor below enters from top
+                    2 => {
+                        // bottom edge → neighbor below enters from top
                         let nci = (((cy + 1) - min_y) as usize) * w + ((cx - min_x) as usize);
                         EdgeKey { cell: nci, side: 0 }
                     }
-                    3 => { // left edge → neighbor left enters from right
+                    3 => {
+                        // left edge → neighbor left enters from right
                         let nci = ((cy - min_y) as usize) * w + (((cx - 1) - min_x) as usize);
                         EdgeKey { cell: nci, side: 1 }
                     }
@@ -1156,6 +1273,11 @@ fn polygon_area(polygon: &[(f32, f32)]) -> f32 {
         area -= polygon[j].0 * polygon[i].1;
     }
     area * 0.5
+}
+
+fn simplify_epsilon_for_contour(contour_len: usize) -> f32 {
+    let len = contour_len as f32;
+    (len / 1600.0).max(0.5)
 }
 
 fn simplify_douglas_peucker(points: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
@@ -1296,7 +1418,10 @@ fn analyze_inert_cells(world: &World, bounds: &RectI) -> ChunkInertInfo {
             }
         }
     }
-    ChunkInertInfo { hash: hasher.finish(), inert_count }
+    ChunkInertInfo {
+        hash: hasher.finish(),
+        inert_count,
+    }
 }
 
 fn rotated_world_pos(tx: f32, ty: f32, cos_a: f32, sin_a: f32, local: Vec2i) -> Vec2i {
@@ -1408,7 +1533,10 @@ fn compute_morph_fill_cells(
     }
     let closed_raw = morph_close_8(&anchor_keys);
     let closed = closed_cells_reachable_from_seeds(&anchor_keys, &closed_raw);
-    let new_keys: Vec<(i32, i32)> = closed.into_iter().filter(|k| !map.contains_key(k)).collect();
+    let new_keys: Vec<(i32, i32)> = closed
+        .into_iter()
+        .filter(|k| !map.contains_key(k))
+        .collect();
     if new_keys.is_empty() {
         return Vec::new();
     }
@@ -1432,71 +1560,66 @@ fn compute_morph_fill_cells(
     out
 }
 
-/// Scan rows of a chunk for contiguous runs of inert cells and merge vertically
-/// into rectangles. Returns (center_x, center_y, half_width, half_height) for each.
-fn build_run_rectangles(world: &World, bounds: &RectI) -> Vec<(f32, f32, f32, f32)> {
-    let mut active: Vec<(i32, i32, i32)> = Vec::new(); // (start_x, end_x, start_y)
-    let mut rects = Vec::new();
-
-    // +1 extra iteration to flush remaining active runs
-    for y in bounds.min.y..=bounds.max.y + 1 {
-        let mut row_runs: Vec<(i32, i32)> = Vec::new();
-        if y <= bounds.max.y {
-            let mut run_start: Option<i32> = None;
-            for x in bounds.min.x..=bounds.max.x {
-                let solid = is_static_terrain(world, Vec2i::new(x, y));
-                if solid {
-                    if run_start.is_none() {
-                        run_start = Some(x);
-                    }
-                } else if let Some(sx) = run_start {
-                    row_runs.push((sx, x - 1));
-                    run_start = None;
-                }
-            }
-            if let Some(sx) = run_start {
-                row_runs.push((sx, bounds.max.x));
+fn collect_static_positions(world: &World, bounds: &RectI) -> Vec<(i32, i32)> {
+    let mut positions = Vec::new();
+    for y in bounds.min.y..=bounds.max.y {
+        for x in bounds.min.x..=bounds.max.x {
+            if is_static_terrain(world, Vec2i::new(x, y)) {
+                positions.push((x, y));
             }
         }
+    }
+    positions
+}
 
-        let mut matched_active = vec![false; active.len()];
-        let mut matched_row = vec![false; row_runs.len()];
-
-        for (ai, &(asx, aex, _)) in active.iter().enumerate() {
-            for (ri, &(rsx, rex)) in row_runs.iter().enumerate() {
-                if !matched_row[ri] && asx == rsx && aex == rex {
-                    matched_active[ai] = true;
-                    matched_row[ri] = true;
-                    break;
-                }
-            }
+fn build_static_triangle_colliders(
+    colliders: &mut ColliderSet,
+    bodies: &mut RigidBodySet,
+    handle: RigidBodyHandle,
+    positions: &[(i32, i32)],
+) -> Vec<ColliderHandle> {
+    let mut handles = Vec::new();
+    let contours = marching_squares_contours(positions);
+    for contour in &contours {
+        if contour.len() < 3 {
+            continue;
         }
-
-        for (ai, &(asx, aex, asy)) in active.iter().enumerate() {
-            if !matched_active[ai] {
-                let hw = (aex - asx + 1) as f32 / 2.0;
-                let hh = (y - asy) as f32 / 2.0;
-                let cx = asx as f32 + hw;
-                let cy = asy as f32 + hh;
-                rects.push((cx, cy, hw, hh));
-            }
+        let eps = simplify_epsilon_for_contour(contour.len());
+        let simplified = simplify_douglas_peucker(contour, eps);
+        if polygon_area(&simplified) <= 0.0 {
+            continue;
         }
-
-        let mut new_active: Vec<(i32, i32, i32)> = Vec::new();
-        for (ai, &run) in active.iter().enumerate() {
-            if matched_active[ai] {
-                new_active.push(run);
-            }
+        for tri in triangulate_ear_clip(&simplified) {
+            let shape = SharedShape::triangle(tri[0], tri[1], tri[2]);
+            let collider = ColliderBuilder::new(shape)
+                .friction(0.5)
+                .restitution(0.0)
+                .build();
+            let h = colliders.insert_with_parent(collider, handle, bodies);
+            handles.push(h);
         }
-        for (ri, &(rsx, rex)) in row_runs.iter().enumerate() {
-            if !matched_row[ri] {
-                new_active.push((rsx, rex, y));
-            }
-        }
-        active = new_active;
     }
 
-    rects
+    if !handles.is_empty() || positions.is_empty() {
+        return handles;
+    }
+
+    let min_x = positions.iter().map(|p| p.0).min().unwrap();
+    let max_x = positions.iter().map(|p| p.0).max().unwrap();
+    let min_y = positions.iter().map(|p| p.1).min().unwrap();
+    let max_y = positions.iter().map(|p| p.1).max().unwrap();
+    let cx = (min_x + max_x) as f32 * 0.5;
+    let cy = (min_y + max_y) as f32 * 0.5;
+    let hx = ((max_x - min_x + 1) as f32 * 0.5).max(0.25);
+    let hy = ((max_y - min_y + 1) as f32 * 0.5).max(0.25);
+    let collider = ColliderBuilder::cuboid(hx, hy)
+        .translation(vector![cx, cy])
+        .friction(0.5)
+        .restitution(0.0)
+        .build();
+    let h = colliders.insert_with_parent(collider, handle, bodies);
+    handles.push(h);
+    handles
 }
 
 fn find_empty_above(
@@ -1547,7 +1670,10 @@ mod morph_tests {
             "two separated groups should each get a boundary loop"
         );
         for l in &loops {
-            assert!(polygon_area(l) > 0.0, "outer boundary should be CCW (positive area)");
+            assert!(
+                polygon_area(l) > 0.0,
+                "outer boundary should be CCW (positive area)"
+            );
         }
     }
 

@@ -12,11 +12,16 @@ fn main() {
         sim.paint_circle(Vec2i::new(64, 18), 18, material::SAND);
         sim.paint_circle(Vec2i::new(64, 14), 16, material::LIQUID);
         sim.paint_circle(Vec2i::new(64, 50), 10, material::GAS);
-        let _rb = sim.spawn_rigid_body_rect(Vec2i::new(40, 48), Vec2i::new(80, 58), material::RIGID);
+        let _rb =
+            sim.spawn_rigid_body_rect(Vec2i::new(40, 48), Vec2i::new(80, 58), material::RIGID);
     });
     run_tier("full_churn", 600, |sim| {
         for y in (8..120).step_by(12) {
-            let mat = if y % 24 == 0 { material::SAND } else { material::LIQUID };
+            let mat = if y % 24 == 0 {
+                material::SAND
+            } else {
+                material::LIQUID
+            };
             sim.paint_circle(Vec2i::new(64, y), 20, mat);
         }
         sim.paint_circle(Vec2i::new(64, 4), 30, material::GAS);

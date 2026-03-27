@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const MATERIAL_BITS: u32 = 10;
+/// Stored cell temperature in Kelvin (0–[`MAX_TEMPERATURE`]). 12 bits covers gameplay (e.g. to ~4000 K).
 pub const TEMPERATURE_BITS: u32 = 12;
 pub const VX_BITS: u32 = 4;
 pub const VY_BITS: u32 = 4;
@@ -101,7 +102,7 @@ impl Cell {
         ((self.0 & FRAME_MASK) >> FRAME_SHIFT) as u8
     }
 
-    /// Original material stored in spare bits when a rigid body cell becomes STATIC proxy.
+    /// Original material stored in spare bits when a rigid body cell becomes STONE proxy.
     /// Returns 0 (EMPTY) for non-rigid cells.
     #[inline]
     pub const fn rigid_source_material(self) -> u16 {
@@ -119,7 +120,8 @@ impl Cell {
     #[inline]
     pub fn set_temperature(&mut self, t: u16) {
         let t = t.min(MAX_TEMPERATURE);
-        self.0 = (self.0 & !TEMPERATURE_MASK) | (((t as u64) << TEMPERATURE_SHIFT) & TEMPERATURE_MASK);
+        self.0 =
+            (self.0 & !TEMPERATURE_MASK) | (((t as u64) << TEMPERATURE_SHIFT) & TEMPERATURE_MASK);
     }
 
     #[inline]
@@ -136,7 +138,8 @@ impl Cell {
 
     #[inline]
     pub fn set_lifetime(&mut self, lifetime: u8) {
-        self.0 = (self.0 & !LIFETIME_MASK) | (((lifetime as u64) << LIFETIME_SHIFT) & LIFETIME_MASK);
+        self.0 =
+            (self.0 & !LIFETIME_MASK) | (((lifetime as u64) << LIFETIME_SHIFT) & LIFETIME_MASK);
     }
 
     #[inline]
@@ -159,7 +162,8 @@ impl Cell {
     #[inline]
     pub fn set_rigid_source_material(&mut self, id: u16) {
         debug_assert!(id <= MAX_MATERIAL_ID);
-        self.0 = (self.0 & !RIGID_SOURCE_MAT_MASK) | (((id as u64) << RIGID_SOURCE_MAT_SHIFT) & RIGID_SOURCE_MAT_MASK);
+        self.0 = (self.0 & !RIGID_SOURCE_MAT_MASK)
+            | (((id as u64) << RIGID_SOURCE_MAT_SHIFT) & RIGID_SOURCE_MAT_MASK);
     }
 
     // --- Flag helpers ---
@@ -189,8 +193,13 @@ impl Cell {
 
     #[inline]
     pub const fn with_temperature(mut self, t: u16) -> Self {
-        let t_clamped = if t > MAX_TEMPERATURE { MAX_TEMPERATURE } else { t };
-        self.0 = (self.0 & !TEMPERATURE_MASK) | (((t_clamped as u64) << TEMPERATURE_SHIFT) & TEMPERATURE_MASK);
+        let t_clamped = if t > MAX_TEMPERATURE {
+            MAX_TEMPERATURE
+        } else {
+            t
+        };
+        self.0 = (self.0 & !TEMPERATURE_MASK)
+            | (((t_clamped as u64) << TEMPERATURE_SHIFT) & TEMPERATURE_MASK);
         self
     }
 
@@ -208,7 +217,8 @@ impl Cell {
 
     #[inline]
     pub const fn with_lifetime(mut self, lifetime: u8) -> Self {
-        self.0 = (self.0 & !LIFETIME_MASK) | (((lifetime as u64) << LIFETIME_SHIFT) & LIFETIME_MASK);
+        self.0 =
+            (self.0 & !LIFETIME_MASK) | (((lifetime as u64) << LIFETIME_SHIFT) & LIFETIME_MASK);
         self
     }
 
@@ -234,7 +244,8 @@ impl Cell {
 
     #[inline]
     pub const fn with_rigid_source_material(mut self, id: u16) -> Self {
-        self.0 = (self.0 & !RIGID_SOURCE_MAT_MASK) | (((id as u64) << RIGID_SOURCE_MAT_SHIFT) & RIGID_SOURCE_MAT_MASK);
+        self.0 = (self.0 & !RIGID_SOURCE_MAT_MASK)
+            | (((id as u64) << RIGID_SOURCE_MAT_SHIFT) & RIGID_SOURCE_MAT_MASK);
         self
     }
 }
@@ -256,7 +267,17 @@ fn encode_signed_4(v: i8) -> u8 {
 
 const _: () = assert!(std::mem::size_of::<Cell>() == 8);
 const _: () = assert!(
-    MATERIAL_BITS + TEMPERATURE_BITS + VX_BITS + VY_BITS + LIFETIME_BITS + VARIANT_BITS + FLAGS_BITS + FRAME_BITS + RIGID_SOURCE_MAT_BITS + SPARE_BITS == 64
+    MATERIAL_BITS
+        + TEMPERATURE_BITS
+        + VX_BITS
+        + VY_BITS
+        + LIFETIME_BITS
+        + VARIANT_BITS
+        + FLAGS_BITS
+        + FRAME_BITS
+        + RIGID_SOURCE_MAT_BITS
+        + SPARE_BITS
+        == 64
 );
 
 #[cfg(test)]

@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+    />
+    <title>Sandii</title>
+    <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="0" />
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html,
+      body {
+        height: 100%;
+        overflow: hidden;
+        background: #111;
+        color: #eee;
+        font-family: system-ui, sans-serif;
+      }
+
+      #app {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        width: 100%;
+      }
+
+      #game-wrap {
+        flex: 1 1 0;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #000;
+        position: relative;
+      }
+      canvas {
+        display: block;
+        box-sizing: content-box;
+        border: 1px solid #666;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        touch-action: none;
+        cursor: crosshair;
+      }
+
+      #hud {
+        position: absolute;
+        top: 6px;
+        left: 8px;
+        font-size: 12px;
+        color: rgba(255, 255, 255, 0.55);
+        pointer-events: none;
+        text-shadow: 0 1px 2px #000;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 5px;
+        max-width: calc(100% - 64px);
+      }
+      .hud-pick {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.88);
+        line-height: 1.35;
+      }
+      .pick-mode {
+        color: rgba(200, 220, 255, 0.95);
+      }
+      .pick-sep {
+        color: rgba(255, 255, 255, 0.35);
+        font-weight: 400;
+        user-select: none;
+      }
+      .pick-mat {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+      .pick-swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+        flex-shrink: 0;
+      }
+      .pick-name {
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.92);
+      }
+
+      /* Share: floating button + modal */
+      #share-btn {
+        position: absolute;
+        right: 10px;
+        bottom: 10px;
+        z-index: 20;
+        width: 46px;
+        height: 46px;
+        padding: 0;
+        border: 2px solid #555;
+        border-radius: 50%;
+        background: rgba(30, 30, 30, 0.92);
+        color: #e8e8e8;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+      }
+      #share-btn:hover {
+        background: #2a2a2a;
+        border-color: #777;
+      }
+      #share-btn:active {
+        background: #333;
+      }
+      #share-btn svg {
+        width: 22px;
+        height: 22px;
+        display: block;
+      }
+
+      #share-modal-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 45;
+        background: rgba(0, 0, 0, 0.55);
+      }
+      #share-modal-backdrop.open {
+        display: block;
+      }
+
+      #share-modal {
+        position: fixed;
+        z-index: 50;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%) scale(0.96);
+        width: min(400px, calc(100vw - 24px));
+        max-height: min(85vh, 520px);
+        overflow: hidden;
+        display: none;
+        flex-direction: column;
+        background: #1a1a1a;
+        border: 1px solid #444;
+        border-radius: 14px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        opacity: 0;
+        transition:
+          transform 0.22s ease,
+          opacity 0.22s ease;
+      }
+      #share-modal.open {
+        display: flex;
+        transform: translate(-50%, -50%) scale(1);
+        opacity: 1;
+      }
+
+      #share-modal-header {
+        flex-shrink: 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 14px 14px 10px;
+        border-bottom: 1px solid #333;
+      }
+      #share-modal-header h2 {
+        font-size: 17px;
+        font-weight: 600;
+      }
+      #share-modal-close {
+        background: none;
+        border: none;
+        color: #aaa;
+        font-size: 26px;
+        line-height: 1;
+        cursor: pointer;
+        padding: 4px 10px;
+      }
+
+      #share-modal-body {
+        padding: 14px 14px 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      #share-modal-hint {
+        font-size: 12px;
+        color: #888;
+        line-height: 1.45;
+        margin-bottom: 4px;
+      }
+      .share-action {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 12px 14px;
+        border: 2px solid #555;
+        border-radius: 10px;
+        background: #252525;
+        color: #eee;
+        font: inherit;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+        text-decoration: none;
+      }
+      .share-action:hover {
+        background: #2f2f2f;
+        border-color: #666;
+      }
+      .share-action:active {
+        background: #383838;
+      }
+      .share-action--x {
+        border-color: #38444d;
+      }
+      .share-action--li {
+        border-color: #0077b5;
+        color: #8ec8f0;
+      }
+      .share-action--native {
+        border-color: #5a7a5a;
+        color: #b8d4b8;
+      }
+      .share-action[hidden] {
+        display: none !important;
+      }
+
+      /* One bar on all viewports: opens the same panel */
+      #controls-bar {
+        flex-shrink: 0;
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+        padding: 8px 10px;
+        background: #161616;
+        border-top: 1px solid #333;
+      }
+      #controls-open {
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: 12px 16px;
+        border: 2px solid #555;
+        border-radius: 10px;
+        background: #252525;
+        color: #eee;
+        font: inherit;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #controls-open:active {
+        background: #333;
+      }
+      #clear-world {
+        flex-shrink: 0;
+        padding: 12px 14px;
+        border: 2px solid #6b3a3a;
+        border-radius: 10px;
+        background: #2a1f1f;
+        color: #f0b4b4;
+        font: inherit;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      #clear-world:active {
+        background: #3a2828;
+      }
+
+      /* Panel (desktop + mobile) */
+      #panel-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 30;
+        background: rgba(0, 0, 0, 0.55);
+      }
+      #panel-backdrop.open {
+        display: block;
+      }
+
+      #panel {
+        position: fixed;
+        z-index: 40;
+        left: 50%;
+        bottom: 0;
+        transform: translate(-50%, 100%);
+        width: min(560px, 100vw);
+        max-height: min(78vh, 720px);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        background: #1a1a1a;
+        border: 1px solid #444;
+        border-bottom: none;
+        border-radius: 16px 16px 0 0;
+        box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.45);
+        transition: transform 0.28s ease;
+      }
+      #panel.open {
+        transform: translate(-50%, 0);
+      }
+
+      #panel-header {
+        flex-shrink: 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 14px 14px 10px;
+        border-bottom: 1px solid #333;
+      }
+      #panel-header h2 {
+        font-size: 17px;
+        font-weight: 600;
+      }
+      #panel-close {
+        background: none;
+        border: none;
+        color: #aaa;
+        font-size: 26px;
+        line-height: 1;
+        cursor: pointer;
+        padding: 4px 10px;
+      }
+
+      #panel-scroll {
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        padding: 12px 14px 22px;
+      }
+
+      #panel-modes {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 8px;
+        margin-bottom: 16px;
+      }
+      .mode-btn {
+        padding: 10px 6px;
+        border: 2px solid #555;
+        border-radius: 8px;
+        background: #252525;
+        color: #ddd;
+        cursor: pointer;
+        font: inherit;
+        font-size: 12px;
+        text-align: center;
+      }
+      .mode-btn--active {
+        border-color: #8ab4f8;
+        background: #2a3550;
+        color: #fff;
+      }
+
+      #mode-help {
+        font-size: 13px;
+        color: #aaa;
+        line-height: 1.45;
+        margin-bottom: 12px;
+      }
+
+      .brush-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 16px;
+        font-size: 13px;
+        color: #ccc;
+      }
+      .brush-row label {
+        flex-shrink: 0;
+      }
+      .brush-row input[type="range"] {
+        flex: 1 1 auto;
+        min-width: 0;
+        accent-color: #8ab4f8;
+      }
+      #brush-value {
+        min-width: 1.75em;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        color: #8ab4f8;
+      }
+
+      .material-detail {
+        margin-bottom: 14px;
+        padding: 12px;
+        border-radius: 10px;
+        background: #141414;
+        border: 1px solid #333;
+      }
+      .material-detail-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #fff;
+        margin-bottom: 6px;
+      }
+      .material-detail-body {
+        font-size: 13px;
+        color: #b8b8b8;
+        line-height: 1.5;
+      }
+
+      #panel-materials {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        gap: 8px;
+      }
+      .mat-btn {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        padding: 6px;
+        border: 2px solid #444;
+        border-radius: 8px;
+        background: #1e1e1e;
+        color: #eee;
+        cursor: pointer;
+        font: inherit;
+        font-size: 11px;
+        min-height: 52px;
+      }
+      .mat-btn--selected {
+        border-color: #fff;
+        box-shadow: 0 0 0 1px #fff;
+      }
+      .mat-btn--ineligible,
+      .mat-btn:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+      .mat-swatch {
+        height: 18px;
+        width: 100%;
+        border-radius: 4px;
+        flex-shrink: 0;
+      }
+      .mat-name {
+        padding: 4px 2px 0;
+        text-align: center;
+        line-height: 1.2;
+        word-break: break-word;
+      }
+
+      @media (min-width: 600px) {
+        #panel {
+          border-radius: 16px 16px 0 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="game-wrap">
+        <canvas id="sandii" width="448" height="252"></canvas>
+        <div id="hud">
+          <div class="hud-stats"><span id="stats"></span></div>
+          <div class="hud-pick" id="hud-pick" aria-live="polite">
+            <span id="selection-mode" class="pick-mode"></span>
+            <span id="selection-sep" class="pick-sep" hidden>·</span>
+            <span id="selection-mat-wrap" class="pick-mat" hidden>
+              <span
+                id="selection-swatch"
+                class="pick-swatch"
+                aria-hidden="true"
+              ></span>
+              <span id="selection-name" class="pick-name"></span>
+            </span>
+          </div>
+        </div>
+        <button
+          type="button"
+          id="share-btn"
+          title="Share or save snapshot"
+          aria-haspopup="dialog"
+          aria-controls="share-modal"
+          aria-expanded="false"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" />
+            <polyline points="16 6 12 2 8 6" />
+            <line x1="12" y1="2" x2="12" y2="15" />
+          </svg>
+        </button>
+      </div>
+      <div id="controls-bar">
+        <button type="button" id="controls-open">Materials &amp; modes</button>
+        <button
+          type="button"
+          id="clear-world"
+          title="Erase all particles (same as C)"
+        >
+          Clear
+        </button>
+      </div>
+    </div>
+
+    <div id="share-modal-backdrop"></div>
+    <div
+      id="share-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="share-modal-title"
+      aria-hidden="true"
+    >
+      <div id="share-modal-header">
+        <h2 id="share-modal-title">Share snapshot</h2>
+        <button type="button" id="share-modal-close" aria-label="Close">
+          &times;
+        </button>
+      </div>
+      <div id="share-modal-body">
+        <p id="share-modal-hint">
+          Save a PNG of the canvas, or share this page on social (attach the
+          image in the post if you like).
+        </p>
+        <button type="button" class="share-action" id="share-save-png">
+          Save image (PNG)
+        </button>
+        <a
+          class="share-action share-action--x"
+          id="share-x"
+          href="#"
+          target="_blank"
+          rel="noopener noreferrer"
+          >Share on X</a
+        >
+        <a
+          class="share-action share-action--li"
+          id="share-linkedin"
+          href="#"
+          target="_blank"
+          rel="noopener noreferrer"
+          >Share on LinkedIn</a
+        >
+        <button
+          type="button"
+          class="share-action share-action--native"
+          id="share-native"
+          hidden
+        >
+          Share image…
+        </button>
+      </div>
+    </div>
+
+    <div id="panel-backdrop"></div>
+    <div
+      id="panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="panel-title"
+    >
+      <div id="panel-header">
+        <h2 id="panel-title">Controls</h2>
+        <button type="button" id="panel-close" aria-label="Close">
+          &times;
+        </button>
+      </div>
+      <div id="panel-scroll">
+        <div id="panel-modes"></div>
+        <p id="mode-help"></p>
+        <div id="brush-row" class="brush-row">
+          <label for="brush-slider">Brush size</label>
+          <input
+            type="range"
+            id="brush-slider"
+            min="1"
+            max="32"
+            value="4"
+            step="1"
+          />
+          <span id="brush-value">4</span>
+        </div>
+        <div class="material-detail">
+          <div id="material-detail-title" class="material-detail-title"></div>
+          <p id="material-detail-body" class="material-detail-body"></p>
+        </div>
+        <div id="panel-materials"></div>
+      </div>
+    </div>
+
+    <script>
+      const openBtn = document.getElementById("controls-open");
+      const panel = document.getElementById("panel");
+      const backdrop = document.getElementById("panel-backdrop");
+      const closeBtn = document.getElementById("panel-close");
+      function openPanel() {
+        panel.classList.add("open");
+        backdrop.classList.add("open");
+      }
+      function closePanel() {
+        panel.classList.remove("open");
+        backdrop.classList.remove("open");
+      }
+      openBtn.addEventListener("click", openPanel);
+      backdrop.addEventListener("click", closePanel);
+      closeBtn.addEventListener("click", closePanel);
+    </script>
+    <script>
+      (function () {
+        var shareBtn = document.getElementById("share-btn");
+        var shareBackdrop = document.getElementById("share-modal-backdrop");
+        var shareModal = document.getElementById("share-modal");
+        var shareClose = document.getElementById("share-modal-close");
+        var savePng = document.getElementById("share-save-png");
+        var shareX = document.getElementById("share-x");
+        var shareLi = document.getElementById("share-linkedin");
+        var shareNative = document.getElementById("share-native");
+        var canvas = document.getElementById("sandii");
+
+        function socialUrls() {
+          var url = window.location.href;
+          var text = "Sandii snapshot — play with falling sand in the browser.";
+          var x =
+            "https://twitter.com/intent/tweet?" +
+            new URLSearchParams({ text: text, url: url }).toString();
+          var li =
+            "https://www.linkedin.com/sharing/share-offsite/?url=" +
+            encodeURIComponent(url);
+          return { x: x, li: li };
+        }
+
+        function updateShareLinks() {
+          var u = socialUrls();
+          shareX.href = u.x;
+          shareLi.href = u.li;
+        }
+
+        function openShareModal() {
+          updateShareLinks();
+          shareBackdrop.classList.add("open");
+          shareModal.classList.add("open");
+          shareModal.setAttribute("aria-hidden", "false");
+          shareBtn.setAttribute("aria-expanded", "true");
+          shareNative.hidden =
+            typeof navigator === "undefined" ||
+            typeof navigator.share !== "function";
+        }
+
+        function closeShareModal() {
+          shareBackdrop.classList.remove("open");
+          shareModal.classList.remove("open");
+          shareModal.setAttribute("aria-hidden", "true");
+          shareBtn.setAttribute("aria-expanded", "false");
+        }
+
+        shareBtn.addEventListener("click", function (e) {
+          e.stopPropagation();
+          openShareModal();
+        });
+
+        shareClose.addEventListener("click", closeShareModal);
+        shareBackdrop.addEventListener("click", closeShareModal);
+
+        savePng.addEventListener("click", function () {
+          try {
+            var ts = new Date()
+              .toISOString()
+              .replace(/[:.]/g, "-")
+              .slice(0, 19);
+            var a = document.createElement("a");
+            a.download = "sandii-" + ts + ".png";
+            a.href = canvas.toDataURL("image/png");
+            a.click();
+          } catch (err) {
+            console.error(err);
+          }
+        });
+
+        shareNative.addEventListener("click", function () {
+          if (!navigator.share) return;
+          canvas.toBlob(function (blob) {
+            if (!blob) return;
+            var file = new File([blob], "sandii.png", { type: "image/png" });
+            var p;
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+              p = navigator.share({
+                files: [file],
+                title: "Sandii",
+                text: "My Sandii snapshot",
+              });
+            } else {
+              p = navigator.share({
+                title: "Sandii",
+                text: "Sandii — falling sand in the browser",
+                url: window.location.href,
+              });
+            }
+            if (p && typeof p.catch === "function") p.catch(function () {});
+          }, "image/png");
+        });
+
+        document.addEventListener("keydown", function (e) {
+          if (e.key === "Escape" && shareModal.classList.contains("open")) {
+            closeShareModal();
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

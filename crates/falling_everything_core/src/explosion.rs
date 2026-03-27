@@ -6,8 +6,8 @@
 
 use std::collections::HashSet;
 
-use rand::seq::SliceRandom;
 use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 
 use crate::bresenham::{bresenham_line, isqrt_i32};
 use crate::world::{material, Cell, MaterialId, Vec2i, World};
@@ -50,7 +50,7 @@ impl ExplosionParams {
             edge_on_destroy: Some(ExplosionSpawn {
                 material: material::FIRE,
                 lifetime: Some(40),
-                temperature: Some(800),
+                temperature: Some(1200),
             }),
             edge_band_inward: 2,
         }

@@ -7,6 +7,7 @@ edition = "2021"
 members = [
     "crates/falling_everything_core",
     "crates/falling_everything_godot",
+    "crates/sandii_web",
 ]
 resolver = "2"
 

@@ -1,0 +1,5 @@
+[build]
+target = "index.html"
+# Relative URLs so the same build works on itch.io and other hosts that serve the game from a subpath
+# (default "/" makes `/foo.js` resolve to the site root and breaks embeds).
+public_url = "./"
