@@ -1,6 +1,7 @@
 pub(crate) mod acid;
 pub(crate) mod adjacent;
 pub(crate) mod burn;
+pub(crate) mod electricity;
 pub(crate) mod gas;
 pub(crate) mod granular;
 pub(crate) mod influence;

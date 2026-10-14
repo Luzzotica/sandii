@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use falling_everything_core::materials;
+use falling_everything_core::recipes;
 use falling_everything_core::world::material;
 use falling_everything_core::world::MaterialId;
 use wasm_bindgen::closure::Closure;
@@ -29,12 +30,16 @@ enum UiAction {
     SetMode(InteractionMode),
     SetBrushRadius(i32),
     ClearWorld,
+    /// Index into [`recipes::WOW_RECIPES`]; cycles material step when re-selected.
+    SelectRecipe(usize),
 }
 
 struct UiRefs {
     mat_container: Element,
     mat_buttons: Vec<HtmlElement>,
     mode_buttons: Vec<HtmlElement>,
+    recipe_buttons: Vec<HtmlElement>,
+    recipe_tip: HtmlElement,
     mode_help: HtmlElement,
     brush_slider: HtmlInputElement,
     brush_value: HtmlElement,
@@ -61,6 +66,9 @@ struct App {
     last_ui_mode: InteractionMode,
     last_ui_mat: MaterialId,
     last_ui_brush: i32,
+    /// Active wow recipe (index, material step).
+    active_recipe: Option<(usize, usize)>,
+    last_ui_recipe: Option<(usize, usize)>,
 }
 
 impl App {
@@ -79,6 +87,8 @@ impl App {
             last_ui_mode: InteractionMode::Draw,
             last_ui_mat: material::SAND,
             last_ui_brush: 4,
+            active_recipe: None,
+            last_ui_recipe: None,
         }
     }
 
@@ -92,12 +102,26 @@ impl App {
         }
         for a in batch {
             match a {
-                UiAction::SelectMaterial(id) => self.game.set_selected_material(id),
+                UiAction::SelectMaterial(id) => {
+                    self.game.set_selected_material(id);
+                    self.active_recipe = None;
+                }
                 UiAction::SetMode(m) => self.game.set_interaction_mode(m),
                 UiAction::SetBrushRadius(r) => {
                     self.game.brush_radius = clamp_brush_to_mode(r, self.game.interaction_mode);
                 }
                 UiAction::ClearWorld => self.game.clear_world(),
+                UiAction::SelectRecipe(ri) => {
+                    let step = match self.active_recipe {
+                        Some((prev, s)) if prev == ri => s.wrapping_add(1),
+                        _ => 0,
+                    };
+                    if let Some(id) = recipes::recipe_material_at(ri, step) {
+                        self.game.set_interaction_mode(InteractionMode::Draw);
+                        self.game.set_selected_material(id);
+                        self.active_recipe = Some((ri, step));
+                    }
+                }
             }
         }
         true
@@ -159,11 +183,13 @@ impl App {
             || self.game.interaction_mode != self.last_ui_mode
             || self.game.selected != self.last_ui_mat
             || self.game.brush_radius != self.last_ui_brush
+            || self.active_recipe != self.last_ui_recipe
         {
-            sync_ui(ui, &self.game);
+            sync_ui(ui, &self.game, self.active_recipe);
             self.last_ui_mode = self.game.interaction_mode;
             self.last_ui_mat = self.game.selected;
             self.last_ui_brush = self.game.brush_radius;
+            self.last_ui_recipe = self.active_recipe;
         }
 
         self.prev_input = cur;
@@ -213,7 +239,7 @@ fn mode_help_text(mode: InteractionMode) -> &'static str {
     }
 }
 
-fn sync_ui(ui: &UiRefs, game: &GameState) {
+fn sync_ui(ui: &UiRefs, game: &GameState, active_recipe: Option<(usize, usize)>) {
     use InteractionMode::*;
 
     let show_materials = matches!(game.interaction_mode, Draw | RigidBody);
@@ -271,6 +297,45 @@ fn sync_ui(ui: &UiRefs, game: &GameState) {
         } else {
             "mode-btn"
         });
+    }
+
+    let active_ri = active_recipe.map(|(i, _)| i);
+    for btn in &ui.recipe_buttons {
+        let idx_str = btn.get_attribute("data-recipe-idx").unwrap_or_default();
+        let idx: usize = idx_str.parse().unwrap_or(0);
+        let on = active_ri == Some(idx);
+        btn.set_class_name(if on {
+            "recipe-btn recipe-btn--active"
+        } else {
+            "recipe-btn"
+        });
+    }
+
+    if let Some((ri, step)) = active_recipe {
+        if let Some(r) = recipes::wow_recipe_at(ri) {
+            let mat_name = materials::BUILTINS
+                .iter()
+                .find(|d| d.id == game.selected)
+                .map(|d| d.name)
+                .unwrap_or("material");
+            let n = r.materials.len().max(1);
+            let step_disp = (step % n) + 1;
+            ui.recipe_tip.set_inner_html(&format!(
+                "<strong>{}</strong> · brush: <strong>{}</strong> ({}/{}) — {} <em>{}</em>",
+                r.title,
+                mat_name,
+                step_disp,
+                n,
+                r.how,
+                r.result
+            ));
+        } else {
+            ui.recipe_tip.set_inner_text("");
+        }
+    } else {
+        ui.recipe_tip.set_inner_text(
+            "Pick a recipe above, paint the loaded material, then tap the same recipe again for the next ingredient.",
+        );
     }
 
     ui.mode_help
@@ -340,6 +405,12 @@ fn create_mat_btn(
     btn.set_attribute("type", "button")?;
     btn.set_attribute("data-mat-id", &def.id.to_string())?;
     btn.set_class_name("mat-btn");
+    let blurb = material_blurbs::material_description(def.id);
+    btn.set_attribute("title", blurb)?;
+    btn.set_attribute(
+        "aria-label",
+        &format!("{} — {}", def.name, blurb),
+    )?;
 
     let swatch: HtmlElement = document.create_element("span")?.dyn_into()?;
     swatch.set_class_name("mat-swatch");
@@ -351,8 +422,13 @@ fn create_mat_btn(
     name_el.set_class_name("mat-name");
     name_el.set_text_content(Some(def.name));
 
+    let short_el: HtmlElement = document.create_element("span")?.dyn_into()?;
+    short_el.set_class_name("mat-short");
+    short_el.set_text_content(Some(material_blurbs::material_short_label(def.id)));
+
     btn.append_child(&swatch)?;
     btn.append_child(&name_el)?;
+    btn.append_child(&short_el)?;
     Ok(btn)
 }
 
@@ -362,6 +438,40 @@ fn create_mode_btn(document: &Document, idx: usize, label: &str) -> Result<HtmlE
     btn.set_attribute("data-mode-idx", &idx.to_string())?;
     btn.set_class_name("mode-btn");
     btn.set_text_content(Some(label));
+    Ok(btn)
+}
+
+fn create_recipe_btn(
+    document: &Document,
+    idx: usize,
+    recipe: &recipes::WowRecipe,
+) -> Result<HtmlElement, JsValue> {
+    let btn: HtmlElement = document.create_element("button")?.dyn_into()?;
+    btn.set_attribute("type", "button")?;
+    btn.set_attribute("data-recipe-idx", &idx.to_string())?;
+    btn.set_class_name("recipe-btn");
+    btn.set_attribute("title", &format!("{} — {}", recipe.how, recipe.result))?;
+
+    let swatches: HtmlElement = document.create_element("span")?.dyn_into()?;
+    swatches.set_class_name("recipe-swatches");
+    for &mid in recipe.materials.iter().take(2) {
+        let color = materials::BUILTINS
+            .iter()
+            .find(|d| d.id == mid)
+            .map(|d| d.color_argb)
+            .unwrap_or(0xFF888888);
+        let sw: HtmlElement = document.create_element("span")?.dyn_into()?;
+        sw.set_class_name("recipe-swatch");
+        sw.style()
+            .set_property("background", &argb_to_css(color))?;
+        swatches.append_child(&sw)?;
+    }
+
+    let label: HtmlElement = document.create_element("span")?.dyn_into()?;
+    label.set_text_content(Some(recipe.title));
+
+    btn.append_child(&swatches)?;
+    btn.append_child(&label)?;
     Ok(btn)
 }
 
@@ -451,6 +561,17 @@ fn run() -> Result<(), JsValue> {
         .expect("#material-detail-body")
         .dyn_into::<HtmlElement>()?;
 
+    let recipe_container = document
+        .get_element_by_id("panel-recipes")
+        .expect("#panel-recipes")
+        .dyn_into::<Element>()?;
+    recipe_container.set_inner_html("");
+
+    let recipe_tip = document
+        .get_element_by_id("recipe-tip")
+        .expect("#recipe-tip")
+        .dyn_into::<HtmlElement>()?;
+
     let selection_mode = document
         .get_element_by_id("selection-mode")
         .expect("#selection-mode")
@@ -488,10 +609,20 @@ fn run() -> Result<(), JsValue> {
         mode_buttons.push(btn);
     }
 
+    let mut recipe_buttons: Vec<HtmlElement> = Vec::new();
+    for i in 0..recipes::wow_recipe_count() {
+        let r = recipes::wow_recipe_at(i).expect("wow recipe");
+        let btn = create_recipe_btn(&document, i, r)?;
+        recipe_container.append_child(&btn)?;
+        recipe_buttons.push(btn);
+    }
+
     let ui = Rc::new(UiRefs {
         mat_container,
         mat_buttons,
         mode_buttons,
+        recipe_buttons,
+        recipe_tip,
         mode_help,
         brush_slider,
         brush_value,
@@ -541,6 +672,20 @@ fn run() -> Result<(), JsValue> {
         closure.forget();
     }
 
+    for btn in &ui.recipe_buttons {
+        let pq2 = pending_ui.clone();
+        let idx: usize = btn
+            .get_attribute("data-recipe-idx")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        let closure = Closure::wrap(Box::new(move |_e: Event| {
+            pq2.borrow_mut().push_back(UiAction::SelectRecipe(idx));
+        }) as Box<dyn FnMut(_)>);
+        btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
     {
         let pq2 = pending_ui.clone();
         let slider_el = ui.brush_slider.clone();
@@ -567,7 +712,7 @@ fn run() -> Result<(), JsValue> {
         closure.forget();
     }
 
-    sync_ui(&ui, &app.borrow().game);
+    sync_ui(&ui, &app.borrow().game, None);
 
     {
         let inp = input.clone();

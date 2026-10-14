@@ -615,6 +615,28 @@ pub fn cell_name_at(sim: &Simulation, world: Vec2i) -> String {
 }
 
 pub fn cell_flags_line(sim: &Simulation, world: Vec2i) -> String {
+    use falling_everything_core::world::cell_flags;
     let cell: Cell = sim.cell(world);
-    format!("flags 0x{:x}", cell.flags())
+    let f = cell.flags();
+    let mut parts: Vec<&'static str> = Vec::new();
+    if f & cell_flags::IS_FREE_FALLING != 0 {
+        parts.push("FF");
+    }
+    if f & cell_flags::WET != 0 {
+        parts.push("WET");
+    }
+    if f & cell_flags::ELECTRIFIED != 0 {
+        parts.push("ELEC");
+    }
+    if f & cell_flags::ASLEEP != 0 {
+        parts.push("SLEEP");
+    }
+    if f & cell_flags::RIGID_PIXEL != 0 {
+        parts.push("RIG");
+    }
+    if parts.is_empty() {
+        format!("flags 0x{:x}", f)
+    } else {
+        format!("{} 0x{:x}", parts.join(" "), f)
+    }
 }

@@ -19,6 +19,7 @@ pub(crate) fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallR
                 && vertical_down_allows_density_swap(props.phase(), below_props.phase())
                 && props.density > below_props.density)
         {
+            sg.clear_flag(p, cell_flags::ASLEEP);
             sg.set_flag(p, cell_flags::IS_FREE_FALLING);
         } else {
             if below_props.phase() == Phase::Liquid && rng.gen_ratio(1, 5) {
@@ -26,7 +27,17 @@ pub(crate) fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallR
                 let side = Vec2i::new(p.x + dir, p.y);
                 if sg.get(side).material() == material::EMPTY {
                     let _ = sg.try_displace(world, p, side, MoveIntent::Lateral, rng);
+                    return;
                 }
+            }
+            // Fully settled solid grain → sleep into static physics mesh.
+            if !cell.has_flag(cell_flags::ASLEEP)
+                && (below_props.inert()
+                    || below_cell.has_flag(cell_flags::ASLEEP)
+                    || below_cell.has_flag(cell_flags::RIGID_PIXEL))
+            {
+                sg.set_flag(p, cell_flags::ASLEEP);
+                sg.set_velocity(p, 0);
             }
             return;
         }
@@ -60,11 +71,13 @@ pub(crate) fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallR
         } else {
             sg.set_velocity(current, 0);
             sg.clear_flag(current, cell_flags::IS_FREE_FALLING);
+            // Resting on support → eligible for ASLEEP next ticks.
             break;
         }
     }
 
     if moved {
+        sg.clear_flag(current, cell_flags::ASLEEP);
         for dx in [-1i32, 1] {
             let neighbor = Vec2i::new(current.x + dx, current.y);
             let ncell = sg.get(neighbor);
@@ -76,6 +89,7 @@ pub(crate) fn step_sand(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallR
                 {
                     let dislodge_chance = (255 - nprops.inertial_resistance()) as u32;
                     if rng.gen_ratio(dislodge_chance.max(1), 256) {
+                        sg.clear_flag(neighbor, cell_flags::ASLEEP);
                         sg.set_flag(neighbor, cell_flags::IS_FREE_FALLING);
                     }
                 }

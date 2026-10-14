@@ -8,8 +8,12 @@ use crate::sim::engines::burn::{
     apply_ignition_neighbor_pulse, eliminate_smoldering_fuel_at, try_neighbor_spawns,
 };
 use crate::sim::engines::{
-    adjacent::step_adjacent_transform_neighbors, gas::step_gas, granular::step_sand,
-    liquid::step_liquid, smolder::step_smoldering_fuel,
+    adjacent::step_adjacent_transform_neighbors,
+    electricity::{step_electrified_conductor, step_electricity},
+    gas::step_gas,
+    granular::step_sand,
+    liquid::step_liquid,
+    smolder::step_smoldering_fuel,
 };
 use crate::sim::steps::{ember::step_ember, fire::step_fire, smoke::step_smoke, steam::step_steam};
 use crate::sim::{check_phase_transition, is_burning, step_temperature, FlameSpawn, SimGrids};
@@ -156,6 +160,17 @@ pub(crate) fn step_pixel(
         step_ember(sg, world, p, rng, explosions);
         return;
     }
+    if cell.material() == material::ELECTRICITY {
+        step_electricity(sg, world, p, rng);
+        return;
+    }
+    if cell.has_flag(cell_flags::ELECTRIFIED)
+        && world.material_props(cell.material()).conductive
+        && cell.material() != material::ELECTRICITY
+    {
+        step_electrified_conductor(sg, world, p, rng);
+        // Fall through so metal stays inert and water still flows after charge hop.
+    }
     let props = world.material_props(cell.material());
     let lava_adj_early = cell.material() == material::LAVA && props.has_adjacent_transforms();
     if lava_adj_early {
@@ -192,6 +207,22 @@ pub(crate) fn step_pixel(
     let cell = sg.get(p);
     if cell.has_flag(cell_flags::RIGID_PIXEL) {
         return;
+    }
+    // Settled granular: stay in static mesh unless support vanishes.
+    if cell.has_flag(cell_flags::ASLEEP) && props.phase() == Phase::Solid {
+        let below = Vec2i::new(p.x, p.y + 1);
+        let below_cell = sg.get(below);
+        let below_props = world.material_props(below_cell.material());
+        let supported = below_cell.material() != material::EMPTY
+            && (below_props.inert()
+                || below_cell.has_flag(cell_flags::ASLEEP)
+                || below_cell.has_flag(cell_flags::RIGID_PIXEL)
+                || below_props.density >= props.density);
+        if supported {
+            return;
+        }
+        sg.clear_flag(p, cell_flags::ASLEEP);
+        sg.set_flag(p, cell_flags::IS_FREE_FALLING);
     }
     match props.phase() {
         Phase::Solid => step_sand(sg, world, p, rng),

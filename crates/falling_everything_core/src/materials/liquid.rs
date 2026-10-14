@@ -76,6 +76,7 @@ pub const DEF: MaterialDef = MaterialDef {
         durability: 58,
         // Water is inert to acid (no neutralization sim yet).
         acid_vulnerability: AcidVulnerability::inactive(),
+        conductive: true,
         ..MaterialProps::default_const()
     },
     rule: MaterialRule {

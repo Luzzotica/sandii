@@ -2,8 +2,15 @@ pub mod bresenham;
 pub mod cell64;
 pub mod explosion;
 pub mod materials;
+pub mod recipes;
 
 pub use explosion::{base_strength_for_radius, ExplosionParams, ExplosionSpawn};
+pub use materials::{
+    material_blurb, material_blurb_desktop, material_display_name, material_short_label,
+};
+pub use recipes::{
+    recipe_material_at, wow_recipe_at, wow_recipe_count, WowRecipe, WOW_RECIPES,
+};
 pub use sim::FlameSpawn;
 pub mod render;
 pub mod rigid;
@@ -388,9 +395,44 @@ impl Simulation {
         self.rigid.set_world_border_colliders(bounds);
     }
 
+    /// Soft cap on active dense-grid size (cells). Viewport may be smaller; hidden
+    /// buffer must not push the sim past this (laptop FPS budget).
+    pub const ACTIVE_SIM_MAX_W: i32 = 700;
+    pub const ACTIVE_SIM_MAX_H: i32 = 400;
+
+    /// Half-extents for [`World::relocate_around`] so total W×H stays ≤
+    /// [`Self::ACTIVE_SIM_MAX_W`]×[`Self::ACTIVE_SIM_MAX_H`], while covering at least
+    /// the viewport. Prefer a thin margin over the old 3× screen buffer (~1920×1080).
+    pub fn active_grid_half_extents(screen_w: i32, screen_h: i32) -> (i32, i32) {
+        let sw = screen_w.max(1);
+        let sh = screen_h.max(1);
+        // Thin margin: up to ~half a chunk, not a full extra screen on each side.
+        let margin_w = 32i32.min((Self::ACTIVE_SIM_MAX_W - sw).max(0) / 2);
+        let margin_h = 24i32.min((Self::ACTIVE_SIM_MAX_H - sh).max(0) / 2);
+        let total_w = (sw + 2 * margin_w).clamp(sw, Self::ACTIVE_SIM_MAX_W);
+        let total_h = (sh + 2 * margin_h).clamp(sh, Self::ACTIVE_SIM_MAX_H);
+        // relocate_around uses half * 2 for size — keep even totals.
+        let total_w = total_w & !1;
+        let total_h = total_h & !1;
+        (total_w / 2, total_h / 2)
+    }
+
+    /// Size (or re-center) the active dense grid around `camera_center` using the FPS budget.
+    /// Returns true if the store origin/size changed.
+    pub fn ensure_active_grid(&mut self, camera_center: Vec2i, screen_w: i32, screen_h: i32) -> bool {
+        let (half_w, half_h) = Self::active_grid_half_extents(screen_w, screen_h);
+        if self.world.relocate_around(camera_center, half_w, half_h) {
+            self.rigid.clear_all_static_colliders();
+            self.world.mark_all_chunks_physics_dirty();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Re-center the simulation grid around `camera_center` if the camera has drifted
-    /// far enough from the current grid center. The grid is sized at 3x the screen
-    /// dimensions to provide a one-screen buffer in every direction.
+    /// far enough from the current grid center. Active size is viewport + thin margin,
+    /// capped at [`Self::ACTIVE_SIM_MAX_W`]×[`Self::ACTIVE_SIM_MAX_H`] (not 3× screen).
     pub fn relocate_if_needed(&mut self, camera_center: Vec2i, screen_w: i32, screen_h: i32) {
         let origin = self.world.grid_origin();
         let gw = self.world.grid_width();
@@ -400,12 +442,12 @@ impl Simulation {
         let dx = (camera_center.x - grid_center.x).abs();
         let dy = (camera_center.y - grid_center.y).abs();
 
-        if dx > screen_w / 2 || dy > screen_h / 2 {
-            let half_w = screen_w * 3 / 2;
-            let half_h = screen_h * 3 / 2;
-            if self.world.relocate_around(camera_center, half_w, half_h) {
-                self.rigid.clear_all_static_colliders();
-            }
+        // Relocate when nearing the edge of the thin margin, or if grid is oversized.
+        let oversized = gw > Self::ACTIVE_SIM_MAX_W || gh > Self::ACTIVE_SIM_MAX_H;
+        let margin_x = (gw - screen_w).max(0) / 4;
+        let margin_y = (gh - screen_h).max(0) / 4;
+        if oversized || dx > margin_x.max(8) || dy > margin_y.max(8) {
+            let _ = self.ensure_active_grid(camera_center, screen_w, screen_h);
         }
     }
 
@@ -623,7 +665,7 @@ mod tests {
     use crate::sim::deterministic_hash;
     use crate::world::{
         material, AdjacentTransformRule, Cell, ChunkCoord, MaterialId, MaterialMotion, Vec2i,
-        World, CHUNK_SIZE,
+        World, CHUNK_H, CHUNK_SIZE, CHUNK_W,
     };
 
     fn count_material(sim: &Simulation, rect: RectI, id: u16) -> usize {
@@ -1188,9 +1230,10 @@ mod tests {
         let mut cfg = SimulationConfig::default();
         cfg.debug_full_world_single_pass = true;
         let mut sim = Simulation::new(cfg);
-        let w = 2 * CHUNK_SIZE;
-        let h = 2 * CHUNK_SIZE;
-        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(127, 127));
+        // Span a 2×2 chunk grid of the current 16:9 work units (not a huge square).
+        let w = 2 * CHUNK_W;
+        let h = 2 * CHUNK_H;
+        let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(w.max(h) + 16, w.max(h) + 16));
         sim.set_solid_bounds(bounds);
 
         let mut wood_props = crate::materials::BUILTINS
@@ -1465,16 +1508,16 @@ mod tests {
         world.set_solid_bounds(RectI::new(min, max));
         let origin = world.grid_origin();
         assert_ne!(
-            origin.x.rem_euclid(CHUNK_SIZE),
+            origin.x.rem_euclid(CHUNK_W),
             0,
             "test requires misaligned origin.x (got {})",
             origin.x
         );
 
         let y = origin.y + 3;
-        let x1 = origin.x + CHUNK_SIZE - 1;
-        let x2 = origin.x + CHUNK_SIZE;
-        let x3 = origin.x + 2 * CHUNK_SIZE;
+        let x1 = origin.x + CHUNK_W - 1;
+        let x2 = origin.x + CHUNK_W;
+        let x3 = origin.x + 2 * CHUNK_W;
 
         for &x in &[x1, x2, x3] {
             let p = Vec2i::new(x, y);
@@ -1493,11 +1536,11 @@ mod tests {
         let mut world = World::new(CHUNK_SIZE, 128);
         world.set_solid_bounds(RectI::new(Vec2i::new(-960, 0), Vec2i::new(-960 + 127, 95)));
         let origin = world.grid_origin();
-        assert_eq!(origin.x.rem_euclid(CHUNK_SIZE), 0);
+        assert_eq!(origin.x.rem_euclid(CHUNK_W), 0);
 
-        let p = Vec2i::new(origin.x + CHUNK_SIZE + 3, origin.y + 5);
+        let p = Vec2i::new(origin.x + CHUNK_W + 3, origin.y + 5);
         let coord = world.dense_chunk_coord_for_cell(p).unwrap();
-        assert_eq!(coord.x * CHUNK_SIZE, origin.x + CHUNK_SIZE);
+        assert_eq!(coord.x * CHUNK_W, origin.x + CHUNK_W);
         let b = world.bounds_for_chunk(coord);
         assert!(b.contains(p));
     }
@@ -1514,8 +1557,8 @@ mod tests {
 
         let probes = [
             Vec2i::new(-1000, 20),
-            Vec2i::new(-1000 + CHUNK_SIZE, 20),
-            Vec2i::new(-1000 + 2 * CHUNK_SIZE, 20),
+            Vec2i::new(-1000 + CHUNK_W, 20),
+            Vec2i::new(-1000 + 2 * CHUNK_W, 20),
         ];
         for p in probes {
             world.set_cell(p, test_dirt_cell());
@@ -1540,7 +1583,7 @@ mod tests {
         let origin = world.grid_origin();
         let y = origin.y + 7;
         let x0 = origin.x + 1;
-        for dx in 0..(3 * CHUNK_SIZE + 5) {
+        for dx in 0..(3 * CHUNK_W + 5) {
             let p = Vec2i::new(x0 + dx, y);
             if world.get_cell(p).material() == material::EMPTY {
                 world.set_cell(p, test_dirt_cell());
@@ -1568,7 +1611,7 @@ mod tests {
         let origin = world.grid_origin();
         let y = origin.y + 11;
         let x0 = origin.x + 2;
-        let span = 3 * CHUNK_SIZE + 3;
+        let span = 3 * CHUNK_W + 3;
         let mut coords_order: Vec<ChunkCoord> = Vec::new();
         for dx in 0..span {
             let p = Vec2i::new(x0 + dx, y);
@@ -1615,7 +1658,7 @@ mod tests {
         let origin = world.grid_origin();
         let x = origin.x + 5;
         let y0 = origin.y + 2;
-        for dy in 0..(2 * CHUNK_SIZE + 4) {
+        for dy in 0..(2 * CHUNK_H + 4) {
             let p = Vec2i::new(x, y0 + dy);
             if world.get_cell(p).material() == material::EMPTY {
                 world.set_cell(p, test_dirt_cell());
@@ -1799,7 +1842,7 @@ mod tests {
         ));
         let origin = sim.test_world().grid_origin();
         let y = origin.y + 8;
-        let x_mid = origin.x + CHUNK_SIZE;
+        let x_mid = origin.x + CHUNK_W;
         sim.paint_rect_filled(
             Vec2i::new(x_mid - 2, y),
             Vec2i::new(x_mid + 2, y),

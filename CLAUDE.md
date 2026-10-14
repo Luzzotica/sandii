@@ -1,0 +1,1 @@
+/Users/sterlinglong/NonCloud/PAZA/Projects/sandii/.k2/skills/k2so/SKILL.md

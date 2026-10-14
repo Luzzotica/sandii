@@ -14,6 +14,8 @@ use crate::SimulationEvent;
 mod engines;
 mod step_pixel;
 mod steps;
+#[cfg(test)]
+mod stress_scenes;
 mod thermal;
 
 pub(crate) use thermal::{check_phase_transition, step_temperature};
@@ -169,7 +171,8 @@ impl Scheduler {
                 }
                 SchedulerMode::ThreadPool => {
                     // Parallelism is **per chunk** within this pass: each `ChunkCoord` is one rayon task.
-                    // A single 64×64 chunk is still stepped on one thread (cells are not split across threads).
+                    // Chunks are 16:9 (`CHUNK_W`×`CHUNK_H`); each chunk is stepped on one thread
+                    // (cells are not split across threads).
                     let sg = SimGrids::from_world(world);
                     let tick = self.tick;
                     let seed = self.seed;
@@ -406,9 +409,14 @@ pub(crate) struct SimGrids {
     awake_next: *mut bool,
     chunks_x: i32,
     chunks_y: i32,
-    chunk_size: i32,
+    /// Dense-grid work unit width (16:9 with [`Self::chunk_h`]).
+    chunk_w: i32,
+    /// Dense-grid work unit height (16:9 with [`Self::chunk_w`]).
+    chunk_h: i32,
     debug_pass: *mut u8,
     debug_pass_enabled: bool,
+    /// Material props for visitor checks (conductive) without holding `&World`.
+    material_props: *const MaterialProps,
 }
 
 unsafe impl Send for SimGrids {}
@@ -431,10 +439,21 @@ impl SimGrids {
             awake_next: world.chunk_awake_next_ptr(),
             chunks_x: world.chunks_x(),
             chunks_y: world.chunks_y(),
-            chunk_size: world.chunk_size(),
+            chunk_w: world.chunk_w(),
+            chunk_h: world.chunk_h(),
             debug_pass,
             debug_pass_enabled,
+            material_props: world.material_props_ptr(),
         }
+    }
+
+    #[inline]
+    fn props_conductive(&self, mat: u16) -> bool {
+        if mat == material::EMPTY {
+            return false;
+        }
+        let props = unsafe { &*self.material_props.add(mat as usize) };
+        props.conductive
     }
 
     fn stamp_debug_pass(&self, p: Vec2i, pass: u8) {
@@ -480,6 +499,21 @@ impl SimGrids {
 
     fn set_cell(&self, p: Vec2i, cell: Cell) {
         if let Some(i) = self.index(p) {
+            // Electricity visitor: never overwrite conductive media in the write grid.
+            if cell.material() == material::ELECTRICITY {
+                let existing = unsafe { *self.write.add(i) };
+                let em = existing.material();
+                if em != material::EMPTY
+                    && em != material::ELECTRICITY
+                    && self.props_conductive(em)
+                {
+                    unsafe {
+                        (*self.write.add(i)).or_flags(cell_flags::ELECTRIFIED);
+                    }
+                    self.wake_at(p);
+                    return;
+                }
+            }
             unsafe {
                 *self.write.add(i) = cell;
             }
@@ -526,8 +560,9 @@ impl SimGrids {
     pub(crate) fn wake_at(&self, p: Vec2i) {
         let lx = p.x - self.origin.x;
         let ly = p.y - self.origin.y;
-        let cx = crate::world::div_floor(lx, self.chunk_size);
-        let cy = crate::world::div_floor(ly, self.chunk_size);
+        // Must use 16:9 chunk extents — never a single square `chunk_size` for both axes.
+        let cx = crate::world::div_floor(lx, self.chunk_w);
+        let cy = crate::world::div_floor(ly, self.chunk_h);
         for dy in -1i32..=1 {
             for dx in -1i32..=1 {
                 let ncx = cx + dx;
@@ -562,6 +597,13 @@ impl SimGrids {
         let from_cell = unsafe { *self.write.add(from_idx) };
         let to_cell = unsafe { *self.write.add(to_idx) };
         if from_cell.material() == material::EMPTY {
+            return false;
+        }
+        // Free sparks move only via electricity visitor `set_cell` hops — never density-swap
+        // with water/metal (that would plant ELECTRICITY material into the medium).
+        if from_cell.material() == material::ELECTRICITY
+            || to_cell.material() == material::ELECTRICITY
+        {
             return false;
         }
         if from_cell.has_flag(cell_flags::RIGID_PIXEL) || to_cell.has_flag(cell_flags::RIGID_PIXEL)

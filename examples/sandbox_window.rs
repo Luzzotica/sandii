@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use falling_everything_core::bresenham;
 use falling_everything_core::materials;
+use falling_everything_core::recipes;
 use falling_everything_core::world::{cell_flags, material, Cell, MaterialId, Phase, RectI, Vec2i};
 use falling_everything_core::worldgen::{self, TerrainConfig};
 use falling_everything_core::{
@@ -11,6 +12,8 @@ use falling_everything_core::{
 };
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Scale, Window, WindowOptions};
 
+/// Visible viewport in sim cells (16:9). Active dense grid is viewport + thin margin,
+/// capped at ~700×400 — not a 3× screen buffer (that was ~1920×1080 and tanked FPS).
 const SIM_WIDTH: usize = 640;
 const SIM_HEIGHT: usize = 360;
 const SCALE: usize = 2;
@@ -47,41 +50,62 @@ struct PaletteLayout {
     panel_y: usize,
     panel_w: usize,
     panel_h: usize,
-    /// Y offset from panel top to swatch row (after header text).
+    /// Y offset from panel top to swatch grid (after header + selected blurb).
     swatch_y_off: usize,
     swatch_w: usize,
     swatch_h: usize,
-    stride: usize,
+    /// Full cell height including short name under swatch.
+    cell_h: usize,
+    stride_x: usize,
+    cols: usize,
+    rows: usize,
     count: usize,
     /// Y offset from panel top to first shortcut help line.
     help_y_off: usize,
     mode_btn_y_off: usize,
     mode_btn_h: usize,
     thermal_btn_y_off: usize,
+    /// Y offset from panel top to “WOW RECIPES” header.
+    recipe_y_off: usize,
+    recipe_row_h: usize,
+    recipe_count: usize,
 }
 
 impl PaletteLayout {
     const INNER: usize = 4 * SCALE;
     /// One line of 5×7 text (scale 1) + gap.
     const LINE: usize = 12;
+    /// Named chips per row — keeps the panel scannable without spanning the whole window.
+    const COLS: usize = 8;
 
     fn new() -> Self {
         let count = materials::paintable_builtin_count();
-        let panel_w = (count * 16 + 70) * SCALE;
-        let swatch_w = 12 * SCALE;
-        let swatch_h = 14 * SCALE;
-        let stride = 16 * SCALE;
+        let cols = Self::COLS.min(count.max(1));
+        let rows = count.div_ceil(cols);
+        // Cell wide enough for a 5–6 letter short name at scale-1 font.
+        let stride_x = 38 * SCALE;
+        let swatch_w = 14 * SCALE;
+        let swatch_h = 12 * SCALE;
+        let name_h = 8;
+        let cell_h = swatch_h + name_h + 2;
+        let panel_w = Self::INNER * 2 + cols * stride_x + 8;
 
-        let header_lines = 2;
-        let swatch_y_off = Self::INNER + header_lines * Self::LINE;
-        let after_swatches = swatch_y_off + swatch_h + 4;
+        // Header (2) + selected name (1) + blurb (2) — tight so recipes/playground breathe.
+        let header_block = 2 * Self::LINE + Self::LINE + 2 * Self::LINE + 2;
+        let swatch_y_off = Self::INNER + header_block;
+        let grid_h = rows * cell_h;
+        let after_swatches = swatch_y_off + grid_h + 2;
         let brush_row_h = Self::LINE;
-        let help_lines = 6;
+        let help_lines = 3;
         let help_y_off = after_swatches + brush_row_h + 2;
-        let mode_btn_y_off = help_y_off + help_lines * Self::LINE + 6;
-        let mode_btn_h = 14 * SCALE;
-        let thermal_btn_y_off = mode_btn_y_off + mode_btn_h + 4;
-        let panel_h = thermal_btn_y_off + mode_btn_h + Self::INNER + 4;
+        let mode_btn_y_off = help_y_off + help_lines * Self::LINE + 4;
+        let mode_btn_h = 13 * SCALE;
+        let thermal_btn_y_off = mode_btn_y_off + mode_btn_h + 2;
+        let recipe_count = recipes::wow_recipe_count();
+        let recipe_row_h = 10 * SCALE;
+        let recipe_y_off = thermal_btn_y_off + mode_btn_h + 4;
+        let recipe_block_h = Self::LINE + recipe_count * recipe_row_h + 2;
+        let panel_h = recipe_y_off + recipe_block_h + Self::INNER + 2;
 
         Self {
             panel_x: 4 * SCALE,
@@ -91,12 +115,18 @@ impl PaletteLayout {
             swatch_y_off,
             swatch_w,
             swatch_h,
-            stride,
+            cell_h,
+            stride_x,
+            cols,
+            rows,
             count,
             help_y_off,
             mode_btn_y_off,
             mode_btn_h,
             thermal_btn_y_off,
+            recipe_y_off,
+            recipe_row_h,
+            recipe_count,
         }
     }
 
@@ -108,6 +138,15 @@ impl PaletteLayout {
         self.panel_y + self.swatch_y_off
     }
 
+    fn cell_origin(&self, index: usize) -> (usize, usize) {
+        let col = index % self.cols;
+        let row = index / self.cols;
+        (
+            self.swatch_base_x() + col * self.stride_x,
+            self.swatch_base_y() + row * self.cell_h,
+        )
+    }
+
     fn panel_contains(&self, mx: i32, my: i32) -> bool {
         mx >= self.panel_x as i32
             && mx < (self.panel_x + self.panel_w) as i32
@@ -116,14 +155,13 @@ impl PaletteLayout {
     }
 
     fn material_at(&self, mx: i32, my: i32, mode: InteractionMode) -> Option<MaterialId> {
-        let bx = self.swatch_base_x() as i32;
-        let by = self.swatch_base_y() as i32;
         for i in 0..self.count {
-            let sx = bx + (i * self.stride) as i32;
-            if mx >= sx
-                && mx < sx + self.swatch_w as i32
-                && my >= by
-                && my < by + self.swatch_h as i32
+            let (cx, cy) = self.cell_origin(i);
+            // Full cell is clickable (swatch + name).
+            if mx >= cx as i32
+                && mx < (cx + self.stride_x.saturating_sub(4)) as i32
+                && my >= cy as i32
+                && my < (cy + self.cell_h) as i32
             {
                 let def = materials::paintable_builtin_at(i).expect("paintable material");
                 if mode == InteractionMode::RigidBody && !is_rigid_body_eligible(def) {
@@ -136,7 +174,7 @@ impl PaletteLayout {
     }
 
     fn brush_row_y(&self) -> usize {
-        self.panel_y + self.swatch_y_off + self.swatch_h + 4
+        self.panel_y + self.swatch_y_off + self.rows * self.cell_h + 4
     }
 
     /// Large clickable mode buttons at bottom of panel.
@@ -176,6 +214,24 @@ impl PaletteLayout {
             Some(InteractionMode::Cool)
         }
     }
+
+    /// Index into [`recipes::WOW_RECIPES`] if click lands on a recipe chip.
+    fn recipe_click(&self, mx: i32, my: i32) -> Option<usize> {
+        let x0 = (self.panel_x + Self::INNER) as i32;
+        let w = (self.panel_w - 2 * Self::INNER) as i32;
+        let rows_y0 = (self.panel_y + self.recipe_y_off + Self::LINE) as i32;
+        if mx < x0 || mx >= x0 + w {
+            return None;
+        }
+        for i in 0..self.recipe_count {
+            let y0 = rows_y0 + (i * self.recipe_row_h) as i32;
+            let y1 = y0 + self.recipe_row_h as i32 - 2;
+            if my >= y0 && my < y1 {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 fn viewport_rect(camera: Vec2i) -> RectI {
@@ -208,31 +264,26 @@ fn main() {
         terrain_cfg.surface_y - (SIM_HEIGHT as i32) / 3,
     );
 
-    let half_w = SIM_WIDTH as i32 * 3 / 2;
-    let half_h = SIM_HEIGHT as i32 * 3 / 2;
+    let cam_center = Vec2i::new(
+        initial_camera.x + SIM_WIDTH as i32 / 2,
+        initial_camera.y + SIM_HEIGHT as i32 / 2,
+    );
+    // Shrink dense store to FPS budget before terrain paint (default region is 512×512).
+    sim.ensure_active_grid(cam_center, SIM_WIDTH as i32, SIM_HEIGHT as i32);
+    let (half_w, half_h) =
+        falling_everything_core::Simulation::active_grid_half_extents(
+            SIM_WIDTH as i32,
+            SIM_HEIGHT as i32,
+        );
     sim.set_solid_bounds(RectI::new(
-        Vec2i::new(
-            initial_camera.x + SIM_WIDTH as i32 / 2 - half_w,
-            initial_camera.y + SIM_HEIGHT as i32 / 2 - half_h,
-        ),
-        Vec2i::new(
-            initial_camera.x + SIM_WIDTH as i32 / 2 + half_w - 1,
-            initial_camera.y + SIM_HEIGHT as i32 / 2 + half_h - 1,
-        ),
+        Vec2i::new(cam_center.x - half_w, cam_center.y - half_h),
+        Vec2i::new(cam_center.x + half_w - 1, cam_center.y + half_h - 1),
     ));
 
     worldgen::paint_terrain(&mut sim, &terrain_cfg);
 
-    let mat_list: String = (0..materials::paintable_builtin_count())
-        .filter_map(materials::paintable_builtin_at)
-        .enumerate()
-        .map(|(i, d)| format!("{} {}", i, d.name))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let title = format!(
-        "Sandii Sandbox - {} | Tab cycles modes (Draw/Rigid/Explode/Heat/Cool) | [] radius in Explode | Arrows pan | T/L spawn | F physics | C clear",
-        mat_list
-    );
+    // Materials live in the left panel chips — keep the OS title bar short.
+    let title = "Sandii Sandbox — Tab modes · [] brush/blast · C clear · Esc quit";
     let mut window = Window::new(
         &title,
         DISP_W,
@@ -274,11 +325,13 @@ fn main() {
     let mut mid_drag_origin: Option<(f32, f32)> = None;
     let mut camera_at_drag_start = camera;
     let mut show_physics = false;
-    /// Full-disk erase (no ray simulation).
+    // Active wow recipe (index into WOW_RECIPES) and material step within it.
+    let mut active_recipe: Option<(usize, usize)> = None;
+    // Full-disk erase (no ray simulation).
     let mut explosion_obliterate = false;
-    /// Destroyed interior becomes selected material (when not EMPTY).
+    // Destroyed interior becomes selected material (when not EMPTY).
     let mut explosion_spawn_interior = false;
-    /// Outer annulus uses `explosion_edge_spawn` when true.
+    // Outer annulus uses `explosion_edge_spawn` when true.
     let mut explosion_edge_enabled = true;
     let mut explosion_edge_spawn = ExplosionSpawn {
         material: material::FIRE,
@@ -440,6 +493,18 @@ fn main() {
                             interaction_mode = m;
                             rigid_stroke.clear();
                             rigid_stroke_last = None;
+                        } else if let Some(ri) = layout.recipe_click(sx, sy) {
+                            let step = match active_recipe {
+                                Some((prev, s)) if prev == ri => s.wrapping_add(1),
+                                _ => 0,
+                            };
+                            if let Some(id) = recipes::recipe_material_at(ri, step) {
+                                selected = id;
+                                interaction_mode = InteractionMode::Draw;
+                                active_recipe = Some((ri, step));
+                                rigid_stroke.clear();
+                                rigid_stroke_last = None;
+                            }
                         }
                     }
                 }
@@ -728,6 +793,7 @@ fn main() {
             explosion_spawn_interior,
             explosion_edge_enabled,
             explosion_edge_spawn.material,
+            active_recipe,
         );
         draw_fps_top_right(
             &mut frame,
@@ -1066,6 +1132,7 @@ fn draw_ui_hint(
     explosion_spawn_interior: bool,
     explosion_edge_enabled: bool,
     explosion_edge_material: MaterialId,
+    active_recipe: Option<(usize, usize)>,
 ) {
     let layout = PaletteLayout::new();
     draw_panel(
@@ -1078,9 +1145,42 @@ fn draw_ui_hint(
     );
     let tx = layout.panel_x + PaletteLayout::INNER;
     let mut ty = layout.panel_y + PaletteLayout::INNER;
-    draw_str_5x7(frame, "CLICK A COLORED SQUARE", tx, ty, 0xFFFFFFFF, 1);
+
+    // Title + selected material name/blurb (scannable without README).
+    if let Some((ri, _step)) = active_recipe {
+        if let Some(r) = recipes::wow_recipe_at(ri) {
+            draw_str_5x7(frame, "TRY RECIPE - CLICK AGAIN", tx, ty, 0xFFFFEB3B, 1);
+            ty += PaletteLayout::LINE;
+            draw_str_5x7(frame, r.desktop_line, tx, ty, 0xFFFFF59D, 1);
+        } else {
+            draw_str_5x7(frame, "MATERIALS - CLICK A CHIP", tx, ty, 0xFFFFFFFF, 1);
+            ty += PaletteLayout::LINE;
+            draw_str_5x7(frame, "OR A WOW RECIPE BELOW", tx, ty, 0xFFFFEB3B, 1);
+        }
+    } else {
+        draw_str_5x7(frame, "MATERIALS - CLICK A CHIP", tx, ty, 0xFFFFFFFF, 1);
+        ty += PaletteLayout::LINE;
+        draw_str_5x7(frame, "COLOR PLUS NAME - SCAN GRID", tx, ty, 0xFFB3E5FC, 1);
+    }
     ty += PaletteLayout::LINE;
-    draw_str_5x7(frame, "TO CHOOSE BRUSH MATERIAL", tx, ty, 0xFFB3E5FC, 1);
+
+    let sel_name = materials::material_display_name(material).to_ascii_uppercase();
+    draw_str_5x7(
+        frame,
+        &format!("SELECTED  {}", sel_name),
+        tx,
+        ty,
+        0xFFFFFFFF,
+        1,
+    );
+    ty += PaletteLayout::LINE;
+    let blurb = materials::material_blurb_desktop(material);
+    draw_str_5x7(frame, blurb[0], tx, ty, 0xFFFFF59D, 1);
+    ty += PaletteLayout::LINE;
+    if !blurb[1].is_empty() {
+        draw_str_5x7(frame, blurb[1], tx, ty, 0xFFB0BEC5, 1);
+    }
+
     draw_material_palette(frame, material, &layout, mode);
     draw_brush_row(frame, brush_radius, &layout);
     draw_help_lines(
@@ -1094,6 +1194,7 @@ fn draw_ui_hint(
     );
     draw_mode_buttons(frame, &layout, mode);
     draw_thermal_buttons(frame, &layout, mode);
+    draw_recipe_strip(frame, &layout, active_recipe.map(|(i, _)| i));
 }
 
 fn draw_help_lines(
@@ -1107,20 +1208,8 @@ fn draw_help_lines(
 ) {
     let tx = layout.panel_x + PaletteLayout::INNER;
     let mut ty = layout.panel_y + layout.help_y_off;
-    draw_str_5x7(frame, "SHIFT LEFT DRAG  RECT PAINT", tx, ty, 0xFFFFE082, 1);
-    ty += PaletteLayout::LINE;
-    draw_str_5x7(frame, "SHIFT RIGHT DRAG RECT ERASE", tx, ty, 0xFF90CAF9, 1);
-    ty += PaletteLayout::LINE;
-    draw_str_5x7(
-        frame,
-        "SHIFT R TWICE      RIGID RECT",
-        tx,
-        ty,
-        0xFFA5D6A7,
-        1,
-    );
-    ty += PaletteLayout::LINE;
-    draw_str_5x7(frame, "EXPLODE LMB      [] RADIUS", tx, ty, 0xFFFFAB91, 1);
+    // Three fixed slots (matches PaletteLayout help_lines).
+    draw_str_5x7(frame, "LMB PAINT  RMB ERASE  C CLEAR", tx, ty, 0xFFFFE082, 1);
     ty += PaletteLayout::LINE;
     if mode == InteractionMode::Explosion {
         let nuke = if explosion_obliterate { "ON " } else { "OFF" };
@@ -1130,16 +1219,18 @@ fn draw_help_lines(
             "OFF"
         };
         let edge = if explosion_edge_enabled { "ON " } else { "OFF" };
-        let edge_name = materials::BUILTINS
-            .iter()
-            .find(|d| d.id == explosion_edge_material)
-            .map(|d| d.name)
-            .unwrap_or("?");
-        let line5 = format!("O NUKE {} I FILL {}", nuke, fill);
-        draw_str_5x7(frame, &line5, tx, ty, 0xFFFFCC80, 1);
+        let edge_name = materials::material_short_label(explosion_edge_material);
+        draw_str_5x7(
+            frame,
+            &format!("O NUKE {} I FILL {} E {}", nuke, fill, edge_name),
+            tx,
+            ty,
+            0xFFFFCC80,
+            1,
+        );
         ty += PaletteLayout::LINE;
-        let line6 = format!("E CAPTURE EDGE {}  SHF-E RING {}", edge_name, edge);
-        draw_str_5x7(frame, &line6, tx, ty, 0xFFFFCC80, 1);
+        draw_str_5x7(frame, "SHIFT DRAG  BRACKETS BRUSH", tx, ty, 0xFF90CAF9, 1);
+        let _ = edge;
     } else if mode == InteractionMode::Heat {
         draw_str_5x7(frame, "HEAT LMB ADDS TEMP", tx, ty, 0xFFFF8A65, 1);
         ty += PaletteLayout::LINE;
@@ -1148,10 +1239,65 @@ fn draw_help_lines(
         draw_str_5x7(frame, "COOL LMB SUB TEMP", tx, ty, 0xFF4FC3F7, 1);
         ty += PaletteLayout::LINE;
         draw_str_5x7(frame, "TAB CYCLE MODES", tx, ty, 0xFF9E9E9E, 1);
-    } else {
-        draw_str_5x7(frame, "TAB CYCLE MODES", tx, ty, 0xFF9E9E9E, 1);
+    } else if mode == InteractionMode::RigidBody {
+        draw_str_5x7(frame, "RIGID DRAG THEN RELEASE", tx, ty, 0xFFFFCC80, 1);
         ty += PaletteLayout::LINE;
-        draw_str_5x7(frame, "EXPLODE O I E KEYS", tx, ty, 0xFF9E9E9E, 1);
+        draw_str_5x7(frame, "TAB CYCLE MODES", tx, ty, 0xFF9E9E9E, 1);
+    } else {
+        draw_str_5x7(frame, "SHIFT DRAG RECT  BRACKETS SIZE", tx, ty, 0xFF90CAF9, 1);
+        ty += PaletteLayout::LINE;
+        draw_str_5x7(frame, "TAB MODES  RECIPES BELOW", tx, ty, 0xFFFFEB3B, 1);
+    }
+}
+
+fn draw_recipe_strip(frame: &mut [u32], layout: &PaletteLayout, active_idx: Option<usize>) {
+    let tx = layout.panel_x + PaletteLayout::INNER;
+    let mut ty = layout.panel_y + layout.recipe_y_off;
+    draw_str_5x7(frame, "WOW RECIPES - CLICK TO LOAD", tx, ty, 0xFFFFEB3B, 1);
+    ty += PaletteLayout::LINE;
+    let row_w = layout.panel_w - 2 * PaletteLayout::INNER;
+    for i in 0..layout.recipe_count {
+        let Some(r) = recipes::wow_recipe_at(i) else {
+            continue;
+        };
+        let y = ty + i * layout.recipe_row_h;
+        let on = active_idx == Some(i);
+        let bg = if on { 0xFF3E2723 } else { 0xFF1A1A24 };
+        draw_panel(frame, tx, y, row_w, layout.recipe_row_h.saturating_sub(2), bg);
+        if on {
+            draw_rect_outline(
+                frame,
+                tx,
+                y,
+                row_w,
+                layout.recipe_row_h.saturating_sub(2),
+                0xFFFFEB3B,
+            );
+        }
+        // Mini swatches for first two materials
+        let mut sx = tx + 3;
+        for (mi, &mid) in r.materials.iter().take(2).enumerate() {
+            let color = materials::BUILTINS
+                .iter()
+                .find(|d| d.id == mid)
+                .map(|d| d.color_argb)
+                .unwrap_or(0xFF888888);
+            let sw = 6 * SCALE;
+            let sh = 6 * SCALE;
+            draw_panel(frame, sx, y + 2 * SCALE, sw, sh, color);
+            sx += sw + 2;
+            if mi == 0 {
+                // tiny gap between pair
+            }
+        }
+        draw_str_5x7(
+            frame,
+            r.desktop_line,
+            sx + 4,
+            y + 3 * SCALE,
+            if on { 0xFFFFF59D } else { 0xFFE0E0E0 },
+            1,
+        );
     }
 }
 
@@ -1226,37 +1372,47 @@ fn draw_material_palette(
     layout: &PaletteLayout,
     mode: InteractionMode,
 ) {
-    let mut x = layout.swatch_base_x();
-    let sy = layout.swatch_base_y();
     for idx in 0..layout.count {
         let def = materials::paintable_builtin_at(idx).expect("paintable material");
+        let (cx, cy) = layout.cell_origin(idx);
         let disabled = mode == InteractionMode::RigidBody && !is_rigid_body_eligible(def);
         let color = if disabled {
             dim_argb(def.color_argb)
         } else {
             def.color_argb
         };
-        draw_panel(frame, x, sy, layout.swatch_w, layout.swatch_h, color);
+        // Center swatch in cell.
+        let sx = cx + (layout.stride_x.saturating_sub(layout.swatch_w)) / 2;
+        let sy = cy;
+        draw_panel(frame, sx, sy, layout.swatch_w, layout.swatch_h, color);
         if def.id == selected && !disabled {
             draw_rect_outline(
                 frame,
-                x.saturating_sub(SCALE),
+                sx.saturating_sub(SCALE),
                 sy.saturating_sub(SCALE),
                 layout.swatch_w + 2 * SCALE,
                 layout.swatch_h + 2 * SCALE,
                 0xFFFFFFFF,
             );
         }
-        if idx < 10 {
-            draw_digit(
-                frame,
-                idx as u8,
-                x + 3 * SCALE,
-                sy + 10 * SCALE,
-                if disabled { 0xFF444444 } else { 0xFF000000 },
-            );
-        }
-        x += layout.stride;
+        let label = materials::material_short_label(def.id);
+        let lw = text_width_5x7(label, 1);
+        let lx = cx + layout.stride_x.saturating_sub(lw + 4) / 2;
+        let ly = sy + layout.swatch_h + 2;
+        draw_str_5x7(
+            frame,
+            label,
+            lx,
+            ly,
+            if disabled {
+                0xFF555555
+            } else if def.id == selected {
+                0xFFFFF59D
+            } else {
+                0xFFCFD8DC
+            },
+            1,
+        );
     }
 }
 
@@ -1492,6 +1648,9 @@ fn flags_subtext(cell: Cell) -> String {
     }
     if f & cell_flags::ELECTRIFIED != 0 {
         parts.push("ELEC");
+    }
+    if f & cell_flags::ASLEEP != 0 {
+        parts.push("SLEEP");
     }
     if f & cell_flags::RIGID_BODY_SIM != 0 {
         parts.push("RBS");

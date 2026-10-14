@@ -417,9 +417,120 @@
         line-height: 1.5;
       }
 
+      /* Wow recipes — discoverable “whoa” loops */
+      #recipes-block {
+        margin-bottom: 16px;
+        padding: 12px;
+        border-radius: 10px;
+        background: #1c1810;
+        border: 1px solid #5a4a20;
+      }
+      #recipes-block h3 {
+        font-size: 13px;
+        font-weight: 700;
+        color: #ffeb3b;
+        margin-bottom: 6px;
+        letter-spacing: 0.02em;
+      }
+      #recipes-intro {
+        font-size: 12px;
+        color: #b8a878;
+        line-height: 1.4;
+        margin-bottom: 10px;
+      }
+      #panel-recipes {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .recipe-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 10px;
+        border: 2px solid #665520;
+        border-radius: 999px;
+        background: #2a2414;
+        color: #f5e6a8;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .recipe-btn:hover {
+        border-color: #ffeb3b;
+        background: #3a3018;
+      }
+      .recipe-btn--active {
+        border-color: #ffeb3b;
+        background: #4a3810;
+        color: #fffde7;
+        box-shadow: 0 0 0 1px #ffeb3b;
+      }
+      .recipe-swatches {
+        display: inline-flex;
+        gap: 3px;
+      }
+      .recipe-swatch {
+        width: 10px;
+        height: 10px;
+        border-radius: 2px;
+        border: 1px solid rgba(255, 255, 255, 0.35);
+        flex-shrink: 0;
+      }
+      #recipe-tip {
+        font-size: 12px;
+        color: #d4c48a;
+        line-height: 1.45;
+        min-height: 2.6em;
+      }
+      #recipe-tip strong {
+        color: #fff59d;
+        font-weight: 600;
+      }
+
+      /* First-run tip (dismissible) */
+      #first-run {
+        position: absolute;
+        left: 50%;
+        bottom: 12px;
+        transform: translateX(-50%);
+        z-index: 15;
+        max-width: min(420px, calc(100% - 24px));
+        padding: 10px 14px;
+        border-radius: 10px;
+        background: rgba(20, 18, 10, 0.92);
+        border: 1px solid #6b5a28;
+        color: #f0e6c0;
+        font-size: 13px;
+        line-height: 1.4;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        display: none;
+        align-items: flex-start;
+        gap: 10px;
+      }
+      #first-run.visible {
+        display: flex;
+      }
+      #first-run p {
+        flex: 1 1 auto;
+        margin: 0;
+      }
+      #first-run-dismiss {
+        flex-shrink: 0;
+        border: none;
+        background: transparent;
+        color: #c0b080;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0 2px;
+      }
+
       #panel-materials {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
         gap: 8px;
       }
       .mat-btn {
@@ -434,11 +545,19 @@
         cursor: pointer;
         font: inherit;
         font-size: 11px;
-        min-height: 52px;
+        min-height: 58px;
+        transition:
+          border-color 0.12s ease,
+          background 0.12s ease;
+      }
+      .mat-btn:hover:not(:disabled) {
+        border-color: #8ab4f8;
+        background: #252a32;
       }
       .mat-btn--selected {
         border-color: #fff;
         box-shadow: 0 0 0 1px #fff;
+        background: #2a3040;
       }
       .mat-btn--ineligible,
       .mat-btn:disabled {
@@ -446,16 +565,28 @@
         cursor: not-allowed;
       }
       .mat-swatch {
-        height: 18px;
+        height: 20px;
         width: 100%;
         border-radius: 4px;
         flex-shrink: 0;
+        border: 1px solid rgba(255, 255, 255, 0.12);
       }
       .mat-name {
-        padding: 4px 2px 0;
+        padding: 5px 2px 0;
         text-align: center;
         line-height: 1.2;
         word-break: break-word;
+        font-weight: 600;
+        font-size: 12px;
+      }
+      .mat-short {
+        display: block;
+        font-size: 10px;
+        font-weight: 500;
+        color: #888;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        margin-top: 2px;
       }
 
       @media (min-width: 600px) {
@@ -483,6 +614,17 @@
               <span id="selection-name" class="pick-name"></span>
             </span>
           </div>
+        </div>
+        <div id="first-run" role="status" aria-live="polite">
+          <p>
+            <strong>Paint</strong> with left click,
+            <strong>erase</strong> with right click. Open
+            <strong>Materials &amp; modes</strong> and try a
+            <strong>wow recipe</strong> (lava + water, fire, acid, C4).
+          </p>
+          <button type="button" id="first-run-dismiss" aria-label="Dismiss tip">
+            &times;
+          </button>
         </div>
         <button
           type="button"
@@ -596,10 +738,29 @@
           />
           <span id="brush-value">4</span>
         </div>
+        <div id="recipes-block">
+          <h3>Wow recipes</h3>
+          <p id="recipes-intro">
+            Tap a recipe to load a material. Tap again to cycle the next
+            ingredient — then paint and watch.
+          </p>
+          <div id="panel-recipes"></div>
+          <p id="recipe-tip" aria-live="polite"></p>
+        </div>
         <div class="material-detail">
           <div id="material-detail-title" class="material-detail-title"></div>
           <p id="material-detail-body" class="material-detail-body"></p>
         </div>
+        <p
+          style="
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 8px;
+            line-height: 1.35;
+          "
+        >
+          Scan by color + name. Tap a chip to paint; detail blurb updates above.
+        </p>
         <div id="panel-materials"></div>
       </div>
     </div>
@@ -620,6 +781,26 @@
       openBtn.addEventListener("click", openPanel);
       backdrop.addEventListener("click", closePanel);
       closeBtn.addEventListener("click", closePanel);
+
+      (function firstRunTip() {
+        var el = document.getElementById("first-run");
+        var dismiss = document.getElementById("first-run-dismiss");
+        if (!el || !dismiss) return;
+        var key = "sandii_first_run_v1";
+        try {
+          if (sessionStorage.getItem(key) === "1") return;
+        } catch (e) {}
+        el.classList.add("visible");
+        function hide() {
+          el.classList.remove("visible");
+          try {
+            sessionStorage.setItem(key, "1");
+          } catch (e) {}
+        }
+        dismiss.addEventListener("click", hide);
+        openBtn.addEventListener("click", hide);
+        setTimeout(hide, 14000);
+      })();
     </script>
     <script>
       (function () {

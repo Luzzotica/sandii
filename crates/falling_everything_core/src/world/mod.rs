@@ -72,16 +72,19 @@ impl RectI {
 }
 
 pub type MaterialId = u16;
-pub const CHUNK_W: i32 = 32;
-pub const CHUNK_H: i32 = 32;
-pub const CHUNK_SIZE: i32 = 32;
+/// Parallel / dirty work-unit width (16:9 aspect with [`CHUNK_H`]).
+pub const CHUNK_W: i32 = 64;
+/// Parallel / dirty work-unit height (16:9 aspect with [`CHUNK_W`]).
+pub const CHUNK_H: i32 = 36;
+/// @deprecated Prefer [`CHUNK_W`] / [`CHUNK_H`]. Kept as max side for legacy single-size call sites.
+pub const CHUNK_SIZE: i32 = CHUNK_W;
 pub const CHUNK_AREA: usize = (CHUNK_W as usize) * (CHUNK_H as usize);
 /// How many ticks a chunk stays awake after the last wake signal.
 /// Gives settling cascades (sand piles, liquid spreading) time to propagate
 /// before sleeping the chunk.
 pub const WAKE_COOLDOWN: u8 = 16;
 
-const _: () = assert!(CHUNK_W == CHUNK_H && CHUNK_W == CHUNK_SIZE);
+const _: () = assert!(CHUNK_W * 9 == CHUNK_H * 16, "chunks must be 16:9");
 
 pub mod material {
     use super::MaterialId;
@@ -113,6 +116,9 @@ pub mod material {
     pub const OBSIDIAN: MaterialId = 24;
     pub const ICE: MaterialId = 25;
     pub const MELTED_WAX: MaterialId = 26;
+    pub const METAL: MaterialId = 27;
+    /// Short-lived charge carrier; spreads along conductive materials (metal, water).
+    pub const ELECTRICITY: MaterialId = 28;
     pub const MAX_MATERIALS: usize = 1024;
 }
 
@@ -528,6 +534,9 @@ pub mod cell_flags {
     /// Set when temperature crosses [`MaterialProps::autoignition_temperature`] or when ignited by neighbors.
     /// Molten fuels with `autoignition_temperature == 0` (e.g. lava) do not use this flag.
     pub const ON_FIRE: u8 = 1 << 5;
+    /// Settled granular (sand-like) that participates in static physics colliders.
+    /// Cleared when a neighboring cell changes (wake).
+    pub const ASLEEP: u8 = 1 << 6;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -617,6 +626,8 @@ pub struct MaterialProps {
     /// Scaled like chemistry: `ΔT_neighbor ≈ pulse * 256 / neighbor_volumetric_heat_capacity`. `0` = derive from `heat_generation_rate`.
     /// Negative values cool neighbors (“alchemical” endothermic ignition).
     pub ignition_thermal_pulse: i16,
+    /// Conducts [`material::ELECTRICITY`] / [`cell_flags::ELECTRIFIED`] (metal, water).
+    pub conductive: bool,
 }
 
 impl Default for MaterialProps {
@@ -688,6 +699,7 @@ impl MaterialProps {
             freeze_into: material::EMPTY,
             heat_generation_rate: 0,
             ignition_thermal_pulse: 0,
+            conductive: false,
         }
     }
 
@@ -786,7 +798,6 @@ const fn region_file_version() -> u8 {
 }
 
 pub struct World {
-    chunk_size: i32,
     region_size: i32,
 
     store: DenseCellStore,
@@ -836,14 +847,18 @@ fn cell_contributes_static_collider_refs(
     if store.grid_index(p).is_none() {
         return false;
     }
-    material_props
+    if cell.material() == material::EMPTY
+        || rigid_ids.contains_key(&p)
+        || cell.has_flag(cell_flags::RIGID_PIXEL)
+    {
+        return false;
+    }
+    let props = material_props
         .get(cell.material() as usize)
         .copied()
-        .unwrap_or_default()
-        .inert()
-        && cell.material() != material::EMPTY
-        && !rigid_ids.contains_key(&p)
-        && !cell.has_flag(cell_flags::RIGID_PIXEL)
+        .unwrap_or_default();
+    // Inert terrain always collides; settled granular (ASLEEP) joins the static mesh too.
+    props.inert() || cell.has_flag(cell_flags::ASLEEP)
 }
 
 impl World {
@@ -866,11 +881,10 @@ impl World {
         let w = region_size;
         let h = region_size;
         let origin = Vec2i::new(0, 0);
-        let cx = (w + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let cy = (h + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let cx = (w + CHUNK_W - 1) / CHUNK_W;
+        let cy = (h + CHUNK_H - 1) / CHUNK_H;
 
         Self {
-            chunk_size: CHUNK_SIZE,
             region_size,
             store: DenseCellStore::new(w, h, origin),
             hash_chunks: SpatialHashChunkStore::with_capacity((cx * cy).max(1) as usize * 4),
@@ -907,8 +921,19 @@ impl World {
         self.ambient_temperature_k = k;
     }
 
+    /// Legacy single-size accessor; equals [`CHUNK_W`]. Prefer [`Self::chunk_w`] / [`Self::chunk_h`].
     pub fn chunk_size(&self) -> i32 {
-        self.chunk_size
+        CHUNK_W
+    }
+
+    #[inline]
+    pub fn chunk_w(&self) -> i32 {
+        CHUNK_W
+    }
+
+    #[inline]
+    pub fn chunk_h(&self) -> i32 {
+        CHUNK_H
     }
 
     pub fn grid_width(&self) -> i32 {
@@ -936,8 +961,8 @@ impl World {
             || bounds.min != self.store.origin()
         {
             self.store.resize(new_w, new_h, bounds.min);
-            let cx = (new_w + CHUNK_SIZE - 1) / CHUNK_SIZE;
-            let cy = (new_h + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            let cx = (new_w + CHUNK_W - 1) / CHUNK_W;
+            let cy = (new_h + CHUNK_H - 1) / CHUNK_H;
             self.chunks_x = cx;
             self.chunks_y = cy;
             self.hash_chunks = SpatialHashChunkStore::with_capacity((cx * cy).max(1) as usize * 4);
@@ -979,10 +1004,10 @@ impl World {
 
         // Save outgoing cells (in old area but NOT in new area) to hash_chunks.
         // A chunk that partially overlaps both areas must still save its non-overlap cells.
-        let old_base_cx = div_floor(old_origin.x, CHUNK_SIZE);
-        let old_base_cy = div_floor(old_origin.y, CHUNK_SIZE);
-        let old_chunks_x = (old_w + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let old_chunks_y = (old_h + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let old_base_cx = div_floor(old_origin.x, CHUNK_W);
+        let old_base_cy = div_floor(old_origin.y, CHUNK_H);
+        let old_chunks_x = (old_w + CHUNK_W - 1) / CHUNK_W;
+        let old_chunks_y = (old_h + CHUNK_H - 1) / CHUNK_H;
 
         for lcy in 0..old_chunks_y {
             for lcx in 0..old_chunks_x {
@@ -990,9 +1015,9 @@ impl World {
                     x: old_base_cx + lcx,
                     y: old_base_cy + lcy,
                 };
-                let chunk_min = Vec2i::new(coord.x * CHUNK_SIZE, coord.y * CHUNK_SIZE);
+                let chunk_min = Vec2i::new(coord.x * CHUNK_W, coord.y * CHUNK_H);
                 let chunk_max =
-                    Vec2i::new(chunk_min.x + CHUNK_SIZE - 1, chunk_min.y + CHUNK_SIZE - 1);
+                    Vec2i::new(chunk_min.x + CHUNK_W - 1, chunk_min.y + CHUNK_H - 1);
                 let chunk_rect = RectI::new(chunk_min, chunk_max);
 
                 let clipped = chunk_rect.intersection(&old_rect).unwrap_or(chunk_rect);
@@ -1024,8 +1049,8 @@ impl World {
                         }
                         if let Some(cell) = self.store.get_read(Vec2i::new(x, y)) {
                             if cell.material() != material::EMPTY {
-                                let lx = x - coord.x * CHUNK_SIZE;
-                                let ly = y - coord.y * CHUNK_SIZE;
+                                let lx = x - coord.x * CHUNK_W;
+                                let ly = y - coord.y * CHUNK_H;
                                 let local_idx = chunk_local_index(lx, ly);
                                 if let Some(slab) = self.hash_chunks.get_chunk_mut(coord) {
                                     slab[local_idx] = cell;
@@ -1043,10 +1068,10 @@ impl World {
 
         // Load incoming cells from hash_chunks (in new area but NOT in old area).
         // Partial-overlap chunks must still load their non-overlap portion.
-        let new_base_cx = div_floor(new_origin.x, CHUNK_SIZE);
-        let new_base_cy = div_floor(new_origin.y, CHUNK_SIZE);
-        let new_chunks_x = (new_w + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let new_chunks_y = (new_h + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let new_base_cx = div_floor(new_origin.x, CHUNK_W);
+        let new_base_cy = div_floor(new_origin.y, CHUNK_H);
+        let new_chunks_x = (new_w + CHUNK_W - 1) / CHUNK_W;
+        let new_chunks_y = (new_h + CHUNK_H - 1) / CHUNK_H;
 
         let mut loaded_coords = Vec::new();
         for lcy in 0..new_chunks_y {
@@ -1055,9 +1080,9 @@ impl World {
                     x: new_base_cx + lcx,
                     y: new_base_cy + lcy,
                 };
-                let chunk_min = Vec2i::new(coord.x * CHUNK_SIZE, coord.y * CHUNK_SIZE);
+                let chunk_min = Vec2i::new(coord.x * CHUNK_W, coord.y * CHUNK_H);
                 let chunk_max =
-                    Vec2i::new(chunk_min.x + CHUNK_SIZE - 1, chunk_min.y + CHUNK_SIZE - 1);
+                    Vec2i::new(chunk_min.x + CHUNK_W - 1, chunk_min.y + CHUNK_H - 1);
                 let chunk_rect = RectI::new(chunk_min, chunk_max);
 
                 if let Some(slab) = self.hash_chunks.get_chunk(coord) {
@@ -1068,8 +1093,8 @@ impl World {
                             if old_rect.contains(Vec2i::new(x, y)) {
                                 continue; // overlap — already copied by relocate
                             }
-                            let lx = x - coord.x * CHUNK_SIZE;
-                            let ly = y - coord.y * CHUNK_SIZE;
+                            let lx = x - coord.x * CHUNK_W;
+                            let ly = y - coord.y * CHUNK_H;
                             let local_idx = chunk_local_index(lx, ly);
                             let cell = slab_copy[local_idx];
                             if cell.material() != material::EMPTY {
@@ -1116,6 +1141,12 @@ impl World {
             .get(id as usize)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Pointer to the material-props table for sim grids (same lifetime as `&World` / step).
+    #[inline]
+    pub(crate) fn material_props_ptr(&self) -> *const MaterialProps {
+        self.material_props.as_ptr()
     }
 
     pub fn set_material_props(&mut self, id: MaterialId, props: MaterialProps) {
@@ -1232,8 +1263,8 @@ impl World {
 
     pub fn wake_chunk_at(&mut self, p: Vec2i) {
         let origin = self.store.origin();
-        let cx = div_floor(p.x - origin.x, self.chunk_size);
-        let cy = div_floor(p.y - origin.y, self.chunk_size);
+        let cx = div_floor(p.x - origin.x, CHUNK_W);
+        let cy = div_floor(p.y - origin.y, CHUNK_H);
         self.wake_chunk_local(cx, cy);
     }
 
@@ -1245,8 +1276,8 @@ impl World {
 
     pub fn wake_chunk_and_neighbors(&mut self, p: Vec2i) {
         let origin = self.store.origin();
-        let cx = div_floor(p.x - origin.x, self.chunk_size);
-        let cy = div_floor(p.y - origin.y, self.chunk_size);
+        let cx = div_floor(p.x - origin.x, CHUNK_W);
+        let cy = div_floor(p.y - origin.y, CHUNK_H);
         for dy in -1..=1 {
             for dx in -1..=1 {
                 self.wake_chunk_local(cx + dx, cy + dy);
@@ -1256,8 +1287,8 @@ impl World {
 
     pub fn is_chunk_awake(&self, coord: ChunkCoord) -> bool {
         let origin = self.store.origin();
-        let base_cx = div_floor(origin.x, self.chunk_size);
-        let base_cy = div_floor(origin.y, self.chunk_size);
+        let base_cx = div_floor(origin.x, CHUNK_W);
+        let base_cy = div_floor(origin.y, CHUNK_H);
         let cx = coord.x - base_cx;
         let cy = coord.y - base_cy;
         self.chunk_local_index(cx, cy)
@@ -1354,6 +1385,21 @@ impl World {
         if cell.material() == material::EMPTY && cell.temperature() == 0 {
             cell = cell.with_temperature(self.ambient_temperature_k());
         }
+        // Electricity is a visitor: never replace conductive media (metal/water) with
+        // ELECTRICITY material — only flag them ELECTRIFIED so the medium restores after.
+        if cell.material() == material::ELECTRICITY {
+            if let Some(old_c) = self.store.get_read(p) {
+                let om = old_c.material();
+                if om != material::EMPTY
+                    && om != material::ELECTRICITY
+                    && self.material_props(om).conductive
+                {
+                    let mut charged = old_c;
+                    charged.or_flags(cell_flags::ELECTRIFIED);
+                    cell = charged;
+                }
+            }
+        }
         Self::assert_supported_material_id(cell.material());
         let old = self.store.get_read(p);
         if self.store.set_read(p, cell) {
@@ -1366,6 +1412,8 @@ impl World {
             }
             self.mark_chunk_dirty_for(p);
             self.wake_chunk_and_neighbors(p);
+            // Adjacent change wakes settled sand so piles can collapse again.
+            self.wake_asleep_neighbors(p);
 
             let before = old.map_or(false, |c| self.cell_contributes_static_collider(p, c));
             self.clear_rigid_id(p);
@@ -1376,10 +1424,34 @@ impl World {
         }
     }
 
+    /// Clear [`cell_flags::ASLEEP`] on the 8-neighborhood so settled sand re-enters motion.
+    pub fn wake_asleep_neighbors(&mut self, p: Vec2i) {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let np = Vec2i::new(p.x + dx, p.y + dy);
+                let Some(mut c) = self.store.get_read(np) else {
+                    continue;
+                };
+                if !c.has_flag(cell_flags::ASLEEP) {
+                    continue;
+                }
+                c.clear_flag_bits(cell_flags::ASLEEP);
+                c.or_flags(cell_flags::IS_FREE_FALLING);
+                let _ = self.store.set_read(np, c);
+                self.mark_chunk_dirty_for(np);
+                self.mark_chunk_physics_dirty_for(np);
+                self.wake_chunk_and_neighbors(np);
+            }
+        }
+    }
+
     fn mark_chunk_dirty_for(&mut self, p: Vec2i) {
         let origin = self.store.origin();
-        let cx = div_floor(p.x - origin.x, self.chunk_size);
-        let cy = div_floor(p.y - origin.y, self.chunk_size);
+        let cx = div_floor(p.x - origin.x, CHUNK_W);
+        let cy = div_floor(p.y - origin.y, CHUNK_H);
         if cx >= 0 && cx < self.chunks_x && cy >= 0 && cy < self.chunks_y {
             self.chunk_dirty[(cy * self.chunks_x + cx) as usize] = true;
         }
@@ -1387,8 +1459,8 @@ impl World {
 
     fn mark_chunk_physics_dirty_for(&mut self, p: Vec2i) {
         let origin = self.store.origin();
-        let cx = div_floor(p.x - origin.x, self.chunk_size);
-        let cy = div_floor(p.y - origin.y, self.chunk_size);
+        let cx = div_floor(p.x - origin.x, CHUNK_W);
+        let cy = div_floor(p.y - origin.y, CHUNK_H);
         if cx >= 0 && cx < self.chunks_x && cy >= 0 && cy < self.chunks_y {
             self.chunk_physics_dirty[(cy * self.chunks_x + cx) as usize] = true;
         }
@@ -1398,8 +1470,8 @@ impl World {
     /// since the last call (`set_cell`, sim commit in `finish_sim`, or rigid id toggles).
     pub fn take_physics_dirty_chunks(&mut self) -> Vec<ChunkCoord> {
         let origin = self.store.origin();
-        let base_cx = div_floor(origin.x, self.chunk_size);
-        let base_cy = div_floor(origin.y, self.chunk_size);
+        let base_cx = div_floor(origin.x, CHUNK_W);
+        let base_cy = div_floor(origin.y, CHUNK_H);
         let mut out = Vec::new();
         for cy in 0..self.chunks_y {
             for cx in 0..self.chunks_x {
@@ -1419,8 +1491,8 @@ impl World {
     /// Return chunk coords for all currently-awake chunks.
     pub fn awake_chunk_coords(&self) -> Vec<ChunkCoord> {
         let origin = self.store.origin();
-        let base_cx = div_floor(origin.x, self.chunk_size);
-        let base_cy = div_floor(origin.y, self.chunk_size);
+        let base_cx = div_floor(origin.x, CHUNK_W);
+        let base_cy = div_floor(origin.y, CHUNK_H);
         let mut out = Vec::new();
         for cy in 0..self.chunks_y {
             for cx in 0..self.chunks_x {
@@ -1570,6 +1642,9 @@ impl World {
         if mat == material::EMBER {
             return 160;
         }
+        if mat == material::ELECTRICITY {
+            return 10;
+        }
         if props.corrosion_max_hp > 0 {
             return props.corrosion_max_hp;
         }
@@ -1620,7 +1695,6 @@ impl World {
         let height = store.height();
         let chunks_x = self.chunks_x;
         let chunks_y = self.chunks_y;
-        let chunk_size = self.chunk_size;
 
         let mut mark_indices: Vec<usize> = Vec::new();
 
@@ -1631,10 +1705,10 @@ impl World {
                     continue;
                 }
                 let mut dirty = false;
-                'scan: for ly in 0..chunk_size {
-                    for lx in 0..chunk_size {
-                        let x = origin.x + cx * chunk_size + lx;
-                        let y = origin.y + cy * chunk_size + ly;
+                'scan: for ly in 0..CHUNK_H {
+                    for lx in 0..CHUNK_W {
+                        let x = origin.x + cx * CHUNK_W + lx;
+                        let y = origin.y + cy * CHUNK_H + ly;
                         let lx_g = x - origin.x;
                         let ly_g = y - origin.y;
                         if lx_g < 0 || lx_g >= width || ly_g < 0 || ly_g >= height {
@@ -1730,8 +1804,8 @@ impl World {
         let origin = self.store.origin();
         let width = self.store.width();
         let height = self.store.height();
-        let base_cx = div_floor(origin.x, self.chunk_size);
-        let base_cy = div_floor(origin.y, self.chunk_size);
+        let base_cx = div_floor(origin.x, CHUNK_W);
+        let base_cy = div_floor(origin.y, CHUNK_H);
         for cy in 0..self.chunks_y {
             for cx in 0..self.chunks_x {
                 let idx = (cy * self.chunks_x + cx) as usize;
@@ -1740,10 +1814,10 @@ impl World {
                         x: cx + base_cx,
                         y: cy + base_cy,
                     };
-                    let min_x = origin.x + cx * self.chunk_size;
-                    let min_y = origin.y + cy * self.chunk_size;
-                    let max_x = (min_x + self.chunk_size - 1).min(origin.x + width - 1);
-                    let max_y = (min_y + self.chunk_size - 1).min(origin.y + height - 1);
+                    let min_x = origin.x + cx * CHUNK_W;
+                    let min_y = origin.y + cy * CHUNK_H;
+                    let max_x = (min_x + CHUNK_W - 1).min(origin.x + width - 1);
+                    let max_y = (min_y + CHUNK_H - 1).min(origin.y + height - 1);
                     out.push((
                         coord,
                         RectI::new(Vec2i::new(min_x, min_y), Vec2i::new(max_x, max_y)),
@@ -1758,8 +1832,8 @@ impl World {
         let px = (pass & 1) as i32;
         let py = ((pass >> 1) & 1) as i32;
         let origin = self.store.origin();
-        let base_cx = div_floor(origin.x, self.chunk_size);
-        let base_cy = div_floor(origin.y, self.chunk_size);
+        let base_cx = div_floor(origin.x, CHUNK_W);
+        let base_cy = div_floor(origin.y, CHUNK_H);
         let mut coords = Vec::new();
         for cy in 0..self.chunks_y {
             for cx in 0..self.chunks_x {
@@ -1784,13 +1858,13 @@ impl World {
     /// World-space rectangle for one dense-grid chunk.
     ///
     /// [`ChunkCoord`] values from [`Self::take_physics_dirty_chunks`], [`Self::active_chunk_coords_for_pass`],
-    /// and the simulation scheduler use `coord = local_index + div_floor(origin, chunk_size)` so that
+    /// and the simulation scheduler use `coord = local_index + div_floor(origin, CHUNK_W/H)` so that
     /// stepping and static colliders stay aligned with the store even when `origin` is not a multiple of
-    /// [`CHUNK_SIZE`]. This must **not** use `coord * chunk_size` alone.
+    /// the chunk size. This must **not** use `coord * chunk` alone.
     pub fn bounds_for_chunk(&self, coord: ChunkCoord) -> RectI {
         let origin = self.store.origin();
-        let base_cx = div_floor(origin.x, self.chunk_size);
-        let base_cy = div_floor(origin.y, self.chunk_size);
+        let base_cx = div_floor(origin.x, CHUNK_W);
+        let base_cy = div_floor(origin.y, CHUNK_H);
         let lcx = coord.x - base_cx;
         let lcy = coord.y - base_cy;
         let w = self.store.width();
@@ -1798,10 +1872,10 @@ impl World {
         if lcx < 0 || lcy < 0 || lcx >= self.chunks_x || lcy >= self.chunks_y || w <= 0 || h <= 0 {
             return RectI::new(origin, origin);
         }
-        let min_x = origin.x + lcx * self.chunk_size;
-        let min_y = origin.y + lcy * self.chunk_size;
-        let max_x = (min_x + self.chunk_size - 1).min(origin.x + w - 1);
-        let max_y = (min_y + self.chunk_size - 1).min(origin.y + h - 1);
+        let min_x = origin.x + lcx * CHUNK_W;
+        let min_y = origin.y + lcy * CHUNK_H;
+        let max_x = (min_x + CHUNK_W - 1).min(origin.x + w - 1);
+        let max_y = (min_y + CHUNK_H - 1).min(origin.y + h - 1);
         RectI::new(Vec2i::new(min_x, min_y), Vec2i::new(max_x, max_y))
     }
 
@@ -1812,13 +1886,13 @@ impl World {
             return None;
         }
         let origin = self.store.origin();
-        let lcx = div_floor(p.x - origin.x, self.chunk_size);
-        let lcy = div_floor(p.y - origin.y, self.chunk_size);
+        let lcx = div_floor(p.x - origin.x, CHUNK_W);
+        let lcy = div_floor(p.y - origin.y, CHUNK_H);
         if lcx < 0 || lcy < 0 || lcx >= self.chunks_x || lcy >= self.chunks_y {
             return None;
         }
-        let base_cx = div_floor(origin.x, self.chunk_size);
-        let base_cy = div_floor(origin.y, self.chunk_size);
+        let base_cx = div_floor(origin.x, CHUNK_W);
+        let base_cy = div_floor(origin.y, CHUNK_H);
         Some(ChunkCoord {
             x: lcx + base_cx,
             y: lcy + base_cy,
@@ -1896,22 +1970,21 @@ impl World {
         let region_max_x = region_min_x + self.region_size - 1;
         let region_max_y = region_min_y + self.region_size - 1;
 
-        let cs = self.chunk_size;
         let mut chunk_cells = Vec::new();
-        let chunk_min_cx = div_floor(region_min_x, cs);
-        let chunk_max_cx = div_floor(region_max_x, cs);
-        let chunk_min_cy = div_floor(region_min_y, cs);
-        let chunk_max_cy = div_floor(region_max_y, cs);
+        let chunk_min_cx = div_floor(region_min_x, CHUNK_W);
+        let chunk_max_cx = div_floor(region_max_x, CHUNK_W);
+        let chunk_min_cy = div_floor(region_min_y, CHUNK_H);
+        let chunk_max_cy = div_floor(region_max_y, CHUNK_H);
 
         for cy in chunk_min_cy..=chunk_max_cy {
             for cx in chunk_min_cx..=chunk_max_cx {
                 let coord = ChunkCoord { x: cx, y: cy };
-                let mut cells = vec![Cell::new(); (cs * cs) as usize];
-                for ly in 0..cs {
-                    for lx in 0..cs {
-                        let p = Vec2i::new(cx * cs + lx, cy * cs + ly);
+                let mut cells = vec![Cell::new(); CHUNK_AREA];
+                for ly in 0..CHUNK_H {
+                    for lx in 0..CHUNK_W {
+                        let p = Vec2i::new(cx * CHUNK_W + lx, cy * CHUNK_H + ly);
                         if let Some(cell) = self.store.get_read(p) {
-                            cells[(ly * cs + lx) as usize] = cell;
+                            cells[chunk_local_index(lx, ly)] = cell;
                         }
                     }
                 }
@@ -1923,7 +1996,8 @@ impl World {
 
         let payload = RegionFile {
             version: region_file_version(),
-            chunk_size: cs,
+            // Encode W in chunk_size for format; H is implied by CHUNK_AREA / W at load.
+            chunk_size: CHUNK_W,
             cells: chunk_cells,
         };
         if let Ok(encoded) = bincode::serialize(&payload) {
@@ -1945,12 +2019,17 @@ impl World {
         };
         let cs = payload.chunk_size;
         for (coord, cells) in payload.cells {
-            if cs == CHUNK_SIZE && cells.len() == CHUNK_AREA {
+            if cs == CHUNK_W && cells.len() == CHUNK_AREA {
                 let _ = self.hash_chunks.upsert_chunk(coord, &cells);
             }
-            for ly in 0..cs {
+            let ch = if cs > 0 && cells.len() % (cs as usize) == 0 {
+                (cells.len() / cs as usize) as i32
+            } else {
+                CHUNK_H
+            };
+            for ly in 0..ch {
                 for lx in 0..cs {
-                    let p = Vec2i::new(coord.x * cs + lx, coord.y * cs + ly);
+                    let p = Vec2i::new(coord.x * cs + lx, coord.y * ch + ly);
                     let cell = cells[(ly * cs + lx) as usize];
                     if cell.material() != material::EMPTY {
                         if self.store.set_read(p, cell) {

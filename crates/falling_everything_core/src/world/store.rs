@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{Cell, ChunkCoord, RectI, Vec2i, CHUNK_AREA, CHUNK_SIZE};
+use super::{Cell, ChunkCoord, RectI, Vec2i, CHUNK_AREA, CHUNK_H, CHUNK_W};
 
 pub struct DenseCellStore {
     grids: [Vec<Cell>; 2],
@@ -283,8 +283,8 @@ impl SpatialHashChunkStore {
     pub fn remove_outside_world_rect(&mut self, bounds: RectI) {
         let mut to_remove = Vec::new();
         for coord in self.handles.keys().copied() {
-            let min = Vec2i::new(coord.x * CHUNK_SIZE, coord.y * CHUNK_SIZE);
-            let max = Vec2i::new(min.x + CHUNK_SIZE - 1, min.y + CHUNK_SIZE - 1);
+            let min = Vec2i::new(coord.x * CHUNK_W, coord.y * CHUNK_H);
+            let max = Vec2i::new(min.x + CHUNK_W - 1, min.y + CHUNK_H - 1);
             let chunk_rect = RectI::new(min, max);
             if !chunk_rect.intersects(bounds) {
                 to_remove.push(coord);
@@ -297,10 +297,10 @@ impl SpatialHashChunkStore {
 
     #[inline]
     pub fn split_world_to_chunk(p: Vec2i) -> (ChunkCoord, usize) {
-        let cx = super::div_floor(p.x, CHUNK_SIZE);
-        let cy = super::div_floor(p.y, CHUNK_SIZE);
-        let lx = p.x - cx * CHUNK_SIZE;
-        let ly = p.y - cy * CHUNK_SIZE;
+        let cx = super::div_floor(p.x, CHUNK_W);
+        let cy = super::div_floor(p.y, CHUNK_H);
+        let lx = p.x - cx * CHUNK_W;
+        let ly = p.y - cy * CHUNK_H;
         (
             ChunkCoord { x: cx, y: cy },
             super::chunk_local_index(lx, ly),

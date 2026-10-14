@@ -281,6 +281,12 @@ fn cell_to_rgba(cell: Cell, x: i32, y: i32) -> [u8; 4] {
                     v[1] = ((v[1] as u16 * 92) / 100) as u8;
                     v[2] = v[2].saturating_add(20).min(255);
                 }
+                // Charge visitor glow — medium color stays, cyan flash while ELECTRIFIED.
+                if cell.has_flag(cell_flags::ELECTRIFIED) && m != material::ELECTRICITY {
+                    v[0] = v[0].saturating_add(40).min(255);
+                    v[1] = v[1].saturating_add(90).min(255);
+                    v[2] = 255;
+                }
                 v
             }
         };

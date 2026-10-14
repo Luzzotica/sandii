@@ -51,8 +51,10 @@ pub struct MaterialDef {
 }
 
 mod acid;
+mod blurbs;
 mod c4;
 mod dirt;
+mod electricity;
 mod ember;
 mod empty;
 mod fire;
@@ -62,6 +64,7 @@ mod ice;
 mod lava;
 mod liquid;
 mod melted_wax;
+mod metal;
 mod obsidian;
 mod oil;
 mod plant;
@@ -76,6 +79,10 @@ mod well;
 mod wood;
 
 pub mod shared_rules;
+
+pub use blurbs::{
+    material_blurb, material_blurb_desktop, material_display_name, material_short_label,
+};
 
 pub const BUILTINS: &[MaterialDef] = &[
     empty::DEF,
@@ -102,6 +109,8 @@ pub const BUILTINS: &[MaterialDef] = &[
     grass::DEF,
     obsidian::DEF,
     ice::DEF,
+    metal::DEF,
+    electricity::DEF,
 ];
 
 /// Materials offered in player brush palettes. Excludes [`material::RIGID`], which is only used as an

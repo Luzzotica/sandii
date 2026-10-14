@@ -1,13 +1,20 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
-use nalgebra::{point, vector};
+use nalgebra::vector;
 use rand::Rng;
 use rapier2d::prelude::*;
 
+mod boundary;
+
 use crate::world::cell_flags;
 use crate::world::{
-    material, Cell, ChunkCoord, MaterialId, Phase, RectI, Vec2i, World, CHUNK_SIZE,
+    material, Cell, ChunkCoord, MaterialId, Phase, RectI, Vec2i, World, CHUNK_H, CHUNK_W,
+};
+
+pub use boundary::{
+    collider_polygons_from_pixels, marching_squares_contours, polygon_area, simplify_contour,
+    triangle_count_for_pixels,
 };
 
 /// Extra radius (world units = grid pixels) for [`RigidBridge::spawn_from_circle_with_temp`] ball colliders.
@@ -748,10 +755,10 @@ impl RigidBridge {
             }
         }
 
-        let bounds_min_cx = bounds.min.x.div_euclid(CHUNK_SIZE);
-        let bounds_min_cy = bounds.min.y.div_euclid(CHUNK_SIZE);
-        let bounds_max_cx = bounds.max.x.div_euclid(CHUNK_SIZE);
-        let bounds_max_cy = bounds.max.y.div_euclid(CHUNK_SIZE);
+        let bounds_min_cx = bounds.min.x.div_euclid(CHUNK_W);
+        let bounds_min_cy = bounds.min.y.div_euclid(CHUNK_H);
+        let bounds_max_cx = bounds.max.x.div_euclid(CHUNK_W);
+        let bounds_max_cy = bounds.max.y.div_euclid(CHUNK_H);
         let stale: Vec<ChunkCoord> = self
             .static_chunk_colliders
             .keys()
@@ -1069,17 +1076,12 @@ fn build_and_insert_dynamic_pixel_colliders(
     local_positions: &[(i32, i32)],
 ) {
     let mut inserted = false;
-    let contours = marching_squares_contours(local_positions);
-    for contour in &contours {
-        if contour.len() < 3 {
+    for poly in boundary::collider_polygons_from_pixels(local_positions) {
+        // Outer rings only for solid collision; holes are negative-area and skipped.
+        if boundary::polygon_area(&poly) <= 0.0 {
             continue;
         }
-        let eps = simplify_epsilon_for_contour(contour.len());
-        let simplified = simplify_douglas_peucker(contour, eps);
-        if polygon_area(&simplified) <= 0.0 {
-            continue;
-        }
-        for tri in triangulate_ear_clip(&simplified) {
+        for tri in boundary::triangulate_ear_clip(&poly) {
             let shape = SharedShape::triangle(tri[0], tri[1], tri[2]);
             let collider = ColliderBuilder::new(shape)
                 .density(5.0)
@@ -1110,290 +1112,6 @@ fn build_and_insert_dynamic_pixel_colliders(
         .restitution(0.2)
         .build();
     colliders.insert_with_parent(collider, handle, bodies);
-}
-
-/// Marching-squares iso-contour extraction on a binary pixel grid.
-/// Returns closed polylines in local float coords (pixel-center space).
-/// Outer boundaries wind CCW (positive `polygon_area`); holes wind CW (negative).
-fn marching_squares_contours(local_positions: &[(i32, i32)]) -> Vec<Vec<(f32, f32)>> {
-    if local_positions.is_empty() {
-        return Vec::new();
-    }
-    let filled: HashSet<(i32, i32)> = local_positions.iter().copied().collect();
-    let min_x = local_positions.iter().map(|p| p.0).min().unwrap() - 1;
-    let min_y = local_positions.iter().map(|p| p.1).min().unwrap() - 1;
-    let max_x = local_positions.iter().map(|p| p.0).max().unwrap() + 1;
-    let max_y = local_positions.iter().map(|p| p.1).max().unwrap() + 1;
-    let w = (max_x - min_x + 1) as usize;
-
-    let sample = |gx: i32, gy: i32| -> bool { filled.contains(&(gx, gy)) };
-
-    // Each marching-squares cell sits between four sample points at grid positions
-    // (cx, cy), (cx+1, cy), (cx, cy+1), (cx+1, cy+1).
-    // Edges are keyed by (cell_index, edge_side) for cycle tracing.
-    // Edge midpoints sit on the boundary between filled/empty samples.
-    // cell_index = (cy - min_y) * w + (cx - min_x)
-
-    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-    struct EdgeKey {
-        cell: usize,
-        side: u8, // 0=top, 1=right, 2=bottom, 3=left
-    }
-
-    fn edge_midpoint(cx: i32, cy: i32, side: u8) -> (f32, f32) {
-        let x = cx as f32;
-        let y = cy as f32;
-        match side {
-            0 => (x + 0.5, y),       // top
-            1 => (x + 1.0, y + 0.5), // right
-            2 => (x + 0.5, y + 1.0), // bottom
-            3 => (x, y + 0.5),       // left
-            _ => unreachable!(),
-        }
-    }
-
-    // Shift from pixel-grid to local coords: sample (gx,gy) corresponds to pixel center (gx,gy),
-    // but marching cell (cx,cy) has corners at samples cx..cx+1, cy..cy+1. Edge midpoints are in
-    // the same space as pixel centers, offset by (-0.5, -0.5) from corner-aligned grids — but since
-    // our samples ARE pixel centers, the midpoints are already correct.
-
-    let mut edge_next: HashMap<EdgeKey, EdgeKey> = HashMap::new();
-
-    for cy in min_y..max_y {
-        for cx in min_x..max_x {
-            let tl = sample(cx, cy) as u8;
-            let tr = sample(cx + 1, cy) as u8;
-            let br = sample(cx + 1, cy + 1) as u8;
-            let bl = sample(cx, cy + 1) as u8;
-            let case = (tl << 3) | (tr << 2) | (br << 1) | bl;
-            if case == 0 || case == 15 {
-                continue;
-            }
-            let ci = ((cy - min_y) as usize) * w + ((cx - min_x) as usize);
-
-            // For each case, list (entry_side, exit_side) pairs. The edge with the filled corner
-            // on its left is the "entry", the edge with filled on its right is "exit".
-            // (entry_side, exit_side) — winding keeps filled region to the RIGHT
-            // of travel in screen coords (Y-down), producing CCW / positive-area
-            // outer boundaries and CW / negative-area holes.
-            let pairs: &[(u8, u8)] = match case {
-                1 => &[(3, 2)],
-                2 => &[(2, 1)],
-                3 => &[(3, 1)],
-                4 => &[(1, 0)],
-                5 => &[(3, 0), (1, 2)], // saddle: TL+BR
-                6 => &[(2, 0)],
-                7 => &[(3, 0)],
-                8 => &[(0, 3)],
-                9 => &[(0, 2)],
-                10 => &[(0, 1), (2, 3)], // saddle: TR+BL
-                11 => &[(0, 1)],
-                12 => &[(1, 3)],
-                13 => &[(1, 2)],
-                14 => &[(2, 3)],
-                _ => continue,
-            };
-
-            for &(entry_side, exit_side) in pairs {
-                let from = EdgeKey {
-                    cell: ci,
-                    side: entry_side,
-                };
-                // The neighbor sharing this edge
-                let to = match exit_side {
-                    0 => {
-                        // top edge → neighbor above enters from bottom
-                        let nci = (((cy - 1) - min_y) as usize) * w + ((cx - min_x) as usize);
-                        EdgeKey { cell: nci, side: 2 }
-                    }
-                    1 => {
-                        // right edge → neighbor right enters from left
-                        let nci = ((cy - min_y) as usize) * w + (((cx + 1) - min_x) as usize);
-                        EdgeKey { cell: nci, side: 3 }
-                    }
-                    2 => {
-                        // bottom edge → neighbor below enters from top
-                        let nci = (((cy + 1) - min_y) as usize) * w + ((cx - min_x) as usize);
-                        EdgeKey { cell: nci, side: 0 }
-                    }
-                    3 => {
-                        // left edge → neighbor left enters from right
-                        let nci = ((cy - min_y) as usize) * w + (((cx - 1) - min_x) as usize);
-                        EdgeKey { cell: nci, side: 1 }
-                    }
-                    _ => unreachable!(),
-                };
-                edge_next.insert(from, to);
-            }
-        }
-    }
-
-    // Trace closed loops
-    let mut visited: HashSet<EdgeKey> = HashSet::new();
-    let mut loops = Vec::new();
-    let all_keys: Vec<EdgeKey> = edge_next.keys().copied().collect();
-    for start in all_keys {
-        if visited.contains(&start) {
-            continue;
-        }
-        let mut poly = Vec::new();
-        let mut cur = start;
-        loop {
-            if visited.contains(&cur) && cur != start {
-                break;
-            }
-            visited.insert(cur);
-            let row = cur.cell / w;
-            let col = cur.cell % w;
-            let cx = col as i32 + min_x;
-            let cy = row as i32 + min_y;
-            poly.push(edge_midpoint(cx, cy, cur.side));
-            if let Some(&next) = edge_next.get(&cur) {
-                cur = next;
-                if cur == start {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        if poly.len() >= 3 {
-            loops.push(poly);
-        }
-    }
-    loops
-}
-
-fn polygon_area(polygon: &[(f32, f32)]) -> f32 {
-    let n = polygon.len();
-    let mut area = 0.0;
-    for i in 0..n {
-        let j = (i + 1) % n;
-        area += polygon[i].0 * polygon[j].1;
-        area -= polygon[j].0 * polygon[i].1;
-    }
-    area * 0.5
-}
-
-fn simplify_epsilon_for_contour(contour_len: usize) -> f32 {
-    let len = contour_len as f32;
-    (len / 1600.0).max(0.5)
-}
-
-fn simplify_douglas_peucker(points: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
-    if points.len() <= 2 {
-        return points.to_vec();
-    }
-    let first = points[0];
-    let last = points[points.len() - 1];
-
-    let mut max_dist = 0.0f32;
-    let mut max_idx = 0;
-    for i in 1..points.len() - 1 {
-        let d = perpendicular_distance(points[i], first, last);
-        if d > max_dist {
-            max_dist = d;
-            max_idx = i;
-        }
-    }
-
-    if max_dist > epsilon {
-        let left = simplify_douglas_peucker(&points[..=max_idx], epsilon);
-        let right = simplify_douglas_peucker(&points[max_idx..], epsilon);
-        let mut result = left;
-        result.extend_from_slice(&right[1..]);
-        result
-    } else {
-        vec![first, last]
-    }
-}
-
-fn perpendicular_distance(point: (f32, f32), line_start: (f32, f32), line_end: (f32, f32)) -> f32 {
-    let dx = line_end.0 - line_start.0;
-    let dy = line_end.1 - line_start.1;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-10 {
-        let px = point.0 - line_start.0;
-        let py = point.1 - line_start.1;
-        return (px * px + py * py).sqrt();
-    }
-    let numerator = ((line_end.0 - line_start.0) * (line_start.1 - point.1)
-        - (line_start.0 - point.0) * (line_end.1 - line_start.1))
-        .abs();
-    numerator / len_sq.sqrt()
-}
-
-fn triangulate_ear_clip(polygon: &[(f32, f32)]) -> Vec<[Point<Real>; 3]> {
-    if polygon.len() < 3 {
-        return Vec::new();
-    }
-
-    let mut indices: Vec<usize> = (0..polygon.len()).collect();
-    let mut triangles = Vec::new();
-
-    while indices.len() > 2 {
-        let n = indices.len();
-        let mut found_ear = false;
-
-        for i in 0..n {
-            let prev = indices[(i + n - 1) % n];
-            let curr = indices[i];
-            let next = indices[(i + 1) % n];
-
-            let a = polygon[prev];
-            let b = polygon[curr];
-            let c = polygon[next];
-
-            let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
-            if cross <= 0.0 {
-                continue;
-            }
-
-            let mut has_point_inside = false;
-            for j in 0..n {
-                if j == (i + n - 1) % n || j == i || j == (i + 1) % n {
-                    continue;
-                }
-                let p = polygon[indices[j]];
-                if point_in_triangle(p, a, b, c) {
-                    has_point_inside = true;
-                    break;
-                }
-            }
-
-            if !has_point_inside {
-                triangles.push([point![a.0, a.1], point![b.0, b.1], point![c.0, c.1]]);
-                indices.remove(i);
-                found_ear = true;
-                break;
-            }
-        }
-
-        if !found_ear {
-            for i in 1..indices.len() - 1 {
-                let a = polygon[indices[0]];
-                let b = polygon[indices[i]];
-                let c = polygon[indices[i + 1]];
-                triangles.push([point![a.0, a.1], point![b.0, b.1], point![c.0, c.1]]);
-            }
-            break;
-        }
-    }
-
-    triangles
-}
-
-fn point_in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
-    let d1 = sign_2d(p, a, b);
-    let d2 = sign_2d(p, b, c);
-    let d3 = sign_2d(p, c, a);
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_neg && has_pos)
-}
-
-fn sign_2d(p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)) -> f32 {
-    (p1.0 - p3.0) * (p2.1 - p3.1) - (p2.0 - p3.0) * (p1.1 - p3.1)
 }
 
 struct ChunkInertInfo {
@@ -1579,17 +1297,11 @@ fn build_static_triangle_colliders(
     positions: &[(i32, i32)],
 ) -> Vec<ColliderHandle> {
     let mut handles = Vec::new();
-    let contours = marching_squares_contours(positions);
-    for contour in &contours {
-        if contour.len() < 3 {
+    for poly in boundary::collider_polygons_from_pixels(positions) {
+        if boundary::polygon_area(&poly) <= 0.0 {
             continue;
         }
-        let eps = simplify_epsilon_for_contour(contour.len());
-        let simplified = simplify_douglas_peucker(contour, eps);
-        if polygon_area(&simplified) <= 0.0 {
-            continue;
-        }
-        for tri in triangulate_ear_clip(&simplified) {
+        for tri in boundary::triangulate_ear_clip(&poly) {
             let shape = SharedShape::triangle(tri[0], tri[1], tri[2]);
             let collider = ColliderBuilder::new(shape)
                 .friction(0.5)
@@ -1650,59 +1362,6 @@ fn find_empty_above(
 #[cfg(test)]
 mod morph_tests {
     use super::*;
-
-    #[test]
-    fn marching_squares_two_disconnected_islands() {
-        let p = [
-            (0, 0),
-            (1, 0),
-            (0, 1),
-            (1, 1),
-            (5, 0),
-            (6, 0),
-            (5, 1),
-            (6, 1),
-        ];
-        let loops = marching_squares_contours(&p);
-        assert_eq!(
-            loops.len(),
-            2,
-            "two separated groups should each get a boundary loop"
-        );
-        for l in &loops {
-            assert!(
-                polygon_area(l) > 0.0,
-                "outer boundary should be CCW (positive area)"
-            );
-        }
-    }
-
-    #[test]
-    fn marching_squares_single_pixel() {
-        let loops = marching_squares_contours(&[(0, 0)]);
-        assert_eq!(loops.len(), 1);
-        assert!(polygon_area(&loops[0]) > 0.0);
-    }
-
-    #[test]
-    fn marching_squares_hole_produces_two_loops() {
-        // 5x5 ring with hollow center (3x3 hole)
-        let mut pixels = Vec::new();
-        for y in 0..5 {
-            for x in 0..5 {
-                if x >= 1 && x <= 3 && y >= 1 && y <= 3 {
-                    continue; // hole
-                }
-                pixels.push((x, y));
-            }
-        }
-        let loops = marching_squares_contours(&pixels);
-        assert_eq!(loops.len(), 2, "ring should produce outer + hole loop");
-        let mut areas: Vec<f32> = loops.iter().map(|l| polygon_area(l)).collect();
-        areas.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        assert!(areas[0] > 0.0, "outer boundary positive");
-        assert!(areas[1] < 0.0, "hole boundary negative");
-    }
 
     #[test]
     fn morph_close_8_fills_center_of_3x3_ring() {
