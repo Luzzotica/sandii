@@ -1,8 +1,8 @@
 use rand::rngs::SmallRng;
 
-use crate::world::{material, MaterialProps, Vec2i, World};
+use crate::world::{material, Cell, MaterialProps, Vec2i, World};
 
-use crate::sim::{vertical_down_allows_density_swap, MoveIntent, SimGrids};
+use crate::sim::{material_bit, vertical_down_allows_density_swap, MoveIntent, SimGrids};
 
 use super::acid::acid_corrode_neighbors;
 use super::influence::liquid_adjacent_influence_pass;
@@ -14,6 +14,28 @@ fn liquid_prefer_left_first(p: Vec2i) -> bool {
     (p.x ^ p.y) & 1 == 0
 }
 
+/// Liquid that may still change without moving: off ambient temperature (rare stochastic 1 K
+/// cooling nudges), acid, or a neighbor its rules act on (rolls that can fail many ticks in a
+/// row). It keeps its chunk awake, as every liquid did before; only a still, ambient pool with
+/// nothing to react with lets its chunk sleep.
+fn liquid_restless(sg: &SimGrids, world: &World, p: Vec2i, cell: Cell, props: &MaterialProps) -> bool {
+    if cell.temperature() != world.ambient_temperature_k() || props.has_acid_corrosion() {
+        return true;
+    }
+    let mut targets = 0u64;
+    for r in &props.adjacent_influence {
+        if r.is_active() {
+            targets |= material_bit(r.victim);
+        }
+    }
+    for r in &props.adjacent_transforms {
+        if r.is_active() {
+            targets |= material_bit(r.from);
+        }
+    }
+    targets != 0 && targets & sg.neighbor8_material_mask(p) != 0
+}
+
 /// Supported liquid loses this much vertical speed per tick when it cannot slide (viscous drag).
 #[inline]
 fn liquid_supported_friction(props: &MaterialProps) -> i8 {
@@ -23,6 +45,9 @@ fn liquid_supported_friction(props: &MaterialProps) -> i8 {
 pub(crate) fn step_liquid(sg: &SimGrids, world: &World, p: Vec2i, rng: &mut SmallRng) {
     let cell = sg.get(p);
     let props = world.material_props(cell.material());
+    if liquid_restless(sg, world, p, cell, props) {
+        sg.wake_at(p);
+    }
     if props.has_acid_corrosion() {
         acid_corrode_neighbors(sg, world, p, &props, rng);
     }

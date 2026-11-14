@@ -1202,7 +1202,7 @@ mod tests {
         let mut sim = Simulation::new(cfg);
         let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
         sim.set_solid_bounds(bounds);
-        let mut wp = sim.test_world().material_props(material::WOOD);
+        let mut wp = *sim.test_world().material_props(material::WOOD);
         wp.fuel_mass = 0;
         wp.ignitability = 255;
         sim.set_material_props(material::WOOD, wp);
@@ -1226,7 +1226,7 @@ mod tests {
         let mut sim = Simulation::new(cfg);
         let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
         sim.set_solid_bounds(bounds);
-        let mut wp = sim.test_world().material_props(material::WOOD);
+        let mut wp = *sim.test_world().material_props(material::WOOD);
         wp.fuel_mass = 0;
         wp.autoignition_temperature = 0;
         wp.ignitability = 255;
@@ -2023,7 +2023,7 @@ mod tests {
         let mut sim = Simulation::new(SimulationConfig::default());
         let bounds = RectI::new(Vec2i::new(0, 0), Vec2i::new(31, 31));
         sim.set_solid_bounds(bounds);
-        let mut wood_props = sim.test_world().material_props(material::WOOD);
+        let mut wood_props = *sim.test_world().material_props(material::WOOD);
         wood_props.adjacent_transforms = [
             AdjacentTransformRule::inactive(),
             AdjacentTransformRule::inactive(),

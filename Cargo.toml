@@ -20,3 +20,9 @@ opt-level = 2
 
 [profile.dev.package.falling_everything_core]
 opt-level = 2
+
+# One codegen unit + LTO: the per-cell sim helpers inline across crates. The web build runs
+# the whole sim on one thread, so this matters most there.
+[profile.release]
+lto = "fat"
+codegen-units = 1
