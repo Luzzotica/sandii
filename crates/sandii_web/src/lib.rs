@@ -1,14 +1,12 @@
 //! Sandii WASM shell: canvas + DOM controls, `requestAnimationFrame` loop.
 
 mod game;
-mod material_blurbs;
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use falling_everything_core::materials;
-use falling_everything_core::recipes;
 use falling_everything_core::world::material;
 use falling_everything_core::world::MaterialId;
 use wasm_bindgen::closure::Closure;
@@ -21,36 +19,42 @@ use web_sys::{
 };
 
 use game::{
-    brush_cap_for_mode, cell_flags_line, cell_name_at, clamp_brush_to_mode, is_rigid_body_eligible,
-    FrameInput, GameState, InteractionMode, DISP_H, DISP_W,
+    brush_cap_for_mode, cell_flags_line, cell_name_at, clamp_brush_to_mode, grid_for_viewport,
+    is_rigid_body_eligible, FrameInput, GameState, InteractionMode,
 };
 
-/// Material/mode clicks are queued here so handlers never `borrow_mut` [`App`] while RAF holds it.
+/// How many recent materials the floating quick bar holds.
+const QUICK_SLOTS: usize = 4;
+/// Wait this long after the last resize before re-laying out the world (rotation settles).
+const RESIZE_SETTLE_MS: f64 = 140.0;
+
+/// Clicks are queued here so handlers never `borrow_mut` [`App`] while RAF holds it.
 enum UiAction {
+    /// Pick a material (from the menu or the quick bar); leaves erase / heat / blast for Draw.
     SelectMaterial(MaterialId),
     SetMode(InteractionMode),
+    /// Paint with Empty.
+    Erase,
+    /// Quick-bar tool button: Paint ⇄ Erase; any other tool goes back to Paint.
+    ToggleTool,
     SetBrushRadius(i32),
     ClearWorld,
-    /// Index into [`recipes::WOW_RECIPES`]; cycles material step when re-selected.
-    SelectRecipe(usize),
+    TogglePause,
+    ToggleDebug,
 }
 
 struct UiRefs {
-    mat_container: Element,
     mat_buttons: Vec<HtmlElement>,
-    mode_buttons: Vec<HtmlElement>,
-    recipe_buttons: Vec<HtmlElement>,
-    recipe_tip: HtmlElement,
-    mode_help: HtmlElement,
+    /// Menu tool buttons: `data-tool` = paint | erase | rigid | blast | heat | cool.
+    tool_buttons: Vec<HtmlElement>,
+    quick_tool: HtmlElement,
+    quick_mats: Vec<HtmlElement>,
     brush_slider: HtmlInputElement,
     brush_value: HtmlElement,
-    material_title: HtmlElement,
-    material_body: HtmlElement,
-    selection_mode: HtmlElement,
-    selection_sep: HtmlElement,
-    selection_mat_wrap: HtmlElement,
-    selection_swatch: HtmlElement,
-    selection_name: HtmlElement,
+    pause_btn: HtmlElement,
+    debug_btn: HtmlElement,
+    hud: HtmlElement,
+    stats: HtmlElement,
 }
 
 struct App {
@@ -64,15 +68,36 @@ struct App {
     fps_last_ms: f64,
     fps_show: u32,
     rgba_scratch: Vec<u8>,
-    last_ui_mode: InteractionMode,
-    last_ui_mat: MaterialId,
-    last_ui_brush: i32,
-    /// Active wow recipe (index, material step).
-    active_recipe: Option<(usize, usize)>,
-    last_ui_recipe: Option<(usize, usize)>,
+    /// Background for empty cells, one colour per grid row (a soft night-sky gradient).
+    sky: Vec<u32>,
+    /// Last real material (not Empty), restored when leaving erase.
+    last_material: MaterialId,
+    recents: Vec<MaterialId>,
+    /// (mode, selected, brush, paused, debug) last pushed to the DOM.
+    last_ui: Option<(InteractionMode, MaterialId, i32, bool, bool)>,
     /// Debug HUD line (FPS, parallel, cell probe): off unless `?debug` or toggled with F3.
     debug_hud: Rc<Cell<bool>>,
-    debug_hud_shown: bool,
+    /// `performance.now()` of the last resize event (0 = none pending).
+    resize_at: Rc<Cell<f64>>,
+}
+
+fn now_ms() -> f64 {
+    window().unwrap().performance().unwrap().now()
+}
+
+fn sky_rows(h: usize) -> Vec<u32> {
+    // Top #0d1120 → bottom #1a1c2c.
+    let (r0, g0, b0) = (13.0, 17.0, 32.0);
+    let (r1, g1, b1) = (26.0, 28.0, 44.0);
+    (0..h)
+        .map(|y| {
+            let t = y as f64 / (h.max(2) - 1) as f64;
+            let r = (r0 + (r1 - r0) * t) as u32;
+            let g = (g0 + (g1 - g0) * t) as u32;
+            let b = (b0 + (b1 - b0) * t) as u32;
+            0xFF00_0000 | (r << 16) | (g << 8) | b
+        })
+        .collect()
 }
 
 impl App {
@@ -80,10 +105,13 @@ impl App {
         input: Rc<RefCell<FrameInput>>,
         pending_ui: Rc<RefCell<VecDeque<UiAction>>>,
         debug_hud: Rc<Cell<bool>>,
+        resize_at: Rc<Cell<f64>>,
+        w: usize,
+        h: usize,
     ) -> Self {
-        let perf = window().unwrap().performance().unwrap().now();
+        let perf = now_ms();
         Self {
-            game: GameState::new(),
+            game: GameState::new(w, h),
             input,
             pending_ui,
             prev_input: FrameInput::default(),
@@ -91,55 +119,98 @@ impl App {
             fps_frames: 0,
             fps_last_ms: perf,
             fps_show: 0,
-            rgba_scratch: vec![0u8; DISP_W * DISP_H * 4],
-            last_ui_mode: InteractionMode::Draw,
-            last_ui_mat: material::SAND,
-            last_ui_brush: 4,
-            active_recipe: None,
-            last_ui_recipe: None,
+            rgba_scratch: vec![0u8; w * h * 4],
+            sky: sky_rows(h),
+            last_material: material::SAND,
+            recents: vec![material::SAND, material::LIQUID, material::LAVA, material::WOOD],
+            last_ui: None,
             debug_hud,
-            debug_hud_shown: false,
+            resize_at,
         }
     }
 
-    fn apply_pending_ui(&mut self) -> bool {
+    fn back_to_paint(&mut self) {
+        self.game.set_interaction_mode(InteractionMode::Draw);
+        if self.game.selected == material::EMPTY {
+            self.game.set_selected_material(self.last_material);
+        }
+    }
+
+    fn apply_pending_ui(&mut self) {
         let batch: Vec<UiAction> = {
             let mut q = self.pending_ui.borrow_mut();
             q.drain(..).collect()
         };
-        if batch.is_empty() {
-            return false;
-        }
         for a in batch {
             match a {
                 UiAction::SelectMaterial(id) => {
+                    let rigid_ok = materials::BUILTINS
+                        .iter()
+                        .find(|d| d.id == id)
+                        .map(is_rigid_body_eligible)
+                        .unwrap_or(false);
+                    let keep_rigid =
+                        self.game.interaction_mode == InteractionMode::RigidBody && rigid_ok;
+                    if !keep_rigid {
+                        self.game.set_interaction_mode(InteractionMode::Draw);
+                    }
                     self.game.set_selected_material(id);
-                    self.active_recipe = None;
                 }
-                UiAction::SetMode(m) => self.game.set_interaction_mode(m),
+                UiAction::SetMode(InteractionMode::Draw) => self.back_to_paint(),
+                UiAction::SetMode(m) => {
+                    if self.game.selected == material::EMPTY {
+                        self.game.set_selected_material(self.last_material);
+                    }
+                    self.game.set_interaction_mode(m);
+                }
+                UiAction::Erase => {
+                    self.game.set_interaction_mode(InteractionMode::Draw);
+                    self.game.set_selected_material(material::EMPTY);
+                }
+                UiAction::ToggleTool => {
+                    if self.game.interaction_mode == InteractionMode::Draw
+                        && self.game.selected != material::EMPTY
+                    {
+                        self.game.set_selected_material(material::EMPTY);
+                    } else {
+                        self.back_to_paint();
+                    }
+                }
                 UiAction::SetBrushRadius(r) => {
                     self.game.brush_radius = clamp_brush_to_mode(r, self.game.interaction_mode);
                 }
-                UiAction::ClearWorld => self.game.clear_world(),
-                UiAction::SelectRecipe(ri) => {
-                    let step = match self.active_recipe {
-                        Some((prev, s)) if prev == ri => s.wrapping_add(1),
-                        _ => 0,
-                    };
-                    if let Some(id) = recipes::recipe_material_at(ri, step) {
-                        self.game.set_interaction_mode(InteractionMode::Draw);
-                        self.game.set_selected_material(id);
-                        self.active_recipe = Some((ri, step));
-                    }
+                UiAction::ClearWorld => {
+                    self.game.clear_world();
+                    toast("Cleared");
                 }
+                UiAction::TogglePause => self.game.paused = !self.game.paused,
+                UiAction::ToggleDebug => self.debug_hud.set(!self.debug_hud.get()),
             }
         }
-        true
     }
 
-    fn tick(&mut self, ctx: &CanvasRenderingContext2d, stats: &HtmlElement, ui: &UiRefs) {
-        let ui_from_queue = self.apply_pending_ui();
-        let now = window().unwrap().performance().unwrap().now();
+    /// Re-lay out the grid once resizing has settled.
+    fn maybe_resize(&mut self, canvas: &HtmlCanvasElement) {
+        let t = self.resize_at.get();
+        if t == 0.0 || now_ms() - t < RESIZE_SETTLE_MS {
+            return;
+        }
+        self.resize_at.set(0.0);
+        let (w, h) = target_grid(canvas);
+        if w == self.game.w && h == self.game.h {
+            return;
+        }
+        self.game.resize(w, h);
+        canvas.set_width(w as u32);
+        canvas.set_height(h as u32);
+        self.rgba_scratch = vec![0u8; w * h * 4];
+        self.sky = sky_rows(h);
+    }
+
+    fn tick(&mut self, canvas: &HtmlCanvasElement, ctx: &CanvasRenderingContext2d, ui: &UiRefs) {
+        self.maybe_resize(canvas);
+        self.apply_pending_ui();
+        let now = now_ms();
         let dt = ((now - self.last_perf_ms) / 1000.0)
             .max(1.0 / 240.0)
             .min(1.0 / 15.0) as f32;
@@ -151,6 +222,9 @@ impl App {
             .try_borrow()
             .map(|b| b.clone())
             .unwrap_or_else(|_| self.prev_input.clone());
+        if cur.clear_pressed {
+            toast("Cleared");
+        }
         self.game.step_frame(dt, &cur, &self.prev_input);
         if let Ok(mut inp) = self.input.try_borrow_mut() {
             inp.clear_transient();
@@ -166,63 +240,78 @@ impl App {
             self.fps_last_ms = now;
         }
 
-        fill_argb_to_rgba_bytes(&self.game.frame, &mut self.rgba_scratch);
+        fill_rgba(&self.game.frame, self.game.w, &self.sky, &mut self.rgba_scratch);
         let data = ImageData::new_with_u8_clamped_array_and_sh(
             wasm_bindgen::Clamped(&mut self.rgba_scratch),
-            DISP_W as u32,
-            DISP_H as u32,
+            self.game.w as u32,
+            self.game.h as u32,
         )
         .expect("ImageData");
         ctx.put_image_data(&data, 0.0, 0.0).expect("put_image_data");
 
         let show_debug = self.debug_hud.get();
-        if show_debug != self.debug_hud_shown {
-            // `stats` sits in `.hud-stats`; hide the whole line so it takes no space.
-            if let Some(line) = stats.parent_element() {
-                let _ = line.toggle_attribute_with_force("hidden", !show_debug);
-            }
-            self.debug_hud_shown = show_debug;
-        }
         if show_debug {
-            let mut hud = String::new();
-            hud.push_str(&format!(
-                "FPS {} | parallel {} | ",
+            let mut hud = format!(
+                "FPS {} · {}×{} · parallel {}",
                 self.fps_show,
+                self.game.w,
+                self.game.h,
                 self.game.sim.is_parallel()
-            ));
+            );
             if cur.mouse_x >= 0.0 {
                 let w = self.game.world_from_mouse(cur.mouse_x, cur.mouse_y);
+                hud.push_str(" · ");
                 hud.push_str(&cell_name_at(&self.game.sim, w));
-                hud.push_str(" | ");
+                hud.push_str(" · ");
                 hud.push_str(&cell_flags_line(&self.game.sim, w));
             }
-            stats.set_inner_text(&hud);
+            ui.stats.set_inner_text(&hud);
         }
 
-        if ui_from_queue
-            || self.game.interaction_mode != self.last_ui_mode
-            || self.game.selected != self.last_ui_mat
-            || self.game.brush_radius != self.last_ui_brush
-            || self.active_recipe != self.last_ui_recipe
-        {
-            sync_ui(ui, &self.game, self.active_recipe);
-            self.last_ui_mode = self.game.interaction_mode;
-            self.last_ui_mat = self.game.selected;
-            self.last_ui_brush = self.game.brush_radius;
-            self.last_ui_recipe = self.active_recipe;
+        let state = (
+            self.game.interaction_mode,
+            self.game.selected,
+            self.game.brush_radius,
+            self.game.paused,
+            show_debug,
+        );
+        if self.last_ui != Some(state) {
+            let prev = self.last_ui;
+            if self.game.selected != material::EMPTY {
+                self.last_material = self.game.selected;
+                if !self.recents.contains(&self.game.selected) {
+                    self.recents.insert(0, self.game.selected);
+                    self.recents.truncate(QUICK_SLOTS);
+                }
+            }
+            if let Some((pm, psel, _, ppause, _)) = prev {
+                if pm != state.0 || psel != state.1 {
+                    toast(&tool_label(&self.game));
+                } else if ppause != state.3 {
+                    toast(if state.3 { "Paused" } else { "Playing" });
+                }
+            }
+            sync_ui(ui, &self.game, &self.recents, show_debug);
+            self.last_ui = Some(state);
         }
 
         self.prev_input = cur;
     }
 }
 
-fn fill_argb_to_rgba_bytes(frame: &[u32], out: &mut [u8]) {
-    for (i, &p) in frame.iter().enumerate() {
-        let o = i * 4;
-        out[o] = ((p >> 16) & 0xff) as u8;
-        out[o + 1] = ((p >> 8) & 0xff) as u8;
-        out[o + 2] = (p & 0xff) as u8;
-        out[o + 3] = ((p >> 24) & 0xff) as u8;
+/// Empty cells render black in the core; paint them with the sky gradient instead.
+fn fill_rgba(frame: &[u32], w: usize, sky: &[u32], out: &mut [u8]) {
+    for (y, row) in frame.chunks_exact(w.max(1)).enumerate() {
+        let bg = sky.get(y).copied().unwrap_or(0xFF00_0000);
+        let base = y * w * 4;
+        for (x, &p) in row.iter().enumerate() {
+            let p = if p & 0x00FF_FFFF == 0 { bg } else { p };
+            let o = base + x * 4;
+            out[o] = ((p >> 16) & 0xff) as u8;
+            out[o + 1] = ((p >> 8) & 0xff) as u8;
+            out[o + 2] = (p & 0xff) as u8;
+            out[o + 3] = 0xff;
+        }
     }
 }
 
@@ -233,164 +322,139 @@ fn argb_to_css(argb: u32) -> String {
     format!("#{:02x}{:02x}{:02x}", r, g, b)
 }
 
-fn mode_display_name(mode: InteractionMode) -> &'static str {
-    match mode {
-        InteractionMode::Draw => "Draw",
-        InteractionMode::RigidBody => "Rigid",
-        InteractionMode::Explosion => "Explosion",
-        InteractionMode::Heat => "Heat",
-        InteractionMode::Cool => "Cool",
+fn material_name(id: MaterialId) -> &'static str {
+    materials::BUILTINS
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.name)
+        .unwrap_or("Material")
+}
+
+fn material_color(id: MaterialId) -> String {
+    materials::BUILTINS
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| argb_to_css(d.color_argb))
+        .unwrap_or_else(|| "#888".into())
+}
+
+/// `data-tool` name of the current tool.
+fn tool_key(game: &GameState) -> &'static str {
+    match game.interaction_mode {
+        InteractionMode::Draw if game.selected == material::EMPTY => "erase",
+        InteractionMode::Draw => "paint",
+        InteractionMode::RigidBody => "rigid",
+        InteractionMode::Explosion => "blast",
+        InteractionMode::Heat => "heat",
+        InteractionMode::Cool => "cool",
     }
 }
 
-fn mode_help_text(mode: InteractionMode) -> &'static str {
-    match mode {
-        InteractionMode::Draw => "Draw: left paint, right erase. Shift+drag rectangles.",
-        InteractionMode::RigidBody => {
-            "Rigid: left-drag stroke, release to spawn. Only solid materials (see grid)."
-        }
-        InteractionMode::Explosion => {
-            "Explosion: left click to blast. Brush size = radius. Material picker hidden."
-        }
-        InteractionMode::Heat => {
-            "Heat: left paint or drag to add temperature. Material picker hidden."
-        }
-        InteractionMode::Cool => "Cool: left paint or drag to remove heat. Material picker hidden.",
+fn tool_label(game: &GameState) -> String {
+    match game.interaction_mode {
+        InteractionMode::Draw if game.selected == material::EMPTY => "Erase".into(),
+        InteractionMode::Draw => material_name(game.selected).into(),
+        InteractionMode::RigidBody => format!("Rigid {}", material_name(game.selected).to_lowercase()),
+        InteractionMode::Explosion => "Blast".into(),
+        InteractionMode::Heat => "Heat".into(),
+        InteractionMode::Cool => "Cool".into(),
     }
 }
 
-fn sync_ui(ui: &UiRefs, game: &GameState, active_recipe: Option<(usize, usize)>) {
+/// Brief label over the canvas (`window.sandiiToast` in index.html).
+fn toast(text: &str) {
+    let Some(w) = window() else { return };
+    if let Ok(f) = js_sys::Reflect::get(&w, &JsValue::from_str("sandiiToast")) {
+        if let Some(f) = f.dyn_ref::<js_sys::Function>() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(text));
+        }
+    }
+}
+
+fn set_class(el: &HtmlElement, class: &str, on: bool) {
+    let _ = el.class_list().toggle_with_force(class, on);
+}
+
+fn sync_ui(ui: &UiRefs, game: &GameState, recents: &[MaterialId], show_debug: bool) {
     use InteractionMode::*;
-
-    let show_materials = matches!(game.interaction_mode, Draw | RigidBody);
-
-    if let Some(he) = ui.mat_container.dyn_ref::<HtmlElement>() {
-        let _ = he
-            .style()
-            .set_property("display", if show_materials { "grid" } else { "none" });
-    }
-
-    if show_materials {
-        if let Some(def) = materials::BUILTINS.iter().find(|d| d.id == game.selected) {
-            ui.material_title.set_inner_text(def.name);
-        } else {
-            ui.material_title.set_inner_text("Material");
-        }
-        ui.material_body
-            .set_inner_text(material_blurbs::material_description(game.selected));
-    } else {
-        ui.material_title.set_inner_text("Materials");
-        ui.material_body
-            .set_inner_text(material_blurbs::MODE_NO_MATERIAL_PICKER);
-    }
+    let mode = game.interaction_mode;
+    let rigid = mode == RigidBody;
+    let painting = matches!(mode, Draw | RigidBody) && game.selected != material::EMPTY;
+    let tool = tool_key(game);
 
     for btn in &ui.mat_buttons {
-        let id_str = btn.get_attribute("data-mat-id").unwrap_or_default();
-        let id: MaterialId = id_str.parse().unwrap_or(0);
-        let rigid = game.interaction_mode == RigidBody;
+        let id: MaterialId = btn
+            .get_attribute("data-mat-id")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
         let eligible = materials::BUILTINS
             .iter()
             .find(|d| d.id == id)
             .map(is_rigid_body_eligible)
             .unwrap_or(false);
-        if rigid && !eligible {
-            let _ = btn.set_attribute("disabled", "");
-        } else {
-            let _ = btn.remove_attribute("disabled");
-        }
-        let mut cls = String::from("mat-btn");
-        if game.selected == id && show_materials {
-            cls.push_str(" mat-btn--selected");
-        }
-        if rigid && !eligible {
-            cls.push_str(" mat-btn--ineligible");
-        }
-        btn.set_class_name(&cls);
+        let off = rigid && !eligible;
+        let _ = btn.toggle_attribute_with_force("disabled", off);
+        set_class(btn, "on", painting && game.selected == id);
     }
 
-    for btn in &ui.mode_buttons {
-        let idx_str = btn.get_attribute("data-mode-idx").unwrap_or_default();
-        let idx: usize = idx_str.parse().unwrap_or(0);
-        let active = InteractionMode::ALL.get(idx).copied() == Some(game.interaction_mode);
-        btn.set_class_name(if active {
-            "mode-btn mode-btn--active"
-        } else {
-            "mode-btn"
-        });
+    for btn in &ui.tool_buttons {
+        let on = btn.get_attribute("data-tool").as_deref() == Some(tool);
+        set_class(btn, "on", on);
+        let _ = btn.set_attribute("aria-pressed", if on { "true" } else { "false" });
     }
 
-    let active_ri = active_recipe.map(|(i, _)| i);
-    for btn in &ui.recipe_buttons {
-        let idx_str = btn.get_attribute("data-recipe-idx").unwrap_or_default();
-        let idx: usize = idx_str.parse().unwrap_or(0);
-        let on = active_ri == Some(idx);
-        btn.set_class_name(if on {
-            "recipe-btn recipe-btn--active"
+    let _ = ui.quick_tool.set_attribute("data-tool", tool);
+    set_class(&ui.quick_tool, "on", tool != "paint");
+    let _ = ui.quick_tool.set_attribute(
+        "aria-label",
+        &format!("Tool: {} (tap to switch paint / erase)", tool_label(game)),
+    );
+    for (i, btn) in ui.quick_mats.iter().enumerate() {
+        if let Some(&id) = recents.get(i) {
+            let _ = btn.set_attribute("data-mat-id", &id.to_string());
+            let _ = btn
+                .style()
+                .set_property("--swatch", &material_color(id));
+            let _ = btn.set_attribute("aria-label", material_name(id));
+            let _ = btn.set_attribute("title", material_name(id));
+            let _ = btn.remove_attribute("hidden");
+            set_class(btn, "on", painting && game.selected == id);
         } else {
-            "recipe-btn"
-        });
-    }
-
-    if let Some((ri, step)) = active_recipe {
-        if let Some(r) = recipes::wow_recipe_at(ri) {
-            let mat_name = materials::BUILTINS
-                .iter()
-                .find(|d| d.id == game.selected)
-                .map(|d| d.name)
-                .unwrap_or("material");
-            let n = r.materials.len().max(1);
-            let step_disp = (step % n) + 1;
-            ui.recipe_tip.set_inner_html(&format!(
-                "<strong>{}</strong> · brush: <strong>{}</strong> ({}/{}) — {} <em>{}</em>",
-                r.title,
-                mat_name,
-                step_disp,
-                n,
-                r.how,
-                r.result
-            ));
-        } else {
-            ui.recipe_tip.set_inner_text("");
+            let _ = btn.set_attribute("hidden", "");
         }
-    } else {
-        ui.recipe_tip.set_inner_text(
-            "Pick a recipe above, paint the loaded material, then tap the same recipe again for the next ingredient.",
-        );
     }
 
-    ui.mode_help
-        .set_inner_text(mode_help_text(game.interaction_mode));
-
-    let cap = brush_cap_for_mode(game.interaction_mode);
-    let _ = ui.brush_slider.set_attribute("min", "1");
+    let cap = brush_cap_for_mode(mode);
     let _ = ui.brush_slider.set_attribute("max", &cap.to_string());
-    ui.brush_slider
-        .set_value(&game.brush_radius.clamp(1, cap).to_string());
-    ui.brush_value
-        .set_inner_text(&game.brush_radius.clamp(1, cap).to_string());
+    let v = game.brush_radius.clamp(1, cap).to_string();
+    ui.brush_slider.set_value(&v);
+    ui.brush_value.set_inner_text(&v);
 
-    ui.selection_mode
-        .set_inner_text(mode_display_name(game.interaction_mode));
-    if show_materials {
-        let _ = ui.selection_sep.remove_attribute("hidden");
-        let _ = ui.selection_mat_wrap.remove_attribute("hidden");
-        if let Some(def) = materials::BUILTINS.iter().find(|d| d.id == game.selected) {
-            ui.selection_name.set_inner_text(def.name);
-            let _ = ui
-                .selection_swatch
-                .style()
-                .set_property("background", &argb_to_css(def.color_argb));
-        } else {
-            ui.selection_name.set_inner_text("—");
-            let _ = ui
-                .selection_swatch
-                .style()
-                .set_property("background", "#444");
-        }
-    } else {
-        let _ = ui.selection_sep.set_attribute("hidden", "");
-        let _ = ui.selection_mat_wrap.set_attribute("hidden", "");
+    set_class(&ui.pause_btn, "on", game.paused);
+    let _ = ui
+        .pause_btn
+        .set_attribute("aria-pressed", if game.paused { "true" } else { "false" });
+    if let Some(label) = ui.pause_btn.query_selector(".label").ok().flatten() {
+        label.set_text_content(Some(if game.paused { "Play" } else { "Pause" }));
     }
+    set_class(&ui.debug_btn, "on", show_debug);
+    let _ = ui
+        .debug_btn
+        .set_attribute("aria-pressed", if show_debug { "true" } else { "false" });
+    let _ = ui.hud.toggle_attribute_with_force("hidden", !show_debug);
+}
+
+/// Grid size for the canvas' current CSS box (it covers the whole viewport).
+fn target_grid(canvas: &HtmlCanvasElement) -> (usize, usize) {
+    let r = canvas.get_bounding_client_rect();
+    let (mut w, mut h) = (r.width(), r.height());
+    if w < 1.0 || h < 1.0 {
+        let win = window().unwrap();
+        w = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+        h = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+    }
+    grid_for_viewport(w, h)
 }
 
 fn request_animation_frame(f: &Closure<dyn FnMut()>) {
@@ -446,117 +510,66 @@ fn create_mat_btn(
     let btn: HtmlElement = document.create_element("button")?.dyn_into()?;
     btn.set_attribute("type", "button")?;
     btn.set_attribute("data-mat-id", &def.id.to_string())?;
-    btn.set_class_name("mat-btn");
-    let blurb = material_blurbs::material_description(def.id);
-    btn.set_attribute("title", blurb)?;
-    btn.set_attribute(
-        "aria-label",
-        &format!("{} — {}", def.name, blurb),
-    )?;
+    btn.set_class_name("mat");
+    btn.set_attribute("aria-label", def.name)?;
+    btn.style()
+        .set_property("--swatch", &argb_to_css(def.color_argb))?;
 
     let swatch: HtmlElement = document.create_element("span")?.dyn_into()?;
-    swatch.set_class_name("mat-swatch");
-    swatch
-        .style()
-        .set_property("background", &argb_to_css(def.color_argb))?;
-
+    swatch.set_class_name("sw");
     let name_el: HtmlElement = document.create_element("span")?.dyn_into()?;
-    name_el.set_class_name("mat-name");
+    name_el.set_class_name("nm");
     name_el.set_text_content(Some(def.name));
-
-    let short_el: HtmlElement = document.create_element("span")?.dyn_into()?;
-    short_el.set_class_name("mat-short");
-    short_el.set_text_content(Some(material_blurbs::material_short_label(def.id)));
-
     btn.append_child(&swatch)?;
     btn.append_child(&name_el)?;
-    btn.append_child(&short_el)?;
     Ok(btn)
 }
 
-fn create_mode_btn(document: &Document, idx: usize, label: &str) -> Result<HtmlElement, JsValue> {
-    let btn: HtmlElement = document.create_element("button")?.dyn_into()?;
-    btn.set_attribute("type", "button")?;
-    btn.set_attribute("data-mode-idx", &idx.to_string())?;
-    btn.set_class_name("mode-btn");
-    btn.set_text_content(Some(label));
-    Ok(btn)
+fn by_id<T: JsCast>(document: &Document, id: &str) -> Result<T, JsValue> {
+    document
+        .get_element_by_id(id)
+        .ok_or_else(|| JsValue::from_str(&format!("#{id} missing")))?
+        .dyn_into::<T>()
+        .map_err(|_| JsValue::from_str(&format!("#{id} has the wrong type")))
 }
 
-fn create_recipe_btn(
-    document: &Document,
-    idx: usize,
-    recipe: &recipes::WowRecipe,
-) -> Result<HtmlElement, JsValue> {
-    let btn: HtmlElement = document.create_element("button")?.dyn_into()?;
-    btn.set_attribute("type", "button")?;
-    btn.set_attribute("data-recipe-idx", &idx.to_string())?;
-    btn.set_class_name("recipe-btn");
-    btn.set_attribute("title", &format!("{} — {}", recipe.how, recipe.result))?;
-
-    let swatches: HtmlElement = document.create_element("span")?.dyn_into()?;
-    swatches.set_class_name("recipe-swatches");
-    for &mid in recipe.materials.iter().take(2) {
-        let color = materials::BUILTINS
-            .iter()
-            .find(|d| d.id == mid)
-            .map(|d| d.color_argb)
-            .unwrap_or(0xFF888888);
-        let sw: HtmlElement = document.create_element("span")?.dyn_into()?;
-        sw.set_class_name("recipe-swatch");
-        sw.style()
-            .set_property("background", &argb_to_css(color))?;
-        swatches.append_child(&sw)?;
+fn all_html(document: &Document, sel: &str) -> Result<Vec<HtmlElement>, JsValue> {
+    let list = document.query_selector_all(sel)?;
+    let mut out = Vec::new();
+    for i in 0..list.length() {
+        if let Some(n) = list.item(i) {
+            if let Ok(el) = n.dyn_into::<HtmlElement>() {
+                out.push(el);
+            }
+        }
     }
-
-    let label: HtmlElement = document.create_element("span")?.dyn_into()?;
-    label.set_text_content(Some(recipe.title));
-
-    btn.append_child(&swatches)?;
-    btn.append_child(&label)?;
-    Ok(btn)
+    Ok(out)
 }
 
-fn fit_canvas(canvas: &HtmlCanvasElement) {
-    let win = window().unwrap();
-    let wrap = win
-        .document()
-        .unwrap()
-        .get_element_by_id("game-wrap")
-        .unwrap();
-    let rect = wrap.get_bounding_client_rect();
-    let w = rect.width();
-    let h = rect.height();
-    if w <= 0.0 || h <= 0.0 {
-        return;
-    }
-    let aspect = DISP_W as f64 / DISP_H as f64;
-    let (css_w, css_h) = if w / h > aspect {
-        (h * aspect, h)
-    } else {
-        (w, w / aspect)
-    };
-    // The canvas has a 1px content-box border: leave room for it so it never overflows the wrap.
-    let css_w = (css_w - 2.0).max(1.0).floor();
-    let css_h = (css_h - 2.0).max(1.0).floor();
-    let s = canvas.style();
-    let _ = s.set_property("width", &format!("{css_w:.0}px"));
-    let _ = s.set_property("height", &format!("{css_h:.0}px"));
+fn on_click(el: &HtmlElement, f: impl FnMut(Event) + 'static) -> Result<(), JsValue> {
+    let closure = Closure::wrap(Box::new(f) as Box<dyn FnMut(Event)>);
+    el.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
+/// True while focus is in a form control (keyboard shortcuts stand down; Space presses the button).
+fn typing_target(e: &KeyboardEvent) -> bool {
+    e.target()
+        .and_then(|t| t.dyn_into::<Element>().ok())
+        .map(|el| matches!(el.tag_name().as_str(), "INPUT" | "BUTTON" | "TEXTAREA" | "SELECT" | "A"))
+        .unwrap_or(false)
 }
 
 fn run() -> Result<(), JsValue> {
     let document: Document = window().unwrap().document().unwrap();
 
-    let canvas = document
-        .get_element_by_id("sandii")
-        .expect("#sandii canvas")
-        .dyn_into::<HtmlCanvasElement>()?;
-    canvas.set_width(DISP_W as u32);
-    canvas.set_height(DISP_H as u32);
+    let canvas: HtmlCanvasElement = by_id(&document, "sandii")?;
+    let (gw, gh) = target_grid(&canvas);
+    canvas.set_width(gw as u32);
+    canvas.set_height(gh as u32);
     canvas.set_tab_index(0);
     let canvas = Rc::new(canvas);
-
-    fit_canvas(&canvas);
 
     let ctx = canvas
         .get_context("2d")?
@@ -564,184 +577,104 @@ fn run() -> Result<(), JsValue> {
         .dyn_into::<CanvasRenderingContext2d>()?;
     ctx.set_image_smoothing_enabled(false);
 
-    let stats = document
-        .get_element_by_id("stats")
-        .expect("#stats")
-        .dyn_into::<HtmlElement>()?;
-
-    let mat_container = document
-        .get_element_by_id("panel-materials")
-        .expect("#panel-materials")
-        .dyn_into::<Element>()?;
+    let mat_container: Element = by_id(&document, "materials")?;
     mat_container.set_inner_html("");
-
-    let mode_row = document
-        .get_element_by_id("panel-modes")
-        .expect("#panel-modes")
-        .dyn_into::<Element>()?;
-    mode_row.set_inner_html("");
-
-    let mode_help = document
-        .get_element_by_id("mode-help")
-        .expect("#mode-help")
-        .dyn_into::<HtmlElement>()?;
-
-    let brush_slider = document
-        .get_element_by_id("brush-slider")
-        .expect("#brush-slider")
-        .dyn_into::<HtmlInputElement>()?;
-
-    let brush_value = document
-        .get_element_by_id("brush-value")
-        .expect("#brush-value")
-        .dyn_into::<HtmlElement>()?;
-
-    let material_title = document
-        .get_element_by_id("material-detail-title")
-        .expect("#material-detail-title")
-        .dyn_into::<HtmlElement>()?;
-
-    let material_body = document
-        .get_element_by_id("material-detail-body")
-        .expect("#material-detail-body")
-        .dyn_into::<HtmlElement>()?;
-
-    let recipe_container = document
-        .get_element_by_id("panel-recipes")
-        .expect("#panel-recipes")
-        .dyn_into::<Element>()?;
-    recipe_container.set_inner_html("");
-
-    let recipe_tip = document
-        .get_element_by_id("recipe-tip")
-        .expect("#recipe-tip")
-        .dyn_into::<HtmlElement>()?;
-
-    let selection_mode = document
-        .get_element_by_id("selection-mode")
-        .expect("#selection-mode")
-        .dyn_into::<HtmlElement>()?;
-    let selection_sep = document
-        .get_element_by_id("selection-sep")
-        .expect("#selection-sep")
-        .dyn_into::<HtmlElement>()?;
-    let selection_mat_wrap = document
-        .get_element_by_id("selection-mat-wrap")
-        .expect("#selection-mat-wrap")
-        .dyn_into::<HtmlElement>()?;
-    let selection_swatch = document
-        .get_element_by_id("selection-swatch")
-        .expect("#selection-swatch")
-        .dyn_into::<HtmlElement>()?;
-    let selection_name = document
-        .get_element_by_id("selection-name")
-        .expect("#selection-name")
-        .dyn_into::<HtmlElement>()?;
-
     let mut mat_buttons: Vec<HtmlElement> = Vec::new();
     for i in 0..materials::paintable_builtin_count() {
         let def = materials::paintable_builtin_at(i).expect("paintable builtin");
+        if def.id == material::EMPTY {
+            continue; // the Erase tool covers it
+        }
         let btn = create_mat_btn(&document, def)?;
         mat_container.append_child(&btn)?;
         mat_buttons.push(btn);
     }
 
-    let mode_labels = ["Draw", "Rigid", "Explosion", "Heat", "Cool"];
-    let mut mode_buttons: Vec<HtmlElement> = Vec::new();
-    for (i, label) in mode_labels.iter().enumerate() {
-        let btn = create_mode_btn(&document, i, label)?;
-        mode_row.append_child(&btn)?;
-        mode_buttons.push(btn);
-    }
-
-    let mut recipe_buttons: Vec<HtmlElement> = Vec::new();
-    for i in 0..recipes::wow_recipe_count() {
-        let r = recipes::wow_recipe_at(i).expect("wow recipe");
-        let btn = create_recipe_btn(&document, i, r)?;
-        recipe_container.append_child(&btn)?;
-        recipe_buttons.push(btn);
-    }
-
     let ui = Rc::new(UiRefs {
-        mat_container,
         mat_buttons,
-        mode_buttons,
-        recipe_buttons,
-        recipe_tip,
-        mode_help,
-        brush_slider,
-        brush_value,
-        material_title,
-        material_body,
-        selection_mode,
-        selection_sep,
-        selection_mat_wrap,
-        selection_swatch,
-        selection_name,
+        tool_buttons: all_html(&document, "#tools [data-tool]")?,
+        quick_tool: by_id(&document, "quick-tool")?,
+        quick_mats: all_html(&document, "#quick .qmat")?,
+        brush_slider: by_id(&document, "brush-slider")?,
+        brush_value: by_id(&document, "brush-value")?,
+        pause_btn: by_id(&document, "act-pause")?,
+        debug_btn: by_id(&document, "act-debug")?,
+        hud: by_id(&document, "hud")?,
+        stats: by_id(&document, "stats")?,
     });
 
     let input = Rc::new(RefCell::new(FrameInput::default()));
-    let pending_ui = Rc::new(RefCell::new(VecDeque::new()));
+    let pending_ui: Rc<RefCell<VecDeque<UiAction>>> = Rc::new(RefCell::new(VecDeque::new()));
     let debug_hud = Rc::new(Cell::new(debug_requested()));
+    let resize_at = Rc::new(Cell::new(0.0f64));
     let app = Rc::new(RefCell::new(App::new(
         input.clone(),
         pending_ui.clone(),
         debug_hud.clone(),
+        resize_at.clone(),
+        gw,
+        gh,
     )));
 
+    let push = {
+        let pq = pending_ui.clone();
+        move |a: UiAction| pq.borrow_mut().push_back(a)
+    };
+
     for btn in &ui.mat_buttons {
-        let pq2 = pending_ui.clone();
         let id: MaterialId = btn
             .get_attribute("data-mat-id")
             .unwrap_or_default()
             .parse()
             .unwrap_or(0);
-        let btn_el = btn.clone();
-        let closure = Closure::wrap(Box::new(move |_e: Event| {
-            if btn_el.has_attribute("disabled") {
-                return;
+        let el = btn.clone();
+        let p = push.clone();
+        on_click(btn, move |_| {
+            if !el.has_attribute("disabled") {
+                p(UiAction::SelectMaterial(id));
             }
-            pq2.borrow_mut().push_back(UiAction::SelectMaterial(id));
-        }) as Box<dyn FnMut(_)>);
-        btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
-        closure.forget();
+        })?;
     }
-
-    for btn in &ui.mode_buttons {
-        let pq2 = pending_ui.clone();
-        let idx: usize = btn
-            .get_attribute("data-mode-idx")
-            .unwrap_or_default()
-            .parse()
-            .unwrap_or(0);
-        let m = InteractionMode::ALL[idx];
-        let closure = Closure::wrap(Box::new(move |_e: Event| {
-            pq2.borrow_mut().push_back(UiAction::SetMode(m));
-        }) as Box<dyn FnMut(_)>);
-        btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
-        closure.forget();
+    for btn in &ui.quick_mats {
+        let el = btn.clone();
+        let p = push.clone();
+        on_click(btn, move |_| {
+            if let Some(Ok(id)) = el.get_attribute("data-mat-id").map(|v| v.parse::<MaterialId>()) {
+                p(UiAction::SelectMaterial(id));
+            }
+        })?;
     }
-
-    for btn in &ui.recipe_buttons {
-        let pq2 = pending_ui.clone();
-        let idx: usize = btn
-            .get_attribute("data-recipe-idx")
-            .unwrap_or_default()
-            .parse()
-            .unwrap_or(0);
-        let closure = Closure::wrap(Box::new(move |_e: Event| {
-            pq2.borrow_mut().push_back(UiAction::SelectRecipe(idx));
-        }) as Box<dyn FnMut(_)>);
-        btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
-        closure.forget();
+    for btn in &ui.tool_buttons {
+        let action_for = btn.get_attribute("data-tool").unwrap_or_default();
+        let p = push.clone();
+        on_click(btn, move |_| {
+            p(match action_for.as_str() {
+                "erase" => UiAction::Erase,
+                "rigid" => UiAction::SetMode(InteractionMode::RigidBody),
+                "blast" => UiAction::SetMode(InteractionMode::Explosion),
+                "heat" => UiAction::SetMode(InteractionMode::Heat),
+                "cool" => UiAction::SetMode(InteractionMode::Cool),
+                _ => UiAction::SetMode(InteractionMode::Draw),
+            })
+        })?;
     }
-
     {
-        let pq2 = pending_ui.clone();
+        let p = push.clone();
+        on_click(&ui.quick_tool, move |_| p(UiAction::ToggleTool))?;
+        let p = push.clone();
+        on_click(&ui.pause_btn, move |_| p(UiAction::TogglePause))?;
+        let p = push.clone();
+        on_click(&ui.debug_btn, move |_| p(UiAction::ToggleDebug))?;
+        let clear: HtmlElement = by_id(&document, "act-clear")?;
+        let p = push.clone();
+        on_click(&clear, move |_| p(UiAction::ClearWorld))?;
+    }
+    {
+        let p = push.clone();
         let slider_el = ui.brush_slider.clone();
         let closure = Closure::wrap(Box::new(move |_e: Event| {
             if let Ok(v) = slider_el.value().parse::<i32>() {
-                pq2.borrow_mut().push_back(UiAction::SetBrushRadius(v));
+                p(UiAction::SetBrushRadius(v));
             }
         }) as Box<dyn FnMut(_)>);
         ui.brush_slider
@@ -749,20 +682,7 @@ fn run() -> Result<(), JsValue> {
         closure.forget();
     }
 
-    {
-        let clear_btn: HtmlElement = document
-            .get_element_by_id("clear-world")
-            .expect("#clear-world")
-            .dyn_into()?;
-        let pq2 = pending_ui.clone();
-        let closure = Closure::wrap(Box::new(move |_e: Event| {
-            pq2.borrow_mut().push_back(UiAction::ClearWorld);
-        }) as Box<dyn FnMut(_)>);
-        clear_btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
-        closure.forget();
-    }
-
-    sync_ui(&ui, &app.borrow().game, None);
+    sync_ui(&ui, &app.borrow().game, &app.borrow().recents, debug_hud.get());
 
     {
         let inp = input.clone();
@@ -956,6 +876,9 @@ fn run() -> Result<(), JsValue> {
         let inp = input.clone();
         let dbg = debug_hud.clone();
         let closure = Closure::wrap(Box::new(move |e: KeyboardEvent| {
+            if typing_target(&e) && e.code() != "F3" {
+                return;
+            }
             if e.code() == "F3" {
                 e.prevent_default();
                 if !e.repeat() {
@@ -973,6 +896,10 @@ fn run() -> Result<(), JsValue> {
                 "KeyT" if !e.repeat() => g.spawn_rigid_circle_pressed = true,
                 "KeyL" if !e.repeat() => g.spawn_obsidian_pressed = true,
                 "KeyR" if !e.repeat() && e.shift_key() => g.rigid_rect_r_pressed = true,
+                "Space" if !e.repeat() => {
+                    e.prevent_default();
+                    g.toggle_pause_pressed = true;
+                }
                 _ => {}
             }
         }) as Box<dyn FnMut(_)>);
@@ -1005,27 +932,27 @@ fn run() -> Result<(), JsValue> {
     }
 
     {
-        let c2 = canvas.clone();
+        let r = resize_at.clone();
         let closure = Closure::wrap(Box::new(move |_e: Event| {
-            fit_canvas(&c2);
+            r.set(now_ms().max(1.0));
         }) as Box<dyn FnMut(_)>);
-        window()
-            .unwrap()
-            .add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())?;
+        let win = window().unwrap();
+        win.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())?;
+        win.add_event_listener_with_callback("orientationchange", closure.as_ref().unchecked_ref())?;
         closure.forget();
     }
 
     {
         let a = app.clone();
         let c = ctx.clone();
-        let s = stats.clone();
+        let cv = canvas.clone();
         let u = ui.clone();
         let closure = Rc::new(RefCell::new(None::<Closure<dyn FnMut()>>));
         let g = closure.clone();
         *closure.borrow_mut() = Some(Closure::wrap(Box::new(move || {
             {
                 let mut app_b = a.borrow_mut();
-                app_b.tick(&c, &s, &u);
+                app_b.tick(&cv, &c, &u);
             }
             request_animation_frame(g.borrow().as_ref().unwrap());
         }) as Box<dyn FnMut()>));

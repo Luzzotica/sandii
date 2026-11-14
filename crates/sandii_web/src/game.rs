@@ -10,12 +10,24 @@ use falling_everything_core::{
     base_strength_for_radius, ExplosionParams, ExplosionSpawn, Simulation, SimulationConfig,
 };
 
-/// World size in cells (~70% of 640×360). Display uses 1× scale for lighter web CPU load.
-pub const SIM_WIDTH: usize = 448;
-pub const SIM_HEIGHT: usize = 252;
-pub const SCALE: usize = 1;
-pub const DISP_W: usize = SIM_WIDTH * SCALE;
-pub const DISP_H: usize = SIM_HEIGHT * SCALE;
+/// Cell budget for the web grid: the old fixed 448×252 world. The grid takes the viewport's
+/// aspect ratio and never exceeds this many cells, so CPU load stays where it was.
+pub const MAX_CELLS: f64 = 448.0 * 252.0;
+/// Smallest on-screen cell (CSS px): small screens get fewer, chunkier cells (phones stay smooth).
+pub const MIN_CELL_PX: f64 = 2.0;
+/// Where the terrain surface sits, as a fraction of the grid height from the top.
+const SURFACE_FRACTION: f64 = 0.55;
+
+/// Grid size (cells) for a viewport of `css_w`×`css_h` CSS px.
+pub fn grid_for_viewport(css_w: f64, css_h: f64) -> (usize, usize) {
+    let css_w = css_w.max(64.0);
+    let css_h = css_h.max(64.0);
+    let cell = (css_w * css_h / MAX_CELLS).sqrt().max(MIN_CELL_PX);
+    let w = (css_w / cell).round().max(32.0) as usize;
+    let h = (css_h / cell).round().max(32.0) as usize;
+    (w, h)
+}
+
 pub const TEMP_BRUSH_DELTA: i32 = 40;
 /// Max brush radius for most modes (particles, explosions, temperature).
 pub const BRUSH_MAX_DEFAULT: i32 = 32;
@@ -44,15 +56,6 @@ pub enum InteractionMode {
     Cool,
 }
 
-impl InteractionMode {
-    pub const ALL: [InteractionMode; 5] = [
-        Self::Draw,
-        Self::RigidBody,
-        Self::Explosion,
-        Self::Heat,
-        Self::Cool,
-    ];
-}
 
 /// Same rule as the desktop sandbox: only solid, non-empty, non-static materials can become rigid bodies.
 pub fn is_rigid_body_eligible(def: &materials::MaterialDef) -> bool {
@@ -62,57 +65,21 @@ pub fn is_rigid_body_eligible(def: &materials::MaterialDef) -> bool {
         && def.id != material::RIGID
 }
 
-fn viewport_rect(camera: Vec2i) -> RectI {
+fn viewport_rect(camera: Vec2i, w: usize, h: usize) -> RectI {
     RectI::new(
         camera,
-        Vec2i::new(
-            camera.x + SIM_WIDTH as i32 - 1,
-            camera.y + SIM_HEIGHT as i32 - 1,
-        ),
+        Vec2i::new(camera.x + w as i32 - 1, camera.y + h as i32 - 1),
     )
 }
 
-fn camera_center(camera: Vec2i) -> Vec2i {
+/// Camera for a `w`×`h` grid: centered on x = 0, terrain surface at [`SURFACE_FRACTION`] down.
+/// The same rule for every size, so the ground stays put across rotations.
+fn camera_for(w: usize, h: usize) -> Vec2i {
+    let surface_y = TerrainConfig::default().surface_y;
     Vec2i::new(
-        camera.x + SIM_WIDTH as i32 / 2,
-        camera.y + SIM_HEIGHT as i32 / 2,
+        -(w as i32) / 2,
+        surface_y - (h as f64 * SURFACE_FRACTION).round() as i32,
     )
-}
-
-fn upscale_blit(
-    frame: &mut [u32],
-    pixels: &[u32],
-    screen_x: usize,
-    screen_y: usize,
-    w: usize,
-    h: usize,
-) {
-    for sy in 0..h {
-        for sx in 0..w {
-            let color = pixels[sy * w + sx];
-            let dx = (screen_x + sx) * SCALE;
-            let dy = (screen_y + sy) * SCALE;
-            for oy in 0..SCALE {
-                let row = dy + oy;
-                if row >= DISP_H {
-                    break;
-                }
-                let base = row * DISP_W + dx;
-                for ox in 0..SCALE {
-                    let col = dx + ox;
-                    if col < DISP_W {
-                        frame[base + ox] = color;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn blit_full_world(sim: &Simulation, frame: &mut [u32], camera: Vec2i) {
-    let rect = viewport_rect(camera);
-    let pixels = sim.copy_argb32_for_region(rect);
-    upscale_blit(frame, &pixels, 0, 0, SIM_WIDTH, SIM_HEIGHT);
 }
 
 /// Keyboard / pointer state sampled once per frame (from DOM events).
@@ -131,6 +98,7 @@ pub struct FrameInput {
     pub spawn_rigid_circle_pressed: bool,
     pub spawn_obsidian_pressed: bool,
     pub rigid_rect_r_pressed: bool,
+    pub toggle_pause_pressed: bool,
     /// Set on a touch/pen press; cleared once a frame has seen it (so a quick tap still paints).
     pub press_unseen: bool,
     /// A touch lifted before any frame saw the press: release after the next frame.
@@ -154,6 +122,7 @@ impl Default for FrameInput {
             spawn_rigid_circle_pressed: false,
             spawn_obsidian_pressed: false,
             rigid_rect_r_pressed: false,
+            toggle_pause_pressed: false,
             press_unseen: false,
             release_pending: false,
             hide_pointer_pending: false,
@@ -169,6 +138,7 @@ impl FrameInput {
         self.spawn_rigid_circle_pressed = false;
         self.spawn_obsidian_pressed = false;
         self.rigid_rect_r_pressed = false;
+        self.toggle_pause_pressed = false;
         // Touch bookkeeping: hide a lifted finger's position only after a frame saw the release.
         if self.hide_pointer_pending && !self.left_down && !self.release_pending {
             self.mouse_x = -1.0;
@@ -187,7 +157,11 @@ pub struct GameState {
     /// Used by the WASM shell for HUD (parallel toggle, cell probe).
     pub sim: Simulation,
     pub camera: Vec2i,
+    /// Grid size in cells (= canvas bitmap size).
+    pub w: usize,
+    pub h: usize,
     pub frame: Vec<u32>,
+    pub paused: bool,
     pub selected: MaterialId,
     pub brush_radius: i32,
     pub interaction_mode: InteractionMode,
@@ -207,37 +181,21 @@ pub struct GameState {
 }
 
 impl GameState {
-    pub fn new() -> Self {
+    pub fn new(w: usize, h: usize) -> Self {
         let mut sim = Simulation::new(SimulationConfig {
             deterministic: true,
             ..SimulationConfig::default()
         });
-
-        let terrain_cfg = TerrainConfig::default();
-
-        let initial_camera = Vec2i::new(
-            -(SIM_WIDTH as i32) / 2,
-            terrain_cfg.surface_y - (SIM_HEIGHT as i32) / 3,
-        );
-
-        // Tight bounds: no panning so the world equals the viewport (saves memory + CPU).
-        sim.set_solid_bounds(RectI::new(
-            initial_camera,
-            Vec2i::new(
-                initial_camera.x + SIM_WIDTH as i32 - 1,
-                initial_camera.y + SIM_HEIGHT as i32 - 1,
-            ),
-        ));
-
-        worldgen::paint_terrain(&mut sim, &terrain_cfg);
-
         // 60 Hz simulation; allow several substeps per frame to catch up after a long frame.
         sim.set_fixed_timestep(1.0 / 60.0, 4);
 
-        Self {
+        let mut g = Self {
             sim,
-            camera: initial_camera,
-            frame: vec![0u32; DISP_W * DISP_H],
+            camera: Vec2i::new(0, 0),
+            w: 0,
+            h: 0,
+            frame: Vec::new(),
+            paused: false,
             selected: material::SAND,
             brush_radius: 4,
             interaction_mode: InteractionMode::Draw,
@@ -258,7 +216,94 @@ impl GameState {
                 lifetime: Some(40),
                 temperature: Some(1200),
             },
+        };
+        g.install(w, h, None);
+        g
+    }
+
+    /// Re-lay the world out for a new grid size (rotation / window resize), keeping what was on
+    /// screen: cells in the overlap carry over, newly shown ground gets fresh terrain.
+    /// Rigid bodies settle in place as plain material.
+    pub fn resize(&mut self, w: usize, h: usize) {
+        if w == self.w && h == self.h {
+            return;
         }
+        let old = viewport_rect(self.camera, self.w, self.h);
+        let mut cells = Vec::with_capacity(self.w * self.h);
+        for y in old.min.y..=old.max.y {
+            for x in old.min.x..=old.max.x {
+                cells.push(self.sim.cell(Vec2i::new(x, y)));
+            }
+        }
+        self.install(w, h, Some((old, cells)));
+    }
+
+    fn install(&mut self, w: usize, h: usize, keep: Option<(RectI, Vec<Cell>)>) {
+        use falling_everything_core::world::cell_flags;
+        let camera = camera_for(w, h);
+        let rect = viewport_rect(camera, w, h);
+        // Drop every rigid body, particle and cell (the store is rebuilt below).
+        let far = Vec2i::new(1 << 28, 1 << 28);
+        self.sim.despawn_outside(RectI::new(far, far));
+        // Tight bounds: no panning, the world equals the viewport (saves memory + CPU).
+        self.sim.set_solid_bounds(rect);
+
+        let kept = keep.as_ref().map(|(r, _)| *r);
+        let in_kept = |p: Vec2i| kept.map_or(false, |r| r.contains(p));
+        let cfg = TerrainConfig {
+            x_min: rect.min.x,
+            x_max: rect.max.x,
+            ..TerrainConfig::default()
+        };
+        for col in worldgen::generate_terrain(&cfg) {
+            for &(y, mat) in &col.cells {
+                let p = Vec2i::new(col.x, y);
+                if rect.contains(p) && !in_kept(p) {
+                    self.sim.paint_cell(p, Cell::new().with_material(mat));
+                }
+            }
+        }
+        if let Some((old, cells)) = keep {
+            let ow = (old.max.x - old.min.x + 1) as usize;
+            for y in rect.min.y.max(old.min.y)..=rect.max.y.min(old.max.y) {
+                for x in rect.min.x.max(old.min.x)..=rect.max.x.min(old.max.x) {
+                    let i = (y - old.min.y) as usize * ow + (x - old.min.x) as usize;
+                    let mut c = cells[i];
+                    if c.has_flag(cell_flags::RIGID_PIXEL) || c.material() == material::RIGID {
+                        let src = c.rigid_source_material();
+                        let mut m = if c.material() == material::RIGID && src != 0 {
+                            src
+                        } else {
+                            c.material()
+                        };
+                        if m == material::RIGID {
+                            m = material::STONE;
+                        }
+                        c = Cell::new()
+                            .with_material(m)
+                            .with_temperature(c.temperature())
+                            .with_variant(c.variant());
+                    }
+                    self.sim.paint_cell(Vec2i::new(x, y), c);
+                }
+            }
+        }
+
+        self.camera = camera;
+        self.w = w;
+        self.h = h;
+        self.frame = vec![0u32; w * h];
+        self.reset_strokes();
+    }
+
+    fn reset_strokes(&mut self) {
+        self.rigid_stroke.clear();
+        self.rigid_stroke_last = None;
+        self.last_left_paint = None;
+        self.last_right_paint = None;
+        self.shift_left_rect_anchor = None;
+        self.shift_right_rect_anchor = None;
+        self.rigid_rect_corner = None;
     }
 
     pub fn set_interaction_mode(&mut self, mode: InteractionMode) {
@@ -289,24 +334,15 @@ impl GameState {
 
     /// Erase the entire visible world (same as the `C` key) and drop in-progress strokes.
     pub fn clear_world(&mut self) {
-        self.sim
-            .paint_circle(camera_center(self.camera), 10_000, material::EMPTY);
-        self.rigid_stroke.clear();
-        self.rigid_stroke_last = None;
-        self.last_left_paint = None;
-        self.last_right_paint = None;
-        self.shift_left_rect_anchor = None;
-        self.shift_right_rect_anchor = None;
-        self.rigid_rect_corner = None;
+        let r = viewport_rect(self.camera, self.w, self.h);
+        self.sim.paint_rect_filled(r.min, r.max, material::EMPTY);
+        self.reset_strokes();
     }
 
     pub fn world_from_mouse(&self, mx: f32, my: f32) -> Vec2i {
-        let mx = mx.clamp(0.0, (DISP_W.saturating_sub(1)) as f32) as i32;
-        let my = my.clamp(0.0, (DISP_H.saturating_sub(1)) as f32) as i32;
-        Vec2i::new(
-            mx / SCALE as i32 + self.camera.x,
-            my / SCALE as i32 + self.camera.y,
-        )
+        let mx = mx.clamp(0.0, (self.w.saturating_sub(1)) as f32) as i32;
+        let my = my.clamp(0.0, (self.h.saturating_sub(1)) as f32) as i32;
+        Vec2i::new(mx + self.camera.x, my + self.camera.y)
     }
 
     pub fn step_frame(&mut self, dt: f32, input: &FrameInput, prev: &FrameInput) {
@@ -315,6 +351,9 @@ impl GameState {
         if input.brush_steps != 0 {
             let cap = brush_cap_for_mode(self.interaction_mode);
             self.brush_radius = (self.brush_radius + input.brush_steps).clamp(1, cap);
+        }
+        if input.toggle_pause_pressed {
+            self.paused = !self.paused;
         }
         if input.clear_pressed {
             self.clear_world();
@@ -587,8 +626,12 @@ impl GameState {
             }
         }
 
-        let _stats = self.sim.advance_frame(dt);
-        blit_full_world(&self.sim, &mut self.frame, self.camera);
+        if !self.paused {
+            let _stats = self.sim.advance_frame(dt);
+        }
+        self.frame = self
+            .sim
+            .copy_argb32_for_region(viewport_rect(self.camera, self.w, self.h));
     }
 }
 
