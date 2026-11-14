@@ -553,7 +553,7 @@ fn on_click(el: &HtmlElement, f: impl FnMut(Event) + 'static) -> Result<(), JsVa
     Ok(())
 }
 
-/// True while focus is in a form control (keyboard shortcuts stand down; Space presses the button).
+/// True while focus is on a control (button, slider, link): Space belongs to it there.
 fn typing_target(e: &KeyboardEvent) -> bool {
     e.target()
         .and_then(|t| t.dyn_into::<Element>().ok())
@@ -711,7 +711,11 @@ fn run() -> Result<(), JsValue> {
             g.mouse_y = my;
             g.shift = e.shift_key();
             match e.button() {
-                0 => g.left_down = true,
+                0 => {
+                    g.left_down = true;
+                    g.press_unseen = true;
+                    g.release_pending = false;
+                }
                 1 => g.middle_down = true,
                 2 => g.right_down = true,
                 _ => {}
@@ -739,6 +743,8 @@ fn run() -> Result<(), JsValue> {
             g.mouse_y = my;
             g.shift = e.shift_key();
             match e.button() {
+                // A click shorter than a frame: let one frame see the press (explosions need it).
+                0 if g.press_unseen && g.left_down => g.release_pending = true,
                 0 => g.left_down = false,
                 1 => g.middle_down = false,
                 2 => g.right_down = false,
@@ -876,7 +882,8 @@ fn run() -> Result<(), JsValue> {
         let inp = input.clone();
         let dbg = debug_hud.clone();
         let closure = Closure::wrap(Box::new(move |e: KeyboardEvent| {
-            if typing_target(&e) && e.code() != "F3" {
+            // Space presses a focused button / moves a slider; it only pauses from the canvas.
+            if typing_target(&e) && e.code() == "Space" {
                 return;
             }
             if e.code() == "F3" {
@@ -921,7 +928,11 @@ fn run() -> Result<(), JsValue> {
         let inp = input.clone();
         let closure = Closure::wrap(Box::new(move |_e: MouseEvent| {
             let mut g = inp.borrow_mut();
-            g.left_down = false;
+            if g.press_unseen && g.left_down {
+                g.release_pending = true;
+            } else {
+                g.left_down = false;
+            }
             g.right_down = false;
             g.middle_down = false;
         }) as Box<dyn FnMut(_)>);
