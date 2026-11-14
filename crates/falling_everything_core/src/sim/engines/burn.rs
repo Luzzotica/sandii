@@ -3,7 +3,7 @@ use rand::Rng;
 
 use crate::cell64::MAX_TEMPERATURE;
 use crate::sim::thermal::thermal_props_for;
-use crate::sim::SimGrids;
+use crate::sim::{material_bit, SimGrids};
 use crate::world::{
     cell_flags, material, AdjacentInfluenceRule, Cell, MaterialId, MaterialProps, Phase, Vec2i,
     World,
@@ -389,6 +389,13 @@ pub(crate) fn spread_burn_to_neighbors(
         (0, 1),
         (1, 1),
     ];
+
+    // Inside a pool of the same material (or open air) every neighbor is skipped below.
+    let others = sg.neighbor8_material_mask(p)
+        & !(material_bit(material::EMPTY) | material_bit(source_material));
+    if others == 0 && material_bit(source_material) != material_bit(u16::MAX) {
+        return false;
+    }
 
     let src_props = world.material_props(source_material);
 

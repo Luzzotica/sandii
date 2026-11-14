@@ -77,20 +77,19 @@ pub(crate) fn step_temperature(
     };
     let mut temp = effective_temp(cell);
 
-    for &(dx, dy) in &[(0i32, -1i32), (0, 1), (-1, 0), (1, 0)] {
-        let np = Vec2i::new(p.x + dx, p.y + dy);
-        let nc = sg.get(np);
+    // Up, down, left, right (same order as before: `temp` updates edge by edge).
+    for nc in sg.neighbors4(p) {
+        let diff = effective_temp(nc) - temp;
+        if diff == 0 {
+            // No flux across this edge (`transfer` would be 0).
+            continue;
+        }
         let Some(np_props) = thermal_props_for(nc, world) else {
             continue;
         };
         let mut k = (props.thermal_conductivity as i32).min(np_props.thermal_conductivity as i32);
         if cell.material() == material::LIQUID || nc.material() == material::LIQUID {
             k = (k + LIQUID_EDGE_THERMAL_BONUS).min(255);
-        }
-        let diff = effective_temp(nc) - temp;
-        if diff == 0 {
-            // No flux across this edge (`transfer` would be 0).
-            continue;
         }
         let c_vol = (props.volumetric_heat_capacity as i32).max(1);
         let base = (diff * k) / (c_vol * 16);

@@ -503,6 +503,33 @@ impl SimGrids {
         }
     }
 
+    /// The 4 cardinal neighbors of `p` in the order up, down, left, right (as [`Self::get`]:
+    /// out-of-grid cells read as stone), without per-cell bounds checks away from the edge.
+    #[inline]
+    pub(crate) fn neighbors4(&self, p: Vec2i) -> [Cell; 4] {
+        let x = p.x - self.origin.x;
+        let y = p.y - self.origin.y;
+        if x >= 1 && x < self.width - 1 && y >= 1 && y < self.height - 1 {
+            let w = self.width as isize;
+            let i = (y * self.width + x) as isize;
+            unsafe {
+                [
+                    *self.write.offset(i - w),
+                    *self.write.offset(i + w),
+                    *self.write.offset(i - 1),
+                    *self.write.offset(i + 1),
+                ]
+            }
+        } else {
+            [
+                self.get(Vec2i::new(p.x, p.y - 1)),
+                self.get(Vec2i::new(p.x, p.y + 1)),
+                self.get(Vec2i::new(p.x - 1, p.y)),
+                self.get(Vec2i::new(p.x + 1, p.y)),
+            ]
+        }
+    }
+
     fn get(&self, p: Vec2i) -> Cell {
         self.index(p)
             .map(|i| unsafe { *self.write.add(i) })
