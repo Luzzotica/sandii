@@ -23,7 +23,7 @@ use super::SimGrids;
 
 /// Resolve material props for temperature conduction. `EMPTY` uses air-like props; `STONE` does not conduct.
 #[inline]
-pub(crate) fn thermal_props_for(cell: Cell, world: &World) -> Option<MaterialProps> {
+pub(crate) fn thermal_props_for(cell: Cell, world: &World) -> Option<&MaterialProps> {
     let mat = cell.material();
     if mat == material::STONE {
         return None;

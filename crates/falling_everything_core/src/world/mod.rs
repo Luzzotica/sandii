@@ -1136,11 +1136,12 @@ impl World {
         true
     }
 
-    pub fn material_props(&self, id: MaterialId) -> MaterialProps {
-        self.material_props
-            .get(id as usize)
-            .copied()
-            .unwrap_or_default()
+    /// Props for `id` by reference: [`MaterialProps`] is a few hundred bytes and the sim reads it
+    /// several times per cell per tick, so never copy it on the hot path.
+    #[inline]
+    pub fn material_props(&self, id: MaterialId) -> &MaterialProps {
+        static DEFAULT_PROPS: MaterialProps = MaterialProps::default_const();
+        self.material_props.get(id as usize).unwrap_or(&DEFAULT_PROPS)
     }
 
     /// Pointer to the material-props table for sim grids (same lifetime as `&World` / step).

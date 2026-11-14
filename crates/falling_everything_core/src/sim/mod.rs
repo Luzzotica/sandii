@@ -680,10 +680,10 @@ pub(crate) fn vertical_down_allows_density_swap(from: Phase, to: Phase) -> bool 
 }
 
 fn can_displace(
-    from_props: MaterialProps,
+    from_props: &MaterialProps,
     _from_rule: MaterialRule,
     to_cell: Cell,
-    to_props: MaterialProps,
+    to_props: &MaterialProps,
     _to_rule: MaterialRule,
     intent: MoveIntent,
     rng: &mut SmallRng,
