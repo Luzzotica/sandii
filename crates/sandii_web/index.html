@@ -24,10 +24,12 @@
         --accent-ink: #1a1405;
         --danger: #ff7a6b;
         --gap: 16px;
-        --sat: env(safe-area-inset-top, 0px);
-        --sar: env(safe-area-inset-right, 0px);
-        --sab: env(safe-area-inset-bottom, 0px);
-        --sal: env(safe-area-inset-left, 0px);
+        /* Partii's insets first: inside the iPhone app's game frame iOS keeps env() on the
+           rotation the page was made in. Set by the script below (?safe= / partii:insets). */
+        --sat: var(--partii-safe-top, env(safe-area-inset-top, 0px));
+        --sar: var(--partii-safe-right, env(safe-area-inset-right, 0px));
+        --sab: var(--partii-safe-bottom, env(safe-area-inset-bottom, 0px));
+        --sal: var(--partii-safe-left, env(safe-area-inset-left, 0px));
         --fab: 56px;
         --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
       }
@@ -615,6 +617,36 @@
         }
       }
     </style>
+    <script>
+      // Safe-area insets from the Partii app (same as the SDK's onSafeArea, platform/sdk/ts/src/safearea.ts):
+      // ?safe=T,R,B,L at load, then {t: "partii:insets", top, right, bottom, left} messages from the
+      // framing app on load / resize / rotation. Sets --partii-safe-* on <html>; outside the app
+      // neither comes and the CSS falls back to env().
+      (function () {
+        var root = document.documentElement;
+        function num(v) {
+          return typeof v === "number" && isFinite(v) && v >= 0 ? v : 0;
+        }
+        function apply(t, r, b, l) {
+          root.style.setProperty("--partii-safe-top", t + "px");
+          root.style.setProperty("--partii-safe-right", r + "px");
+          root.style.setProperty("--partii-safe-bottom", b + "px");
+          root.style.setProperty("--partii-safe-left", l + "px");
+        }
+        try {
+          var v = new URLSearchParams(location.search).get("safe");
+          var p = v ? v.split(",").map(Number) : null;
+          if (p && p.length === 4 && p.every(function (n) { return isFinite(n) && n >= 0; })) {
+            apply(p[0], p[1], p[2], p[3]);
+          }
+        } catch (e) {}
+        addEventListener("message", function (e) {
+          var d = e.data;
+          if (window.parent === window || e.source !== window.parent || !d || d.t !== "partii:insets") return;
+          apply(num(d.top), num(d.right), num(d.bottom), num(d.left));
+        });
+      })();
+    </script>
   </head>
   <body>
     <canvas id="sandii" aria-label="Sandbox"></canvas>
