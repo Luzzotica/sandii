@@ -161,6 +161,10 @@ pub struct GameState {
     pub w: usize,
     pub h: usize,
     pub frame: Vec<u32>,
+    /// The world may look different from [`Self::frame`] (stepped, painted, cleared, resized).
+    pub view_dirty: bool,
+    /// Cost of the last sim step (ms), to decide whether a second catch-up step fits a frame.
+    last_step_ms: f32,
     pub paused: bool,
     pub selected: MaterialId,
     pub brush_radius: i32,
@@ -186,8 +190,11 @@ impl GameState {
             deterministic: true,
             ..SimulationConfig::default()
         });
-        // 60 Hz simulation; allow several substeps per frame to catch up after a long frame.
-        sim.set_fixed_timestep(1.0 / 60.0, 4);
+        // 60 Hz simulation, at most one step per frame (two when steps are cheap, see
+        // `step_frame`). Behind schedule the world runs in slow motion instead of piling up
+        // steps (4 substeps on a slow phone made each frame 4x slower: a 10 fps spiral).
+        sim.set_fixed_timestep(1.0 / 60.0, 1);
+        sim.set_max_backlog_steps(2);
 
         let mut g = Self {
             sim,
@@ -195,6 +202,8 @@ impl GameState {
             w: 0,
             h: 0,
             frame: Vec::new(),
+            view_dirty: true,
+            last_step_ms: f32::INFINITY,
             paused: false,
             selected: material::SAND,
             brush_radius: 4,
@@ -293,6 +302,7 @@ impl GameState {
         self.w = w;
         self.h = h;
         self.frame = vec![0u32; w * h];
+        self.view_dirty = true;
         self.reset_strokes();
     }
 
@@ -336,6 +346,7 @@ impl GameState {
     pub fn clear_world(&mut self) {
         let r = viewport_rect(self.camera, self.w, self.h);
         self.sim.paint_rect_filled(r.min, r.max, material::EMPTY);
+        self.view_dirty = true;
         self.reset_strokes();
     }
 
@@ -347,6 +358,19 @@ impl GameState {
 
     pub fn step_frame(&mut self, dt: f32, input: &FrameInput, prev: &FrameInput) {
         // No panning in web — camera is fixed at initial position.
+        // Painting, erasing, rigid strokes and spawns all happen while a button is down, on the
+        // release frame, or on a key press: the view may change.
+        if input.left_down
+            || input.right_down
+            || prev.left_down
+            || prev.right_down
+            || input.clear_pressed
+            || input.spawn_rigid_circle_pressed
+            || input.spawn_obsidian_pressed
+            || input.rigid_rect_r_pressed
+        {
+            self.view_dirty = true;
+        }
 
         if input.brush_steps != 0 {
             let cap = brush_cap_for_mode(self.interaction_mode);
@@ -627,15 +651,28 @@ impl GameState {
         }
 
         if !self.paused {
-            let _stats = self.sim.advance_frame(dt);
+            // A second catch-up step only when a step costs under a quarter of a 60 Hz frame
+            // (a 50 Hz display or a hitch on a fast device); otherwise one step per frame.
+            let max_sub = if self.last_step_ms < 4.0 { 2 } else { 1 };
+            self.sim.set_fixed_timestep(1.0 / 60.0, max_sub);
+            let stats = self.sim.advance_frame(dt);
+            if stats.substeps > 0 {
+                self.last_step_ms = stats.sim_ms / stats.substeps as f32;
+                self.view_dirty = true;
+            }
         }
     }
 
-    /// Copy the visible grid into [`Self::frame`] (ARGB).
-    pub fn render_frame(&mut self) {
-        self.frame = self
-            .sim
-            .copy_argb32_for_region(viewport_rect(self.camera, self.w, self.h));
+    /// Copy the visible grid into [`Self::frame`] (ARGB) if it may have changed. Returns
+    /// whether it did (an unchanged frame need not be drawn again).
+    pub fn render_frame(&mut self) -> bool {
+        if !self.view_dirty {
+            return false;
+        }
+        self.view_dirty = false;
+        self.sim
+            .fill_argb32_for_region(viewport_rect(self.camera, self.w, self.h), &mut self.frame);
+        true
     }
 
     /// Benchmark scenes (`?bench`): fill the screen with liquid. `water` / `lava` fill every empty

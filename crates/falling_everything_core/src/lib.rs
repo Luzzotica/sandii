@@ -77,6 +77,8 @@ pub struct Simulation {
     fixed_dt: f32,
     accumulator: f32,
     max_substeps: u32,
+    /// Most sim time (in steps) the accumulator may hold; see [`Simulation::set_max_backlog_steps`].
+    max_backlog_steps: u32,
     /// With chunk-step on: run at most one grid substep every this many frames (1 = every frame).
     chunk_step_stride_frames: u32,
     chunk_step_stride_counter: u32,
@@ -121,6 +123,7 @@ impl Simulation {
             fixed_dt: 1.0 / 60.0,
             accumulator: 0.0,
             max_substeps: 4,
+            max_backlog_steps: 0,
             chunk_step_stride_frames: 8,
             chunk_step_stride_counter: 0,
             debug_views_enabled: false,
@@ -487,6 +490,11 @@ impl Simulation {
         render::copy_argb32_for_region(&self.world, Some(&self.rigid), rect)
     }
 
+    /// [`Self::copy_argb32_for_region`] into a reused buffer (no per-frame allocation).
+    pub fn fill_argb32_for_region(&self, rect: RectI, out: &mut Vec<u32>) {
+        render::fill_argb32_for_region(&self.world, Some(&self.rigid), rect, out)
+    }
+
     pub fn copy_argb32_for_region_chunk_step_viz(&self, rect: RectI) -> Vec<u32> {
         render::copy_argb32_for_region_chunk_step_viz(&self.world, Some(&self.rigid), rect)
     }
@@ -607,9 +615,18 @@ impl Simulation {
         self.max_substeps = max_substeps.max(1);
     }
 
+    /// Let the accumulator hold up to `steps` fixed steps of time even when
+    /// [`Self::set_fixed_timestep`] allows fewer substeps per frame (`0` = same as max substeps).
+    /// With one substep per frame and a backlog of two, frame-time jitter on a 60 Hz display is
+    /// absorbed instead of dropping steps, while a slow device runs at one step per frame (slow
+    /// motion) instead of piling up steps it cannot afford.
+    pub fn set_max_backlog_steps(&mut self, steps: u32) {
+        self.max_backlog_steps = steps;
+    }
+
     pub fn advance_frame(&mut self, frame_dt: f32) -> SimulationStats {
-        self.accumulator =
-            (self.accumulator + frame_dt).min(self.fixed_dt * self.max_substeps as f32);
+        let backlog = self.max_substeps.max(self.max_backlog_steps);
+        self.accumulator = (self.accumulator + frame_dt).min(self.fixed_dt * backlog as f32);
         let start = Instant::now();
         let mut substeps = 0u32;
         let max_sub = if self.scheduler.debug_chunk_step() {

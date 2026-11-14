@@ -78,9 +78,22 @@ fn apply_rigid_morph_overlays_rgba(
 
 /// Returns ARGB32 pixels for a region, suitable for minifb / sandbox rendering.
 pub fn copy_argb32_for_region(world: &World, rigid: Option<&RigidBridge>, rect: RectI) -> Vec<u32> {
+    let mut buf = Vec::new();
+    fill_argb32_for_region(world, rigid, rect, &mut buf);
+    buf
+}
+
+/// [`copy_argb32_for_region`] into `buf` (cleared first; its allocation is reused).
+pub fn fill_argb32_for_region(
+    world: &World,
+    rigid: Option<&RigidBridge>,
+    rect: RectI,
+    buf: &mut Vec<u32>,
+) {
     let width = (rect.max.x - rect.min.x + 1).max(0) as usize;
     let height = (rect.max.y - rect.min.y + 1).max(0) as usize;
-    let mut buf = Vec::with_capacity(width * height);
+    buf.clear();
+    buf.reserve(width * height);
     for y in rect.min.y..=rect.max.y {
         for x in rect.min.x..=rect.max.x {
             let cell = world.get_cell(Vec2i::new(x, y));
@@ -88,9 +101,8 @@ pub fn copy_argb32_for_region(world: &World, rigid: Option<&RigidBridge>, rect: 
         }
     }
     if let Some(r) = rigid {
-        apply_rigid_morph_overlays_argb32(world, r, rect, &mut buf, width);
+        apply_rigid_morph_overlays_argb32(world, r, rect, buf, width);
     }
-    buf
 }
 
 fn apply_rigid_morph_overlays_argb32(

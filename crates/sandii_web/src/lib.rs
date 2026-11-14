@@ -294,7 +294,7 @@ impl App {
         let t_sim = now_ms();
         self.game.step_frame(dt, &cur, &self.prev_input);
         let t_render = now_ms();
-        self.game.render_frame();
+        let drawn = self.game.render_frame();
         if let Ok(mut inp) = self.input.try_borrow_mut() {
             inp.clear_transient();
         }
@@ -309,14 +309,16 @@ impl App {
             self.fps_last_ms = now;
         }
 
-        fill_rgba(&self.game.frame, self.game.w, &self.sky, &mut self.rgba_scratch);
-        let data = ImageData::new_with_u8_clamped_array_and_sh(
-            wasm_bindgen::Clamped(&mut self.rgba_scratch),
-            self.game.w as u32,
-            self.game.h as u32,
-        )
-        .expect("ImageData");
-        ctx.put_image_data(&data, 0.0, 0.0).expect("put_image_data");
+        if drawn {
+            fill_rgba(&self.game.frame, self.game.w, &self.sky, &mut self.rgba_scratch);
+            let data = ImageData::new_with_u8_clamped_array_and_sh(
+                wasm_bindgen::Clamped(&mut self.rgba_scratch),
+                self.game.w as u32,
+                self.game.h as u32,
+            )
+            .expect("ImageData");
+            ctx.put_image_data(&data, 0.0, 0.0).expect("put_image_data");
+        }
         let t_end = now_ms();
         BENCH.with(|b| {
             let mut b = b.borrow_mut();
@@ -383,18 +385,18 @@ impl App {
     }
 }
 
-/// Empty cells render black in the core; paint them with the sky gradient instead.
+/// ARGB → canvas RGBA bytes. Empty cells render black in the core; paint them with the sky
+/// gradient instead.
 fn fill_rgba(frame: &[u32], w: usize, sky: &[u32], out: &mut [u8]) {
-    for (y, row) in frame.chunks_exact(w.max(1)).enumerate() {
+    for ((y, row), out_row) in frame
+        .chunks_exact(w.max(1))
+        .enumerate()
+        .zip(out.chunks_exact_mut(w.max(1) * 4))
+    {
         let bg = sky.get(y).copied().unwrap_or(0xFF00_0000);
-        let base = y * w * 4;
-        for (x, &p) in row.iter().enumerate() {
+        for (&p, o) in row.iter().zip(out_row.chunks_exact_mut(4)) {
             let p = if p & 0x00FF_FFFF == 0 { bg } else { p };
-            let o = base + x * 4;
-            out[o] = ((p >> 16) & 0xff) as u8;
-            out[o + 1] = ((p >> 8) & 0xff) as u8;
-            out[o + 2] = (p & 0xff) as u8;
-            out[o + 3] = 0xff;
+            o.copy_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, 0xff]);
         }
     }
 }
