@@ -131,6 +131,12 @@ pub struct FrameInput {
     pub spawn_rigid_circle_pressed: bool,
     pub spawn_obsidian_pressed: bool,
     pub rigid_rect_r_pressed: bool,
+    /// Set on a touch/pen press; cleared once a frame has seen it (so a quick tap still paints).
+    pub press_unseen: bool,
+    /// A touch lifted before any frame saw the press: release after the next frame.
+    pub release_pending: bool,
+    /// Touch has no hover: forget the pointer position once the release frame has run.
+    pub hide_pointer_pending: bool,
 }
 
 impl Default for FrameInput {
@@ -148,6 +154,9 @@ impl Default for FrameInput {
             spawn_rigid_circle_pressed: false,
             spawn_obsidian_pressed: false,
             rigid_rect_r_pressed: false,
+            press_unseen: false,
+            release_pending: false,
+            hide_pointer_pending: false,
         }
     }
 }
@@ -160,6 +169,17 @@ impl FrameInput {
         self.spawn_rigid_circle_pressed = false;
         self.spawn_obsidian_pressed = false;
         self.rigid_rect_r_pressed = false;
+        // Touch bookkeeping: hide a lifted finger's position only after a frame saw the release.
+        if self.hide_pointer_pending && !self.left_down && !self.release_pending {
+            self.mouse_x = -1.0;
+            self.mouse_y = -1.0;
+            self.hide_pointer_pending = false;
+        }
+        if self.release_pending {
+            self.left_down = false;
+            self.release_pending = false;
+        }
+        self.press_unseen = false;
     }
 }
 

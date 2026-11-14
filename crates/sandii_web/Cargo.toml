@@ -12,6 +12,7 @@ falling_everything_core = { path = "../falling_everything_core", default-feature
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = [
+    "AddEventListenerOptions",
     "CanvasRenderingContext2d",
     "console",
     "CssStyleDeclaration",
@@ -25,6 +26,9 @@ web-sys = { version = "0.3", features = [
     "ImageData",
     "KeyboardEvent",
     "MouseEvent",
+    "Location",
     "Performance",
+    "PointerEvent",
+    "UrlSearchParams",
     "Window",
 ] }

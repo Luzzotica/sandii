@@ -3,7 +3,7 @@
 mod game;
 mod material_blurbs;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -15,8 +15,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
-    window, CanvasRenderingContext2d, Document, Element, Event, HtmlCanvasElement, HtmlElement,
-    HtmlInputElement, ImageData, KeyboardEvent, MouseEvent,
+    window, AddEventListenerOptions, CanvasRenderingContext2d, Document, Element, Event,
+    HtmlCanvasElement, HtmlElement, HtmlInputElement, ImageData, KeyboardEvent, MouseEvent,
+    PointerEvent, UrlSearchParams,
 };
 
 use game::{
@@ -69,10 +70,17 @@ struct App {
     /// Active wow recipe (index, material step).
     active_recipe: Option<(usize, usize)>,
     last_ui_recipe: Option<(usize, usize)>,
+    /// Debug HUD line (FPS, parallel, cell probe): off unless `?debug` or toggled with F3.
+    debug_hud: Rc<Cell<bool>>,
+    debug_hud_shown: bool,
 }
 
 impl App {
-    fn new(input: Rc<RefCell<FrameInput>>, pending_ui: Rc<RefCell<VecDeque<UiAction>>>) -> Self {
+    fn new(
+        input: Rc<RefCell<FrameInput>>,
+        pending_ui: Rc<RefCell<VecDeque<UiAction>>>,
+        debug_hud: Rc<Cell<bool>>,
+    ) -> Self {
         let perf = window().unwrap().performance().unwrap().now();
         Self {
             game: GameState::new(),
@@ -89,6 +97,8 @@ impl App {
             last_ui_brush: 4,
             active_recipe: None,
             last_ui_recipe: None,
+            debug_hud,
+            debug_hud_shown: false,
         }
     }
 
@@ -165,19 +175,29 @@ impl App {
         .expect("ImageData");
         ctx.put_image_data(&data, 0.0, 0.0).expect("put_image_data");
 
-        let mut hud = String::new();
-        hud.push_str(&format!(
-            "FPS {} | parallel {} | ",
-            self.fps_show,
-            self.game.sim.is_parallel()
-        ));
-        if cur.mouse_x >= 0.0 {
-            let w = self.game.world_from_mouse(cur.mouse_x, cur.mouse_y);
-            hud.push_str(&cell_name_at(&self.game.sim, w));
-            hud.push_str(" | ");
-            hud.push_str(&cell_flags_line(&self.game.sim, w));
+        let show_debug = self.debug_hud.get();
+        if show_debug != self.debug_hud_shown {
+            // `stats` sits in `.hud-stats`; hide the whole line so it takes no space.
+            if let Some(line) = stats.parent_element() {
+                let _ = line.toggle_attribute_with_force("hidden", !show_debug);
+            }
+            self.debug_hud_shown = show_debug;
         }
-        stats.set_inner_text(&hud);
+        if show_debug {
+            let mut hud = String::new();
+            hud.push_str(&format!(
+                "FPS {} | parallel {} | ",
+                self.fps_show,
+                self.game.sim.is_parallel()
+            ));
+            if cur.mouse_x >= 0.0 {
+                let w = self.game.world_from_mouse(cur.mouse_x, cur.mouse_y);
+                hud.push_str(&cell_name_at(&self.game.sim, w));
+                hud.push_str(" | ");
+                hud.push_str(&cell_flags_line(&self.game.sim, w));
+            }
+            stats.set_inner_text(&hud);
+        }
 
         if ui_from_queue
             || self.game.interaction_mode != self.last_ui_mode
@@ -397,6 +417,28 @@ fn canvas_bitmap_coords(canvas: &HtmlCanvasElement, e: &MouseEvent) -> (f32, f32
     (x as f32, y as f32)
 }
 
+/// Like [`canvas_bitmap_coords`] but clamped to the bitmap: a captured finger that slides off the
+/// canvas keeps painting at the edge instead of reading as "no pointer".
+fn canvas_bitmap_coords_clamped(canvas: &HtmlCanvasElement, e: &MouseEvent) -> (f32, f32) {
+    let (x, y) = canvas_bitmap_coords(canvas, e);
+    if x == -1.0 && y == -1.0 {
+        return (x, y);
+    }
+    let max_x = (canvas.width() as f32 - 1.0).max(0.0);
+    let max_y = (canvas.height() as f32 - 1.0).max(0.0);
+    (x.clamp(0.0, max_x), y.clamp(0.0, max_y))
+}
+
+/// `?debug` (or `?debug=1`) in the page URL turns the debug HUD line on at start.
+fn debug_requested() -> bool {
+    let search = window()
+        .and_then(|w| w.location().search().ok())
+        .unwrap_or_default();
+    UrlSearchParams::new_with_str(&search)
+        .map(|p| p.has("debug"))
+        .unwrap_or(false)
+}
+
 fn create_mat_btn(
     document: &Document,
     def: &materials::MaterialDef,
@@ -494,6 +536,9 @@ fn fit_canvas(canvas: &HtmlCanvasElement) {
     } else {
         (w, w / aspect)
     };
+    // The canvas has a 1px content-box border: leave room for it so it never overflows the wrap.
+    let css_w = (css_w - 2.0).max(1.0).floor();
+    let css_h = (css_h - 2.0).max(1.0).floor();
     let s = canvas.style();
     let _ = s.set_property("width", &format!("{css_w:.0}px"));
     let _ = s.set_property("height", &format!("{css_h:.0}px"));
@@ -637,7 +682,12 @@ fn run() -> Result<(), JsValue> {
 
     let input = Rc::new(RefCell::new(FrameInput::default()));
     let pending_ui = Rc::new(RefCell::new(VecDeque::new()));
-    let app = Rc::new(RefCell::new(App::new(input.clone(), pending_ui.clone())));
+    let debug_hud = Rc::new(Cell::new(debug_requested()));
+    let app = Rc::new(RefCell::new(App::new(
+        input.clone(),
+        pending_ui.clone(),
+        debug_hud.clone(),
+    )));
 
     for btn in &ui.mat_buttons {
         let pq2 = pending_ui.clone();
@@ -804,9 +854,115 @@ fn run() -> Result<(), JsValue> {
         closure.forget();
     }
 
+    // Touch and pen: Pointer Events. Mouse keeps the mouse handlers above; `preventDefault` on
+    // pointerdown suppresses the compatibility mouse events a tap would otherwise also fire.
+    // Only the primary pointer paints (one finger); extra fingers are ignored.
     {
         let inp = input.clone();
+        let c = canvas.clone();
+        let closure = Closure::wrap(Box::new(move |e: PointerEvent| {
+            if e.pointer_type() == "mouse" || !e.is_primary() {
+                return;
+            }
+            e.prevent_default();
+            let _ = c.set_pointer_capture(e.pointer_id());
+            let _ = c.focus();
+            let (mx, my) = canvas_bitmap_coords_clamped(&c, &e);
+            let mut g = inp.borrow_mut();
+            g.mouse_x = mx;
+            g.mouse_y = my;
+            g.shift = false;
+            g.left_down = true;
+            g.press_unseen = true;
+            g.release_pending = false;
+            g.hide_pointer_pending = false;
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("pointerdown", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
+    {
+        let inp = input.clone();
+        let c = canvas.clone();
+        let closure = Closure::wrap(Box::new(move |e: PointerEvent| {
+            if e.pointer_type() == "mouse" || !e.is_primary() {
+                return;
+            }
+            let mut g = inp.borrow_mut();
+            if !g.left_down {
+                return;
+            }
+            e.prevent_default();
+            let (mx, my) = canvas_bitmap_coords_clamped(&c, &e);
+            g.mouse_x = mx;
+            g.mouse_y = my;
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("pointermove", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
+    {
+        let inp = input.clone();
+        let c = canvas.clone();
+        let closure = Closure::wrap(Box::new(move |e: PointerEvent| {
+            if e.pointer_type() == "mouse" || !e.is_primary() {
+                return;
+            }
+            e.prevent_default();
+            let _ = c.release_pointer_capture(e.pointer_id());
+            let mut g = inp.borrow_mut();
+            if !g.left_down {
+                return;
+            }
+            if e.type_() == "pointerup" {
+                let (mx, my) = canvas_bitmap_coords_clamped(&c, &e);
+                g.mouse_x = mx;
+                g.mouse_y = my;
+            }
+            if g.press_unseen {
+                // Tapped and lifted inside one frame: let a frame see the press first.
+                g.release_pending = true;
+            } else {
+                g.left_down = false;
+            }
+            g.hide_pointer_pending = true;
+        }) as Box<dyn FnMut(_)>);
+        canvas.add_event_listener_with_callback("pointerup", closure.as_ref().unchecked_ref())?;
+        canvas.add_event_listener_with_callback("pointercancel", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
+    // Belt and braces for browsers that still scroll/zoom on touch despite `touch-action: none`:
+    // non-passive touch listeners that cancel the default gesture on the canvas.
+    {
+        let closure = Closure::wrap(Box::new(move |e: Event| {
+            if e.cancelable() {
+                e.prevent_default();
+            }
+        }) as Box<dyn FnMut(_)>);
+        let opts = AddEventListenerOptions::new();
+        opts.set_passive(false);
+        for ty in ["touchstart", "touchmove", "touchend"] {
+            canvas.add_event_listener_with_callback_and_add_event_listener_options(
+                ty,
+                closure.as_ref().unchecked_ref(),
+                &opts,
+            )?;
+        }
+        closure.forget();
+    }
+
+    {
+        let inp = input.clone();
+        let dbg = debug_hud.clone();
         let closure = Closure::wrap(Box::new(move |e: KeyboardEvent| {
+            if e.code() == "F3" {
+                e.prevent_default();
+                if !e.repeat() {
+                    dbg.set(!dbg.get());
+                }
+                return;
+            }
             let mut g = inp.borrow_mut();
             g.shift = e.shift_key();
             match e.code().as_str() {
