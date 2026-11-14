@@ -91,7 +91,10 @@ fn main() {
         .unwrap_or(STEPS);
     let scenes = ["idle", "water", "lava", "mix", "rain"];
     println!("grid {W}x{H}, {WARMUP} warm-up + {steps} timed steps per scene");
-    println!("{:<6} {:>8} {:>8} {:>8}  hash", "scene", "avg ms", "p95 ms", "max ms");
+    println!(
+        "{:<6} {:>8} {:>8} {:>8} {:>7}  hash",
+        "scene", "avg ms", "p95 ms", "max ms", "awake"
+    );
     for scene in scenes {
         if !only.is_empty() && !only.iter().any(|s| s == scene) {
             continue;
@@ -112,12 +115,16 @@ fn main() {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p95 = sorted[(sorted.len() * 95) / 100];
         let max = *sorted.last().unwrap();
+        // A zero-length frame runs no step and reports the awake / sleeping chunk counts.
+        let stats = sim.advance_frame(0.0);
         println!(
-            "{:<6} {:>8.3} {:>8.3} {:>8.3}  {:016x}",
+            "{:<6} {:>8.3} {:>8.3} {:>8.3} {:>3}/{:<3}  {:016x}",
             scene,
             avg,
             p95,
             max,
+            stats.active_chunks,
+            stats.active_chunks + stats.sleeping_chunks,
             state_hash(&sim, rect)
         );
     }

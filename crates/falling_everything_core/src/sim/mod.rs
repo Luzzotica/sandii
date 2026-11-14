@@ -518,9 +518,12 @@ impl SimGrids {
 
     fn set_velocity(&self, p: Vec2i, vel: i8) {
         if let Some(i) = self.index(p) {
-            unsafe {
-                (*self.write.add(i)).set_velocity_x(vel);
+            let c = unsafe { &mut *self.write.add(i) };
+            if c.velocity_x() == vel {
+                // Nothing changes: do not keep the chunk awake (settled liquid sets 0 every tick).
+                return;
             }
+            c.set_velocity_x(vel);
             self.wake_at(p);
         }
     }
