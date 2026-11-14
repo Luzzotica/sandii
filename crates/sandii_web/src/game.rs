@@ -629,9 +629,41 @@ impl GameState {
         if !self.paused {
             let _stats = self.sim.advance_frame(dt);
         }
+    }
+
+    /// Copy the visible grid into [`Self::frame`] (ARGB).
+    pub fn render_frame(&mut self) {
         self.frame = self
             .sim
             .copy_argb32_for_region(viewport_rect(self.camera, self.w, self.h));
+    }
+
+    /// Benchmark scenes (`?bench`): fill the screen with liquid. `water` / `lava` fill every empty
+    /// cell; `mix` puts water on the left half and lava on the right; `rain` fills the top 40% only
+    /// so it falls and splashes. Returns false for an unknown scene.
+    pub fn bench_fill(&mut self, scene: &str) -> bool {
+        let r = viewport_rect(self.camera, self.w, self.h);
+        let mid_x = r.min.x + self.w as i32 / 2;
+        let rain_max_y = r.min.y + (self.h as i32 * 2) / 5;
+        for y in r.min.y..=r.max.y {
+            for x in r.min.x..=r.max.x {
+                let p = Vec2i::new(x, y);
+                if self.sim.cell(p).material() != material::EMPTY {
+                    continue;
+                }
+                let mat = match scene {
+                    "water" => material::LIQUID,
+                    "lava" => material::LAVA,
+                    "mix" if x < mid_x => material::LIQUID,
+                    "mix" => material::LAVA,
+                    "rain" if y <= rain_max_y => material::LIQUID,
+                    "rain" => continue,
+                    _ => return false,
+                };
+                self.sim.paint_rect_filled(p, p, mat);
+            }
+        }
+        true
     }
 }
 

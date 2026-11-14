@@ -81,6 +81,72 @@ struct App {
     resize_at: Rc<Cell<f64>>,
 }
 
+/// Frame timing for the headless benchmark (`bench/bench.mjs`): totals since the last
+/// [`bench_reset`]. Cheap enough to keep on always.
+#[derive(Default)]
+struct BenchStats {
+    frames: f64,
+    /// Sum of gaps between ticks (ms) and how many gaps.
+    frame_ms: f64,
+    gaps: f64,
+    max_frame_ms: f64,
+    /// Input + simulation (`step_frame`).
+    sim_ms: f64,
+    /// Grid → pixels → canvas.
+    render_ms: f64,
+    substeps: f64,
+    last_tick_ms: f64,
+}
+
+thread_local! {
+    static BENCH: RefCell<BenchStats> = RefCell::new(BenchStats::default());
+    static APP: RefCell<Option<Rc<RefCell<App>>>> = RefCell::new(None);
+}
+
+/// Benchmark hook: fill the screen (`water`, `lava`, `mix`, `rain`); see [`GameState::bench_fill`].
+#[wasm_bindgen]
+pub fn bench_fill(scene: &str) -> bool {
+    APP.with(|a| {
+        a.borrow()
+            .as_ref()
+            .map_or(false, |app| app.borrow_mut().game.bench_fill(scene))
+    })
+}
+
+/// Benchmark hook: zero the frame timing totals.
+#[wasm_bindgen]
+pub fn bench_reset() {
+    BENCH.with(|b| *b.borrow_mut() = BenchStats::default());
+}
+
+/// Benchmark hook: `[frames, frame_ms_total, gaps, max_frame_ms, sim_ms_total, render_ms_total,
+/// substeps_total, grid_w, grid_h]`.
+#[wasm_bindgen]
+pub fn bench_stats() -> Vec<f64> {
+    let (w, h) = APP.with(|a| {
+        a.borrow()
+            .as_ref()
+            .map_or((0.0, 0.0), |app| {
+                let g = &app.borrow().game;
+                (g.w as f64, g.h as f64)
+            })
+    });
+    BENCH.with(|b| {
+        let b = b.borrow();
+        vec![
+            b.frames,
+            b.frame_ms,
+            b.gaps,
+            b.max_frame_ms,
+            b.sim_ms,
+            b.render_ms,
+            b.substeps,
+            w,
+            h,
+        ]
+    })
+}
+
 fn now_ms() -> f64 {
     window().unwrap().performance().unwrap().now()
 }
@@ -225,7 +291,10 @@ impl App {
         if cur.clear_pressed {
             toast("Cleared");
         }
+        let t_sim = now_ms();
         self.game.step_frame(dt, &cur, &self.prev_input);
+        let t_render = now_ms();
+        self.game.render_frame();
         if let Ok(mut inp) = self.input.try_borrow_mut() {
             inp.clear_transient();
         }
@@ -248,6 +317,21 @@ impl App {
         )
         .expect("ImageData");
         ctx.put_image_data(&data, 0.0, 0.0).expect("put_image_data");
+        let t_end = now_ms();
+        BENCH.with(|b| {
+            let mut b = b.borrow_mut();
+            b.frames += 1.0;
+            b.sim_ms += t_render - t_sim;
+            b.render_ms += t_end - t_render;
+            b.substeps += self.game.sim.last_stats().substeps as f64;
+            if b.last_tick_ms > 0.0 {
+                let gap = now - b.last_tick_ms;
+                b.frame_ms += gap;
+                b.max_frame_ms = b.max_frame_ms.max(gap);
+                b.gaps += 1.0;
+            }
+            b.last_tick_ms = now;
+        });
 
         let show_debug = self.debug_hud.get();
         if show_debug {
@@ -615,6 +699,8 @@ fn run() -> Result<(), JsValue> {
         gw,
         gh,
     )));
+
+    APP.with(|a| *a.borrow_mut() = Some(app.clone()));
 
     let push = {
         let pq = pending_ui.clone();
