@@ -84,8 +84,13 @@ fn state_hash(sim: &Simulation, rect: RectI) -> u64 {
 
 fn main() {
     let only: Vec<String> = std::env::args().skip(1).collect();
+    // Override the timed step count with SANDII_BENCH_STEPS (e.g. for a profiler).
+    let steps: usize = std::env::var("SANDII_BENCH_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STEPS);
     let scenes = ["idle", "water", "lava", "mix", "rain"];
-    println!("grid {W}x{H}, {WARMUP} warm-up + {STEPS} timed steps per scene");
+    println!("grid {W}x{H}, {WARMUP} warm-up + {steps} timed steps per scene");
     println!("{:<6} {:>8} {:>8} {:>8}  hash", "scene", "avg ms", "p95 ms", "max ms");
     for scene in scenes {
         if !only.is_empty() && !only.iter().any(|s| s == scene) {
@@ -96,8 +101,8 @@ fn main() {
         for _ in 0..WARMUP {
             sim.step(1.0 / 60.0);
         }
-        let mut times = Vec::with_capacity(STEPS);
-        for _ in 0..STEPS {
+        let mut times = Vec::with_capacity(steps);
+        for _ in 0..steps {
             let t = Instant::now();
             sim.step(1.0 / 60.0);
             times.push(t.elapsed().as_secs_f64() * 1000.0);

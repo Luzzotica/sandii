@@ -3,7 +3,7 @@ use rand::Rng;
 
 use crate::world::{material, Cell, MaterialProps, Vec2i, World};
 
-use crate::sim::SimGrids;
+use crate::sim::{material_bit, SimGrids};
 
 use super::influence::ADJ_TRANSFORM_NEIGHBORS8;
 
@@ -15,9 +15,22 @@ pub(crate) fn step_adjacent_transform_neighbors(
     props: &MaterialProps,
     rng: &mut SmallRng,
 ) {
+    // Only neighbors made of an active rule's `from` can change (other neighbors roll no dice).
+    let mut froms = 0u64;
+    for rule in &props.adjacent_transforms {
+        if rule.is_active() {
+            froms |= material_bit(rule.from);
+        }
+    }
+    if froms & sg.neighbor8_material_mask(p) == 0 {
+        return;
+    }
     for &(dx, dy) in &ADJ_TRANSFORM_NEIGHBORS8 {
         let np = Vec2i::new(p.x + dx, p.y + dy);
         let neighbor_mat = sg.get(np).material();
+        if froms & material_bit(neighbor_mat) == 0 {
+            continue;
+        }
         for rule in props.adjacent_transforms {
             if !rule.is_active() {
                 continue;

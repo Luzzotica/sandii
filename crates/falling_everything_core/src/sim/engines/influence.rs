@@ -7,7 +7,7 @@ use crate::world::{
     MaterialId, MaterialProps, Vec2i, World,
 };
 
-use crate::sim::SimGrids;
+use crate::sim::{material_bit, SimGrids};
 
 /// 8-neighbor offsets (same winding as burn spread and adjacent transforms).
 pub(crate) const ADJ_TRANSFORM_NEIGHBORS8: [(i32, i32); 8] = [
@@ -253,11 +253,24 @@ pub(crate) fn liquid_adjacent_influence_pass(
         (0, 1),
         (1, 1),
     ];
+    // A neighbor that is none of the active rules' victims cannot match (and rolls no dice).
+    let mut victims = 0u64;
+    for rule in rules {
+        if rule.is_active() {
+            victims |= material_bit(rule.victim);
+        }
+    }
+    if victims & sg.neighbor8_material_mask(p) == 0 {
+        return false;
+    }
     for &(dx, dy) in &NEIGHBORS8 {
         if sg.get(p).material() != source_material {
             return true;
         }
         let np = Vec2i::new(p.x + dx, p.y + dy);
+        if victims & material_bit(sg.get(np).material()) == 0 {
+            continue;
+        }
         if try_adjacent_influence_on_neighbor(
             sg,
             world,

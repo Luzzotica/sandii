@@ -704,57 +704,57 @@ impl MaterialProps {
     }
 
     #[inline]
-    pub const fn phase(self) -> Phase {
+    pub const fn phase(&self) -> Phase {
         self.motion.phase()
     }
 
     #[inline]
-    pub const fn inert(self) -> bool {
+    pub const fn inert(&self) -> bool {
         self.motion.inert()
     }
 
     #[inline]
-    pub const fn viscosity(self) -> u8 {
+    pub const fn viscosity(&self) -> u8 {
         self.motion.viscosity()
     }
 
     #[inline]
-    pub const fn max_speed(self) -> u8 {
+    pub const fn max_speed(&self) -> u8 {
         self.motion.max_speed()
     }
 
     #[inline]
-    pub const fn acceleration(self) -> u8 {
+    pub const fn acceleration(&self) -> u8 {
         self.motion.acceleration()
     }
 
     #[inline]
-    pub const fn inertial_resistance(self) -> u8 {
+    pub const fn inertial_resistance(&self) -> u8 {
         self.motion.inertial_resistance()
     }
 
     #[inline]
-    pub const fn extinguishes_fire(self) -> bool {
+    pub const fn extinguishes_fire(&self) -> bool {
         self.motion.extinguishes_fire()
     }
 
     #[inline]
-    pub fn has_adjacent_transforms(self) -> bool {
+    pub fn has_adjacent_transforms(&self) -> bool {
         self.adjacent_transforms.iter().any(|r| r.is_active())
     }
 
     #[inline]
-    pub fn has_neighbor_spawns(self) -> bool {
+    pub fn has_neighbor_spawns(&self) -> bool {
         self.neighbor_spawns.iter().any(|r| r.is_active())
     }
 
     #[inline]
-    pub fn has_acid_corrosion(self) -> bool {
+    pub fn has_acid_corrosion(&self) -> bool {
         self.acid_corrosion.is_active()
     }
 
     #[inline]
-    pub fn has_adjacent_influence(self) -> bool {
+    pub fn has_adjacent_influence(&self) -> bool {
         self.adjacent_influence.iter().any(|r| r.is_active())
     }
 }
@@ -853,12 +853,11 @@ fn cell_contributes_static_collider_refs(
     {
         return false;
     }
-    let props = material_props
+    let inert = material_props
         .get(cell.material() as usize)
-        .copied()
-        .unwrap_or_default();
+        .map_or(MaterialProps::default_const().inert(), |p| p.inert());
     // Inert terrain always collides; settled granular (ASLEEP) joins the static mesh too.
-    props.inert() || cell.has_flag(cell_flags::ASLEEP)
+    inert || cell.has_flag(cell_flags::ASLEEP)
 }
 
 impl World {
@@ -1718,6 +1717,10 @@ impl World {
                         let i = (ly_g * width + lx_g) as usize;
                         let old_c = read_buf[i];
                         let new_c = write_buf[i];
+                        if old_c == new_c {
+                            // Same cell, same collider answer (skips two rigid-id hash lookups).
+                            continue;
+                        }
                         let p = Vec2i::new(x, y);
                         let before = cell_contributes_static_collider_refs(
                             store,

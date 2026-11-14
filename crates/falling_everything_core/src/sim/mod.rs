@@ -475,6 +475,34 @@ impl SimGrids {
         Some((y * self.width + x) as usize)
     }
 
+    /// Bitset of the materials in the 8 cells around `p` ([`material_bit`]); out-of-grid cells
+    /// read as [`material::STONE`], like [`Self::get`]. One pass over the neighborhood so rule
+    /// engines can skip a cell whose neighbors cannot match any of its rules.
+    #[inline]
+    pub(crate) fn neighbor8_material_mask(&self, p: Vec2i) -> u64 {
+        let x = p.x - self.origin.x;
+        let y = p.y - self.origin.y;
+        if x >= 1 && x < self.width - 1 && y >= 1 && y < self.height - 1 {
+            let w = self.width as isize;
+            let i = (y * self.width + x) as isize;
+            let mut m = 0u64;
+            for off in [-w - 1, -w, -w + 1, -1, 1, w - 1, w, w + 1] {
+                m |= material_bit(unsafe { *self.write.offset(i + off) }.material());
+            }
+            m
+        } else {
+            let mut m = 0u64;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx != 0 || dy != 0 {
+                        m |= material_bit(self.get(Vec2i::new(p.x + dx, p.y + dy)).material());
+                    }
+                }
+            }
+            m
+        }
+    }
+
     fn get(&self, p: Vec2i) -> Cell {
         self.index(p)
             .map(|i| unsafe { *self.write.add(i) })
@@ -657,6 +685,13 @@ impl SimGrids {
         self.wake_at(to);
         true
     }
+}
+
+/// One bit per material id for neighborhood masks; ids 63 and up share bit 63 (a superset test,
+/// so a mask check never skips a cell that could match).
+#[inline]
+pub(crate) const fn material_bit(id: u16) -> u64 {
+    1u64 << (if id < 63 { id } else { 63 })
 }
 
 #[derive(Clone, Copy)]

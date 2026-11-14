@@ -88,6 +88,10 @@ pub(crate) fn step_temperature(
             k = (k + LIQUID_EDGE_THERMAL_BONUS).min(255);
         }
         let diff = effective_temp(nc) - temp;
+        if diff == 0 {
+            // No flux across this edge (`transfer` would be 0).
+            continue;
+        }
         let c_vol = (props.volumetric_heat_capacity as i32).max(1);
         let base = (diff * k) / (c_vol * 16);
         let transfer = (base * gradient_boost(diff)) / 256;
